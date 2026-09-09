@@ -4,11 +4,13 @@ import {
   determineSafeVersion,
   buildRemediationSuggestion,
   extractCveFromText,
+  canBeResolvedInLockfile,
 } from '../src/collectors/npm-audit.js';
 import {
   extractDependencyChains,
   findDirectRoots,
   getDirectDependencies,
+  tracePathsFromPackageLock,
 } from '../src/core/dependency-graph.js';
 import { generateJsonReport } from '../src/report/json-reporter.js';
 import { generateMarkdownReport } from '../src/report/markdown-reporter.js';
@@ -72,6 +74,63 @@ test('buildRemediationSuggestion: direct dependency bump', () => {
   const rem = buildRemediationSuggestion(vuln, directRoots, {});
   assert.equal(rem.strategy, 'bump-direct');
   assert.equal(rem.packageJsonChanges[0].to, '^4.17.21');
+});
+
+test('extractDependencyChains: traces hoisted transitive dependency (e.g. msw -> @xmldom/xmldom)', () => {
+  const pkgJson = {
+    devDependencies: {
+      msw: '^1.2.1',
+    },
+  };
+
+  const pkgLock = {
+    packages: {
+      '': {
+        devDependencies: { msw: '^1.2.1' },
+      },
+      'node_modules/msw': {
+        version: '1.2.1',
+        dependencies: { '@mswjs/interceptors': '^0.17.5' },
+      },
+      'node_modules/@mswjs/interceptors': {
+        version: '0.17.5',
+        dependencies: { '@xmldom/xmldom': '>=0.7.0 <0.9.0' },
+      },
+      'node_modules/@xmldom/xmldom': {
+        version: '0.7.5',
+      },
+    },
+  };
+
+  const directDeps = getDirectDependencies(pkgJson);
+  const vulnData = {
+    name: '@xmldom/xmldom',
+    severity: 'high',
+    range: '< 0.8.8',
+    nodes: ['node_modules/@xmldom/xmldom'],
+  };
+
+  const chains = extractDependencyChains(vulnData, pkgLock, directDeps);
+  assert.ok(chains.length > 0);
+  assert.equal(chains[0][0].name, 'msw');
+  assert.equal(chains[0][1].name, '@mswjs/interceptors');
+  assert.equal(chains[0][2].name, '@xmldom/xmldom');
+
+  const roots = findDirectRoots(chains, directDeps);
+  assert.equal(roots.length, 1);
+  assert.equal(roots[0].name, 'msw');
+
+  // Check remediation suggestion
+  const vuln = {
+    isDirect: false,
+    packageName: '@xmldom/xmldom',
+    currentVersion: '0.7.5',
+    targetSafeVersion: '0.8.8',
+  };
+  const rem = buildRemediationSuggestion(vuln, roots, pkgJson, chains);
+  assert.equal(rem.strategy, 'lockfile-update');
+  assert.equal(rem.packageJsonChanges.length, 0);
+  assert.ok(rem.lockfileActions[0].includes('npm install @xmldom/xmldom@0.8.8 --package-lock-only'));
 });
 
 test('generateJsonReport and generateMarkdownReport', () => {

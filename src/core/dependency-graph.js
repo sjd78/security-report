@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import semver from 'semver';
 
 const execFileAsync = promisify(execFile);
 
@@ -38,15 +39,138 @@ export function getDirectDependencies(pkgJson) {
 }
 
 export function parseNodePath(nodePathStr) {
-  // Format: "node_modules/direct-dep/node_modules/sub-dep/node_modules/vuln-pkg"
-  // or "node_modules/@scope/pkg/node_modules/child"
   if (!nodePathStr) return [];
-
   const segments = nodePathStr.split(/node_modules[/\\]/).filter(Boolean);
   return segments.map((s) => s.replace(/[/\\]$/, ''));
 }
 
-export function extractDependencyChains(vulnData, pkgLock, directDeps) {
+export function extractChainsFromNpmLs(npmLsData, targetPkgName) {
+  if (!npmLsData) return [];
+  const results = [];
+
+  function walk(node, currentChain = []) {
+    if (!node || typeof node !== 'object') return;
+
+    const depCollections = [node.dependencies, node.devDependencies].filter(Boolean);
+
+    for (const deps of depCollections) {
+      for (const [name, depNode] of Object.entries(deps)) {
+        const ver = depNode.version || 'unknown';
+        const link = {
+          name,
+          version: ver,
+          specifier: `${name}@${ver}`,
+          requiredRange: depNode.required?.version || null,
+        };
+
+        const newChain = [...currentChain, link];
+
+        if (name === targetPkgName) {
+          results.push(newChain);
+        }
+
+        if (depNode.dependencies) {
+          walk(depNode, newChain);
+        }
+      }
+    }
+  }
+
+  walk(npmLsData);
+  return results;
+}
+
+export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps) {
+  if (!pkgLock?.packages) return [];
+  const packages = pkgLock.packages;
+
+  // Build package lookup and dependents map
+  // Map: childName -> array of { parentPath, parentName, requiredRange }
+  const dependentsMap = new Map();
+  const packageVersions = new Map();
+
+  for (const [pkgPath, pkgInfo] of Object.entries(packages)) {
+    const parentName = pkgPath === '' ? '__ROOT__' : pkgPath.replace(/^.*node_modules\//, '');
+    const ver = pkgInfo.version || 'unknown';
+    packageVersions.set(pkgPath, ver);
+
+    const allDeps = {
+      ...(pkgInfo.dependencies || {}),
+      ...(pkgInfo.devDependencies || {}),
+      ...(pkgInfo.optionalDependencies || {}),
+    };
+
+    for (const [depName, range] of Object.entries(allDeps)) {
+      if (!dependentsMap.has(depName)) {
+        dependentsMap.set(depName, []);
+      }
+      dependentsMap.get(depName).push({
+        parentPath: pkgPath,
+        parentName,
+        requiredRange: range,
+      });
+    }
+  }
+
+  // Find all installed paths for targetPkgName
+  const targetPaths = Object.keys(packages).filter(
+    (p) => p === `node_modules/${targetPkgName}` || p.endsWith(`/node_modules/${targetPkgName}`)
+  );
+
+  const targetVersion = targetPaths.length > 0 ? packages[targetPaths[0]].version : 'unknown';
+
+  const chains = [];
+
+  function backtrack(currentPkgName, currentPath = []) {
+    const parents = dependentsMap.get(currentPkgName) || [];
+
+    for (const parent of parents) {
+      if (parent.parentName === '__ROOT__') {
+        chains.push(currentPath);
+      } else {
+        const parentVer = packageVersions.get(parent.parentPath) || 'unknown';
+        const link = {
+          name: parent.parentName,
+          version: parentVer,
+          specifier: `${parent.parentName}@${parentVer}`,
+          requiredRange: parent.requiredRange,
+        };
+
+        if (!currentPath.some((p) => p.name === parent.parentName)) {
+          backtrack(parent.parentName, [link, ...currentPath]);
+        }
+      }
+    }
+  }
+  const initialLink = {
+    name: targetPkgName,
+    version: targetVersion,
+    specifier: `${targetPkgName}@${targetVersion}`,
+  };
+
+  backtrack(targetPkgName, [initialLink]);
+
+  return chains;
+}
+
+export function extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData = null) {
+  // 1. Try npm ls graph first if available
+  if (npmLsData) {
+    const lsChains = extractChainsFromNpmLs(npmLsData, vulnData.name);
+    if (lsChains.length > 0) {
+      return lsChains;
+    }
+  }
+
+  // 2. Try package-lock.json dependency graph traversal
+  if (pkgLock?.packages) {
+    const lockChains = tracePathsFromPackageLock(pkgLock, vulnData.name, directDeps);
+    if (lockChains.length > 0) {
+      return lockChains;
+    }
+  }
+
+  // 3. Fallback to audit nodes parsing
   const chains = [];
   const nodes = vulnData.nodes || [];
 
@@ -55,8 +179,6 @@ export function extractDependencyChains(vulnData, pkgLock, directDeps) {
     if (pkgNames.length === 0) continue;
 
     const chain = [];
-    let currentLockNode = pkgLock?.packages ? pkgLock.packages[''] : null;
-
     let accumulatedPath = '';
     for (let i = 0; i < pkgNames.length; i++) {
       const name = pkgNames[i];
@@ -79,7 +201,7 @@ export function extractDependencyChains(vulnData, pkgLock, directDeps) {
     chains.push(chain);
   }
 
-  // If no nodes array or empty, construct minimal chain from directDeps or package name
+  // 4. Default direct representation
   if (chains.length === 0) {
     const isDirect = directDeps.has(vulnData.name);
     const directInfo = directDeps.get(vulnData.name);

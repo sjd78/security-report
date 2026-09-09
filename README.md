@@ -17,12 +17,12 @@ Managing security vulnerabilities across large Node.js repositories is often fra
    - Cross-references and enriches findings with Jira CVE tickets and GitHub Dependabot alerts.
    - Outputs machine-readable JSON (`reports/security-report.json`) and human-readable Markdown (`reports/security-report.md`).
 
-2. **Step 2: Automated Remediation**
-   - Modeled after `npm-check-updates`: updates `package.json` semver constraints for direct roots (preserving formatting and `^`/`~` prefixes).
-   - Applies npm `overrides` for transitive vulnerabilities when upstream parent packages lack a patch.
-   - Performs atomic lockfile synchronizations (`npm install --package-lock-only`).
-   - Runs a post-remediation audit scan to verify that vulnerabilities are resolved.
-
+2. **Step 2: Automated Remediation (4-Tier Preference Hierarchy)**
+   - **`bump-direct`**: Directly updates `package.json` semver constraints for direct dependencies (preserving formatting and `^`/`~` prefixes).
+   - **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an update available that patches the transitive dependency, bumps the direct parent in `package.json`.
+   - **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), updates the lockfile directly without introducing unnecessary `package.json` overrides.
+   - **`package-override`**: Fallback applied only when parent ranges strictly forbid the safe version and no direct parent update exists.
+   - Performs atomic lockfile synchronizations (`npm install --package-lock-only`) and post-remediation audit verification.
 3. **Step 3: Structured Commit Generation & Publishing**
    - Generates conventional commit messages linking CVE IDs, GHSA identifiers, advisory URLs, Jira tickets, Dependabot alert numbers, and the exact dependency path.
    - Stages and commits changes directly on the target branch worktrees with optional remote push.

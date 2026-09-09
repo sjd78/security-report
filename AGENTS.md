@@ -93,15 +93,14 @@ security-report/
 - **Solution**: The engine clones targets into `REPOS/<org>/<name>` and creates isolated `git worktree` instances for each branch under `<repo>/.worktrees/<sanitized_branch>`.
 - **Branch Pointer Handling**: Base repositories are detached upon cloning so all branch names remain available for worktrees. Commits created within worktrees update branch references via `git update-ref refs/heads/<branch> <commitHash>`.
 
-### B. Direct vs. Indirect Ancestor Chain Resolution
-- **Problem**: `npm audit` reports vulnerable packages, but fixing an indirect dependency requires knowing the top-level parent package declared in `package.json`.
-- **Solution**: `src/core/dependency-graph.js` parses the `nodes` graph from audit output and correlates it with `package-lock.json` to reconstruct the full path:
-  ```text
-  direct-parent@1.2.0 -> intermediate-lib@0.4.1 -> vulnerable-pkg@2.1.0
-  ```
-- If direct: updates `package.json` directly (`^` or `~` prefix preserved).
-- If indirect with upstream fix: bumps direct root in `package.json`.
-- If indirect without upstream fix: applies targeted npm `overrides` in `package.json`.
+### B. Direct vs. Indirect Ancestor Chain Resolution & 4-Tier Remediation Strategy
+- **Problem**: `npm audit` reports hoisted paths (e.g. `node_modules/@xmldom/xmldom`), obscuring the logical parent (e.g. `msw -> @mswjs/interceptors -> @xmldom/xmldom`).
+- **Solution**: `src/core/dependency-graph.js` combines `npm ls --all --json` traversal and reverse graph backtracking over `package-lock.json` packages to reconstruct the complete logical ancestry tree down to root `package.json` dependencies.
+- **4-Tier Remediation Strategy**:
+  1. **`bump-direct`**: Directly updates `package.json` if the package is declared in `dependencies`/`devDependencies`.
+  2. **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an updated version available that pulls in the safe dependency, updates the direct parent in `package.json`.
+  3. **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), updates the lockfile directly via `npm install <pkg>@<safeVersion> --package-lock-only` without adding unnecessary `package.json` overrides.
+  4. **`package-override`**: Fallback applied if and only if parent ranges strictly forbid the safe version and no direct parent bump is available.
 
 ### C. Deterministic JS Clients over Heavy Tooling
 - **Decision**: Uses native Node.js `fetch` and ESM modules for Jira and Dependabot REST communication rather than external runtime dependencies or MCP bridges.

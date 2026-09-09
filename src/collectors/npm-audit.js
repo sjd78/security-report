@@ -7,6 +7,7 @@ import {
   getDirectDependencies,
   extractDependencyChains,
   findDirectRoots,
+  runNpmLs,
 } from '../core/dependency-graph.js';
 
 const execFileAsync = promisify(execFile);
@@ -56,11 +57,42 @@ export function determineSafeVersion(vulnerableRange, currentVersion, fixAvailab
   return null;
 }
 
-export function buildRemediationSuggestion(vuln, directRoots, pkgJson) {
+export function canBeResolvedInLockfile(safeVersion, chains = []) {
+  if (!safeVersion || chains.length === 0) return false;
+
+  const validSafe = semver.valid(safeVersion);
+  if (!validSafe) return false;
+
+  let anyParentHasRange = false;
+
+  for (const chain of chains) {
+    if (chain.length < 2) continue;
+    // Get immediate parent of the target package
+    const immediateParent = chain[chain.length - 2];
+    const targetLink = chain[chain.length - 1];
+
+    if (targetLink.requiredRange) {
+      anyParentHasRange = true;
+      if (!semver.satisfies(validSafe, targetLink.requiredRange)) {
+        return false;
+      }
+    } else if (immediateParent.requiredRange) {
+      anyParentHasRange = true;
+      if (!semver.satisfies(validSafe, immediateParent.requiredRange)) {
+        return false;
+      }
+    }
+  }
+
+  return anyParentHasRange;
+}
+
+export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = []) {
   const isDirect = vuln.isDirect;
   const fix = vuln.fixAvailable;
   const safeVersion = vuln.targetSafeVersion;
 
+  // 1. Direct Dependency Bump
   if (isDirect) {
     const directInfo = directRoots.find((r) => r.name === vuln.packageName);
     const currentRange = directInfo?.currentRange || `^${vuln.currentVersion}`;
@@ -87,7 +119,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson) {
     };
   }
 
-  // Indirect / Transitive vulnerability
+  // 2. Direct Root Parent Fix Available (npm audit identified fix)
   if (fix && typeof fix === 'object' && fix.name && fix.version) {
     const directInfo = directRoots.find((r) => r.name === fix.name);
     const currentRange = directInfo?.currentRange || `^${fix.version}`;
@@ -99,6 +131,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson) {
       targetPackage: fix.name,
       targetVersion: fix.version,
       isSemVerMajor: Boolean(fix.isSemVerMajor),
+      directRoot: directInfo?.name || fix.name,
       packageJsonChanges: [
         {
           package: fix.name,
@@ -111,7 +144,40 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson) {
     };
   }
 
-  // Indirect with no direct parent fix available -> override
+  // 3. In-Range Transitive Lockfile Bump (parent range allows safe version)
+  if (safeVersion && canBeResolvedInLockfile(safeVersion, chains)) {
+    return {
+      strategy: 'lockfile-update',
+      targetPackage: vuln.packageName,
+      targetVersion: safeVersion,
+      directRoot: directRoots[0]?.name || null,
+      packageJsonChanges: [],
+      lockfileActions: [
+        `npm install ${vuln.packageName}@${safeVersion} --package-lock-only`,
+        `npm update ${vuln.packageName} --package-lock-only`,
+      ],
+      note: 'Transitive safe version is permitted within parent declared semver ranges. Can be updated directly in lockfile.',
+    };
+  }
+
+  // 4. Transitive with identified Direct Root Parent (e.g. msw)
+  if (directRoots.length > 0) {
+    const primaryRoot = directRoots[0];
+    return {
+      strategy: 'bump-direct-parent',
+      targetPackage: primaryRoot.name,
+      targetVersion: null,
+      directRoot: primaryRoot.name,
+      packageJsonChanges: [],
+      lockfileActions: [
+        `npm update ${primaryRoot.name} --package-lock-only`,
+        `npm install ${vuln.packageName}@${safeVersion || 'latest'} --package-lock-only`,
+      ],
+      note: `Introduced via direct root "${primaryRoot.name}". Check for newer release of ${primaryRoot.name} or lockfile update.`,
+    };
+  }
+
+  // 5. Fallback: Package Override
   if (safeVersion) {
     return {
       strategy: 'package-override',
@@ -139,7 +205,11 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson) {
 }
 
 export async function collectNpmAudit(worktreeDir, branchName = 'main') {
-  const auditJson = await runNpmAuditRaw(worktreeDir);
+  const [auditJson, npmLsData] = await Promise.all([
+    runNpmAuditRaw(worktreeDir),
+    runNpmLs(worktreeDir),
+  ]);
+
   const pkgJson = readPackageJson(worktreeDir);
   const pkgLock = readPackageLock(worktreeDir);
   const directDeps = getDirectDependencies(pkgJson);
@@ -179,7 +249,7 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
       advisoryId = `AUDIT-${pkgName}-${vulnData.severity || 'vuln'}`;
     }
 
-    const chains = extractDependencyChains(vulnData, pkgLock, directDeps);
+    const chains = extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData);
     const directRoots = findDirectRoots(chains, directDeps);
 
     // Format dependency path strings
@@ -215,7 +285,7 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
       },
     };
 
-    vulnRecord.remediation = buildRemediationSuggestion(vulnRecord, directRoots, pkgJson);
+    vulnRecord.remediation = buildRemediationSuggestion(vulnRecord, directRoots, pkgJson, chains);
     vulnerabilities.push(vulnRecord);
   }
 
