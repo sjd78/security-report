@@ -26,6 +26,55 @@ export function parseBranchMap(mapInput) {
   return {};
 }
 
+export function parseCollectorSettings(options = {}, fileConfig = {}) {
+  let npmAudit = true;
+  let jira = true;
+  let dependabot = true;
+
+  // 1. Config file settings
+  if (fileConfig.collectors) {
+    if (Array.isArray(fileConfig.collectors)) {
+      const set = new Set(fileConfig.collectors.map((c) => String(c).toLowerCase().replace(/[-_]/g, '')));
+      npmAudit = set.has('npmaudit');
+      jira = set.has('jira');
+      dependabot = set.has('dependabot');
+    } else if (typeof fileConfig.collectors === 'object') {
+      if (fileConfig.collectors.npmAudit !== undefined) npmAudit = Boolean(fileConfig.collectors.npmAudit);
+      if (fileConfig.collectors.jira !== undefined) jira = Boolean(fileConfig.collectors.jira);
+      if (fileConfig.collectors.dependabot !== undefined) dependabot = Boolean(fileConfig.collectors.dependabot);
+    }
+  }
+
+  // 2. Env variable override (e.g. SEC_COLLECTORS="jira")
+  const envCollectors = process.env.SEC_COLLECTORS;
+  if (envCollectors) {
+    const set = new Set(envCollectors.split(',').map((c) => c.trim().toLowerCase().replace(/[-_]/g, '')));
+    npmAudit = set.has('npmaudit');
+    jira = set.has('jira');
+    dependabot = set.has('dependabot');
+  }
+
+  // 3. CLI --collectors flag (e.g. --collectors jira or --collectors npm-audit,jira)
+  if (options.collectors) {
+    const list = Array.isArray(options.collectors) ? options.collectors : String(options.collectors).split(',');
+    const set = new Set(list.map((c) => c.trim().toLowerCase().replace(/[-_]/g, '')));
+    npmAudit = set.has('npmaudit');
+    jira = set.has('jira');
+    dependabot = set.has('dependabot');
+  }
+
+  // 4. Individual boolean flags (e.g. --no-jira, --no-npm-audit, --no-dependabot)
+  if (options.npmAudit === false || options.noNpmAudit === true) npmAudit = false;
+  if (options.jira === false || options.noJira === true) jira = false;
+  if (options.dependabot === false || options.noDependabot === true) dependabot = false;
+
+  return {
+    npmAudit,
+    jira,
+    dependabot,
+  };
+}
+
 export function loadConfig(options = {}) {
   const cwd = process.cwd();
   let fileConfig = {};
@@ -45,6 +94,7 @@ export function loadConfig(options = {}) {
       }
     }
   }
+
   const repo =
     options.repo ||
     options.repository ||
@@ -70,11 +120,15 @@ export function loadConfig(options = {}) {
     'release-0.10': ['8.1.x', '8.1', 'mta-8.1', 'MTA 8.1'],
   };
 
+  const collectors = parseCollectorSettings(options, fileConfig);
+
   return {
+    ...options,
     debug: Boolean(options.debug ?? (process.env.SEC_DEBUG === 'true' || fileConfig.debug || false)),
     repo,
     reposDir,
     reportsDir,
+    collectors,
     gitProtocol: options.gitProtocol || process.env.GIT_PROTOCOL || fileConfig.gitProtocol || 'https',
     githubToken: options.githubToken || process.env.GITHUB_TOKEN || fileConfig.githubToken || '',
     githubApiUrl: options.githubApiUrl || process.env.GITHUB_API_URL || fileConfig.githubApiUrl || 'https://api.github.com',
@@ -89,6 +143,5 @@ export function loadConfig(options = {}) {
     defaultBranches: options.branches || fileConfig.branches || ['main'],
     semverUpdateType: options.semverUpdateType || fileConfig.semverUpdateType || 'minor',
     allowOverrides: options.allowOverrides ?? fileConfig.allowOverrides ?? true,
-    ...options,
   };
 }

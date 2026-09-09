@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { parseJiraIssues, createJiraAuthHeader, groupJiraTicketsByBranch } from '../src/collectors/jira.js';
 import { parseDependabotAlerts, groupDependabotAlertsByBranch } from '../src/collectors/dependabot.js';
 import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible } from '../src/core/blender.js';
-import { parseBranchMap } from '../src/config.js';
+import { parseBranchMap, parseCollectorSettings } from '../src/config.js';
 
 test('createJiraAuthHeader: Basic Auth and Bearer token', () => {
   const basic = createJiraAuthHeader({ jira: { email: 'user@example.com', apiToken: 'secret123' } });
@@ -204,4 +204,60 @@ test('blendVulnerabilitySources: filters Jira tickets based on branch translatio
 
   // On release-0.10, it should match MTA-7679 (8.1)
   assert.equal(blended[1].vulnerabilities[0].sources.jira.ticketKey, 'MTA-7679');
+});
+
+test('parseCollectorSettings: enables/disables collectors correctly', () => {
+  // Default: all true
+  assert.deepEqual(parseCollectorSettings({}, {}), { npmAudit: true, jira: true, dependabot: true });
+
+  // Just Jira
+  assert.deepEqual(parseCollectorSettings({ collectors: 'jira' }, {}), { npmAudit: false, jira: true, dependabot: false });
+
+  // Just npm-audit
+  assert.deepEqual(parseCollectorSettings({ collectors: 'npm-audit' }, {}), { npmAudit: true, jira: false, dependabot: false });
+
+  // npm-audit and jira
+  assert.deepEqual(parseCollectorSettings({ collectors: 'npm-audit,jira' }, {}), { npmAudit: true, jira: true, dependabot: false });
+
+  // Disable flags
+  assert.deepEqual(parseCollectorSettings({ noJira: true }, {}), { npmAudit: true, jira: false, dependabot: true });
+  assert.deepEqual(parseCollectorSettings({ noNpmAudit: true }, {}), { npmAudit: false, jira: true, dependabot: true });
+
+  // From file config array
+  assert.deepEqual(parseCollectorSettings({}, { collectors: ['jira'] }), { npmAudit: false, jira: true, dependabot: false });
+});
+
+test('blendVulnerabilitySources: Jira-only run populates branch findings', () => {
+  const branchReports = [
+    {
+      branch: 'release-0.11',
+      vulnerabilities: [],
+    },
+  ];
+
+  const jiraTickets = {
+    branches: [
+      {
+        branch: 'release-0.11',
+        tickets: [
+          {
+            ticketKey: 'MTA-7680',
+            summary: 'CVE-2026-82417 qs vulnerability [mta-8.2]',
+            cve: 'CVE-2026-82417',
+            packageName: 'qs',
+            status: 'New',
+            affectsVersions: ['8.2'],
+            url: 'https://jira.example.com/browse/MTA-7680',
+          },
+        ],
+      },
+    ],
+  };
+
+  const blended = blendVulnerabilitySources(branchReports, { jiraTickets, dependabotAlerts: [] });
+  assert.equal(blended[0].vulnerabilities.length, 1);
+  assert.equal(blended[0].vulnerabilities[0].id, 'MTA-7680');
+  assert.equal(blended[0].vulnerabilities[0].cve, 'CVE-2026-82417');
+  assert.equal(blended[0].vulnerabilities[0].packageName, 'qs');
+  assert.equal(blended[0].summary.total, 1);
 });

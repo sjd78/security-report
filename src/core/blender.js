@@ -108,12 +108,16 @@ export function blendVulnerabilitySources(
       ? dependabotBranchMap.get(branchName)
       : allDependabotList;
 
+    const matchedJiraKeys = new Set();
+    const matchedDependabotNumbers = new Set();
+
     const vulnerabilities = (branchReport.vulnerabilities || []).map((v) => {
       const copy = { ...v, sources: { ...(v.sources || {}) } };
 
       // 1. Blend Jira with branch version awareness
       const matchedJira = matchJiraTicket(copy, branchJiraTickets, branchName, branchMap);
       if (matchedJira) {
+        matchedJiraKeys.add(matchedJira.ticketKey);
         copy.sources.jira = {
           ticketKey: matchedJira.ticketKey,
           url: matchedJira.url,
@@ -129,6 +133,7 @@ export function blendVulnerabilitySources(
       // 2. Blend Dependabot
       const matchedDependabot = matchDependabotAlert(copy, branchDependabotAlerts);
       if (matchedDependabot) {
+        matchedDependabotNumbers.add(matchedDependabot.alertNumber);
         copy.sources.dependabot = {
           alertNumber: matchedDependabot.alertNumber,
           url: matchedDependabot.url,
@@ -146,8 +151,89 @@ export function blendVulnerabilitySources(
       return copy;
     });
 
+    // Append any branch Jira tickets not matched to npm audit findings (e.g. when npmAudit is disabled or Jira has extra findings)
+    for (const ticket of branchJiraTickets) {
+      if (!matchedJiraKeys.has(ticket.ticketKey)) {
+        vulnerabilities.push({
+          id: ticket.ticketKey,
+          cve: ticket.cve,
+          packageName: ticket.packageName || ticket.summary,
+          severity: 'high',
+          title: ticket.summary,
+          url: ticket.url,
+          isDirect: false,
+          vulnerableVersionRange: null,
+          currentVersion: 'downstream-tracker',
+          targetSafeVersion: null,
+          dependencyPaths: [ticket.packageName || ticket.summary],
+          directRoots: [],
+          sources: {
+            jira: {
+              ticketKey: ticket.ticketKey,
+              url: ticket.url,
+              summary: ticket.summary,
+              status: ticket.status,
+              affectsVersions: ticket.affectsVersions || [],
+            },
+          },
+          remediation: {
+            strategy: 'jira-tracker',
+            packageJsonChanges: [],
+            lockfileActions: [],
+            note: `Tracked in Jira issue ${ticket.ticketKey} (${ticket.status})`,
+          },
+        });
+      }
+    }
+
+    // Append any branch Dependabot alerts not matched
+    for (const alert of branchDependabotAlerts) {
+      if (!matchedDependabotNumbers.has(alert.alertNumber)) {
+        vulnerabilities.push({
+          id: alert.ghsaId || `DEP-${alert.alertNumber}`,
+          cve: alert.cve,
+          packageName: alert.packageName,
+          severity: alert.severity || 'moderate',
+          title: alert.summary,
+          url: alert.url,
+          isDirect: false,
+          vulnerableVersionRange: alert.vulnerableVersionRange,
+          currentVersion: 'dependabot-alert',
+          targetSafeVersion: alert.targetSafeVersion,
+          dependencyPaths: [alert.packageName],
+          directRoots: [],
+          sources: {
+            dependabot: {
+              alertNumber: alert.alertNumber,
+              url: alert.url,
+              ghsaId: alert.ghsaId,
+              severity: alert.severity,
+            },
+          },
+          remediation: {
+            strategy: 'lockfile-update',
+            targetPackage: alert.packageName,
+            targetVersion: alert.targetSafeVersion,
+            packageJsonChanges: [],
+            lockfileActions: alert.targetSafeVersion
+              ? [`npm install ${alert.packageName}@${alert.targetSafeVersion} --package-lock-only`]
+              : [],
+          },
+        });
+      }
+    }
+
+    const summary = {
+      critical: vulnerabilities.filter((v) => v.severity === 'critical').length,
+      high: vulnerabilities.filter((v) => v.severity === 'high').length,
+      moderate: vulnerabilities.filter((v) => v.severity === 'moderate').length,
+      low: vulnerabilities.filter((v) => v.severity === 'low').length,
+      total: vulnerabilities.length,
+    };
+
     enrichedBranchReports.push({
       ...branchReport,
+      summary,
       vulnerabilities,
     });
   }

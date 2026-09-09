@@ -145,6 +145,7 @@ security-report/
 | `JIRA_API_TOKEN` | `--jira-api-token` | Jira API Token or PAT | `""` |
 | `JIRA_PROJECT` | `--jira-project` | Jira Project Key for CVE tickets | `MTA` |
 | `JIRA_JQL` | `--jira-jql` | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
+| `SEC_COLLECTORS` | `--collectors` | Comma-separated active collectors (`npm-audit`, `jira`, `dependabot`) | `npm-audit,jira,dependabot` |
 | `SEC_DEBUG` | `--debug` | Save raw collector outputs to `security-<name>-collection.json` | `false` |
 
 ---
@@ -152,20 +153,25 @@ security-report/
 ## 6. CLI Commands Reference
 
 ```bash
-# 1. Scan target branches and produce intermediate reports (Step 1)
-# Add --debug to inspect individual collector outputs before blending
+# 1. Scan target branches with all collectors
 sec-remediate scan --debug
 
-# Or specify repo and branches explicitly
-sec-remediate scan konveyor/tackle2-ui --branches main,release-0.12,release-0.11,release-0.10
+# 2. Run with JUST Jira (skips npm-audit and Dependabot)
+sec-remediate scan --collectors jira
 
-# 2. Dry-run remediation: preview changes and commit message without disk edits
+# 3. Run with JUST npm-audit (offline mode, skips Jira and Dependabot)
+sec-remediate scan --collectors npm-audit
+
+# 4. Run with specific disabled collectors
+sec-remediate scan --no-dependabot
+
+# 5. Dry-run remediation: preview changes and commit message without disk edits
 sec-remediate fix --dry-run
 
-# 3. Apply remediation and create Git commits on each branch (Step 2 & Step 3)
+# 6. Apply remediation and create Git commits on each branch (Step 2 & Step 3)
 sec-remediate fix --commit
 
-# 4. Apply remediation, commit, and push to remote
+# 7. Apply remediation, commit, and push to remote
 sec-remediate fix --commit --push
 ```
 

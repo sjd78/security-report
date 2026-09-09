@@ -9,8 +9,8 @@ import {
   pushBranch,
 } from './core/git-manager.js';
 import { collectNpmAudit } from './collectors/npm-audit.js';
-import { fetchJiraCveTickets } from './collectors/jira.js';
-import { fetchDependabotAlerts } from './collectors/dependabot.js';
+import { fetchJiraCveTickets, groupJiraTicketsByBranch } from './collectors/jira.js';
+import { fetchDependabotAlerts, groupDependabotAlertsByBranch } from './collectors/dependabot.js';
 import { blendVulnerabilitySources } from './core/blender.js';
 import { generateJsonReport, writeJsonReport } from './report/json-reporter.js';
 import { generateMarkdownReport, writeMarkdownReport } from './report/markdown-reporter.js';
@@ -50,43 +50,63 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
 
   console.log(`🌿 [Scan] Target branches (${branchesToScan.length}): ${branchesToScan.join(', ')}`);
 
-  // Fetch external sources in parallel
-  console.log(`📡 [Scan] Fetching Jira CVE tickets and GitHub Dependabot alerts...`);
-  const [jiraTickets, dependabotAlerts] = await Promise.all([
-    fetchJiraCveTickets(config, { maxResults: 100, branches: branchesToScan }),
-    fetchDependabotAlerts({
-      org: repoInfo.org,
-      name: repoInfo.name,
-      githubToken: config.githubToken,
-      githubApiUrl: config.githubApiUrl,
-      branches: branchesToScan,
-      defaultBranch: branchesToScan[0] || 'main',
-    }),
-  ]);
+  const enabledCollectors = [];
+  if (config.collectors.npmAudit) enabledCollectors.push('npm-audit');
+  if (config.collectors.jira) enabledCollectors.push('jira');
+  if (config.collectors.dependabot) enabledCollectors.push('dependabot');
+  console.log(`🔌 [Scan] Enabled collectors: ${enabledCollectors.join(', ') || 'none'}`);
+
+  // Fetch external sources conditionally
+  const jiraPromise = config.collectors.jira
+    ? fetchJiraCveTickets(config, { maxResults: 100, branches: branchesToScan })
+    : Promise.resolve(groupJiraTicketsByBranch([], branchesToScan, config.branchMap));
+
+  const dependabotPromise = config.collectors.dependabot
+    ? fetchDependabotAlerts({
+        org: repoInfo.org,
+        name: repoInfo.name,
+        githubToken: config.githubToken,
+        githubApiUrl: config.githubApiUrl,
+        branches: branchesToScan,
+        defaultBranch: branchesToScan[0] || 'main',
+      })
+    : Promise.resolve(groupDependabotAlertsByBranch([], branchesToScan));
+
+  const [jiraTickets, dependabotAlerts] = await Promise.all([jiraPromise, dependabotPromise]);
 
   const jiraCount = jiraTickets.totalTickets ?? (Array.isArray(jiraTickets) ? jiraTickets.length : 0);
   const dependabotCount = dependabotAlerts.totalAlerts ?? (Array.isArray(dependabotAlerts) ? dependabotAlerts.length : 0);
-  console.log(`📡 [Scan] Fetched ${jiraCount} Jira CVE ticket(s) and ${dependabotCount} Dependabot alert(s) across ${branchesToScan.length} branch(es)`);
-  // Run npm audit across all branch worktrees
+  if (config.collectors.jira || config.collectors.dependabot) {
+    console.log(`📡 [Scan] Fetched ${jiraCount} Jira CVE ticket(s) and ${dependabotCount} Dependabot alert(s) across ${branchesToScan.length} branch(es)`);
+  }
+
+  // Run npm audit across all branch worktrees conditionally
   const rawBranchReports = [];
   for (const branch of branchesToScan) {
-    console.log(`🔬 [Scan] Inspecting branch: ${branch}`);
-    try {
-      const branchReport = await withWorktree(repoInfo.repoPath, branch, async (worktreeDir) => {
-        return await collectNpmAudit(worktreeDir, branch);
-      });
-      rawBranchReports.push(branchReport);
-    } catch (err) {
-      console.warn(`⚠️ [Scan] Failed to audit branch ${branch}: ${err.message}`);
+    if (config.collectors.npmAudit) {
+      console.log(`🔬 [Scan] Inspecting branch: ${branch}`);
+      try {
+        const branchReport = await withWorktree(repoInfo.repoPath, branch, async (worktreeDir) => {
+          return await collectNpmAudit(worktreeDir, branch);
+        });
+        rawBranchReports.push(branchReport);
+      } catch (err) {
+        console.warn(`⚠️ [Scan] Failed to audit branch ${branch}: ${err.message}`);
+        rawBranchReports.push({
+          branch,
+          error: err.message,
+          summary: { critical: 0, high: 0, moderate: 0, low: 0, total: 0 },
+          vulnerabilities: [],
+        });
+      }
+    } else {
       rawBranchReports.push({
         branch,
-        error: err.message,
         summary: { critical: 0, high: 0, moderate: 0, low: 0, total: 0 },
         vulnerabilities: [],
       });
     }
   }
-
   // Save raw collector outputs in debug mode
   if (config.debug) {
     saveDebugCollection('jira', jiraTickets, config.reportsDir);
