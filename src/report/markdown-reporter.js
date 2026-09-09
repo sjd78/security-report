@@ -115,6 +115,13 @@ export function generateMarkdownReport(report) {
 
       const depTypeStr = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct Dependency' : 'Indirect (Transitive)'));
       lines.push(`- **Dependency Type:** ${depTypeStr}`);
+      if (v.workspaceDeclarations && v.workspaceDeclarations.length > 0) {
+        lines.push(`- **Direct Package Declarations (${v.workspaceDeclarations.length}):**`);
+        for (const decl of v.workspaceDeclarations) {
+          const wsLabel = decl.isRoot ? '`package.json`' : `\`${decl.packageJsonPath}\` (${decl.workspace})`;
+          lines.push(`  - ${wsLabel} [${decl.section}: \`${decl.range}\`]`);
+        }
+      }
       lines.push(``);
       // List of individual advisories for this package
       if (v.advisories && v.advisories.length > 0) {

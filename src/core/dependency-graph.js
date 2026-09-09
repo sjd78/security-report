@@ -381,18 +381,21 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
   const chains = extractDependencyChains({ name: pkgName, nodes: installedPaths }, pkgLock, directDeps, npmLsData);
   const directRoots = findDirectRoots(chains, directDeps);
 
-  // If directly declared in a workspace or root, create direct path entry if not already present
+  // If directly declared in a workspace or root, add every declaration as a direct path entry
   if (isDirect && workspaceDeclarations.length > 0) {
     const directVer = installedVersionSet.size > 0 ? Array.from(installedVersionSet)[0] : directInfo?.range || 'installed';
     for (const decl of workspaceDeclarations) {
-      const directPathStr = decl.isRoot ? `${pkgName}@${directVer}` : `${decl.workspace} -> ${pkgName}@${directVer}`;
-      if (!chains.some((c) => c.length === 1 && c[0].name === pkgName)) {
-        chains.unshift([{ name: pkgName, version: directVer, specifier: directPathStr }]);
+      const sectionTag = decl.section === 'devDependencies' ? ' (devDependencies)' : ' (dependencies)';
+      const wsName = decl.isRoot ? '[root]' : (decl.workspace || decl.packageJsonPath);
+      const directPathStr = `${wsName}${sectionTag} -> ${pkgName}@${decl.range || directVer}`;
+
+      if (!chains.some((c) => c.length === 1 && c[0].specifier === directPathStr)) {
+        chains.unshift([{ name: pkgName, version: directVer, specifier: directPathStr, isDirectDecl: true }]);
       }
     }
   }
 
-  const isIndirect = chains.some((c) => c.length > 1 || (c.length === 1 && c[0].name !== pkgName));
+  const isIndirect = chains.some((c) => c.length > 1 || (c.length === 1 && !c[0].isDirectDecl && c[0].name !== pkgName));
 
   let dependencyType = 'Unknown';
   if (isDirect && isIndirect) {
