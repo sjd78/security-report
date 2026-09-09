@@ -135,7 +135,7 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
   const cleanBase = baseUrl.replace(/\/+$/, '');
   const maxResults = options.maxResults || 50;
 
-  const fields = 'summary,description,status,labels,created,updated,versions,fixVersions,components';
+  const fields = 'summary,description,status,labels,created,updated,versions,components';
 
   let rawTickets = [];
 
@@ -166,7 +166,7 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
         },
         body: JSON.stringify({
           jql,
-          fields: ['summary', 'description', 'status', 'created', 'updated', 'labels', 'versions', 'fixVersions'],
+          fields: ['summary', 'description', 'status', 'created', 'updated', 'labels', 'versions'],
           maxResults,
         }),
       });
@@ -210,7 +210,7 @@ export function parseJiraIssues(data, baseUrl) {
 
     const packageName = extractPackageNameFromText(summary) || extractPackageNameFromText(descText);
 
-    // Extract affectsVersions and fixVersions
+    // Extract affectsVersions
     const versionsSet = new Set();
     if (Array.isArray(issue.fields?.versions)) {
       for (const v of issue.fields.versions) {
@@ -219,11 +219,6 @@ export function parseJiraIssues(data, baseUrl) {
           const simple = v.name.replace(/^MTA\s*/i, '');
           versionsSet.add(simple);
         }
-      }
-    }
-    if (Array.isArray(issue.fields?.fixVersions)) {
-      for (const v of issue.fields.fixVersions) {
-        if (v.name) versionsSet.add(v.name);
       }
     }
 

@@ -66,7 +66,7 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
 
   const jiraCount = jiraTickets.totalTickets ?? (Array.isArray(jiraTickets) ? jiraTickets.length : 0);
   const dependabotCount = dependabotAlerts.totalAlerts ?? (Array.isArray(dependabotAlerts) ? dependabotAlerts.length : 0);
-  console.log(`ℹ️ [Scan] Fetched ${jiraCount} Jira CVE ticket(s) and ${dependabotCount} Dependabot alert(s) across ${branchesToScan.length} branch(es)`);
+  console.log(`📡 [Scan] Fetched ${jiraCount} Jira CVE ticket(s) and ${dependabotCount} Dependabot alert(s) across ${branchesToScan.length} branch(es)`);
   // Run npm audit across all branch worktrees
   const rawBranchReports = [];
   for (const branch of branchesToScan) {
