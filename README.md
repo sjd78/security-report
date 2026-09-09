@@ -85,6 +85,7 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
 | `JIRA_API_TOKEN` | `--jira-api-token <token>`| Jira API token or Personal Access Token (PAT) | `""` |
 | `JIRA_PROJECT` | `--jira-project <key>` | Jira Project Key for CVE tickets | `MTA` |
 | `JIRA_JQL` | `--jira-jql <query>` | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
+| `SEC_DEBUG` | `--debug` | Save raw collector outputs to `security-<name>-collection.json` | `false` |
 
 ### Example Configuration File (`.security-report.json`)
 
@@ -106,7 +107,8 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
     "project": "MTA",
     "jql": "project = \"Migration Toolkit for Applications\" and labels = \"security\" and (summary ~ \"mta-ui-rhel8\" or summary ~ \"mta-ui-rhel9\" or summary ~ \"mta-ui-rhel10\") and status != Closed"
   },
-  "allowOverrides": true
+  "allowOverrides": true,
+  "debug": false
 }
 ```
 
@@ -131,8 +133,8 @@ sec-remediate scan [repo] [options]
 - `--jira-base-url <url>`: Atlassian Jira base URL.
 - `--jira-email <email>`: Jira user email.
 - `--jira-api-token <token>`: Jira API token.
-- `--jira-project <project>`: Jira Project Key (default: `SEC`).
-
+- `--jira-project <project>`: Jira Project Key (default: `MTA`).
+- `--debug`: Save intermediate collector outputs to `security-<name>-collection.json`.
 ---
 
 ### `sec-remediate fix [repo]` (or `sec-remediate remediate [repo]`)

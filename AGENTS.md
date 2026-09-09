@@ -138,6 +138,7 @@ security-report/
 | `JIRA_API_TOKEN` | `--jira-api-token` | Jira API Token or PAT | `""` |
 | `JIRA_PROJECT` | `--jira-project` | Jira Project Key for CVE tickets | `MTA` |
 | `JIRA_JQL` | `--jira-jql` | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
+| `SEC_DEBUG` | `--debug` | Save raw collector outputs to `security-<name>-collection.json` | `false` |
 
 ---
 
@@ -145,8 +146,8 @@ security-report/
 
 ```bash
 # 1. Scan target branches and produce intermediate reports (Step 1)
-# Uses `repo` and `branches` from .security-report.json if omitted
-sec-remediate scan
+# Add --debug to inspect individual collector outputs before blending
+sec-remediate scan --debug
 
 # Or specify repo and branches explicitly
 sec-remediate scan konveyor/tackle2-ui --branches main,release-0.12,release-0.11,release-0.10

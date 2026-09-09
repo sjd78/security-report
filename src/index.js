@@ -1,4 +1,5 @@
 import path from 'node:path';
+import fs from 'node:fs';
 import { loadConfig } from './config.js';
 import {
   ensureRepo,
@@ -15,6 +16,15 @@ import { generateJsonReport, writeJsonReport } from './report/json-reporter.js';
 import { generateMarkdownReport, writeMarkdownReport } from './report/markdown-reporter.js';
 import { remediateBranch } from './core/remediator.js';
 import { generateCommitMessage } from './core/commit-generator.js';
+
+export function saveDebugCollection(collectorName, data, reportsDir) {
+  fs.mkdirSync(reportsDir, { recursive: true });
+  const filename = `security-${collectorName}-collection.json`;
+  const filePath = path.resolve(reportsDir, filename);
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+  console.log(`🐛 [Debug] Saved ${collectorName} collection: ${filePath}`);
+  return filePath;
+}
 
 export async function scanRepository(repoSpec, cliOptions = {}) {
   const config = loadConfig(cliOptions);
@@ -74,6 +84,12 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
     }
   }
 
+  // Save raw collector outputs in debug mode
+  if (config.debug) {
+    saveDebugCollection('jira', jiraTickets, config.reportsDir);
+    saveDebugCollection('dependabot', dependabotAlerts, config.reportsDir);
+    saveDebugCollection('npm-audit', rawBranchReports, config.reportsDir);
+  }
   // Blend sources
   console.log(`🔄 [Scan] Blending audit findings with Jira and Dependabot...`);
   const blendedBranches = blendVulnerabilitySources(rawBranchReports, {

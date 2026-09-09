@@ -71,6 +71,7 @@ export function loadConfig(options = {}) {
   };
 
   return {
+    debug: Boolean(options.debug ?? (process.env.SEC_DEBUG === 'true' || fileConfig.debug || false)),
     repo,
     reposDir,
     reportsDir,

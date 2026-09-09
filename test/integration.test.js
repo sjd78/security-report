@@ -71,6 +71,7 @@ test('End-to-End: Multi-branch scan, report, and commit message flow', async () 
       branches: 'main,release/1.0',
       reposDir,
       reportsDir,
+      debug: true,
     });
 
     assert.ok(scanResult);
@@ -80,6 +81,10 @@ test('End-to-End: Multi-branch scan, report, and commit message flow', async () 
 
     const jsonReport = JSON.parse(fs.readFileSync(scanResult.jsonPath, 'utf8'));
     assert.equal(jsonReport.branches.length, 2);
+    // Verify debug collector outputs
+    assert.ok(fs.existsSync(path.join(reportsDir, 'security-jira-collection.json')));
+    assert.ok(fs.existsSync(path.join(reportsDir, 'security-dependabot-collection.json')));
+    assert.ok(fs.existsSync(path.join(reportsDir, 'security-npm-audit-collection.json')));
 
     // 3. Test Commit Message generation with mock remediation
     const mockRemResult = {
