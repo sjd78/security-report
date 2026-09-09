@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseJiraIssues, createJiraAuthHeader, groupJiraTicketsByBranch } from '../src/collectors/jira.js';
 import { parseDependabotAlerts, groupDependabotAlertsByBranch } from '../src/collectors/dependabot.js';
-import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible } from '../src/core/blender.js';
+import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible, consolidateVulnerabilitiesByPackage } from '../src/core/blender.js';
 import { parseBranchMap, parseCollectorSettings } from '../src/config.js';
 
 test('createJiraAuthHeader: Basic Auth and Bearer token', () => {
@@ -260,4 +260,45 @@ test('blendVulnerabilitySources: Jira-only run populates branch findings', () =>
   assert.equal(blended[0].vulnerabilities[0].cve, 'CVE-2026-82417');
   assert.equal(blended[0].vulnerabilities[0].packageName, 'qs');
   assert.equal(blended[0].summary.total, 1);
+});
+
+test('consolidateVulnerabilitiesByPackage: groups multiple CVEs and Jira tickets under one package', () => {
+  const rawFindings = [
+    {
+      id: 'GHSA-1',
+      cve: 'CVE-2026-67314',
+      packageName: 'axios',
+      severity: 'high',
+      currentVersion: '1.6.0',
+      targetSafeVersion: '1.7.4',
+      title: 'Prototype Pollution in Basic Auth',
+      sources: { jira: { ticketKey: 'MTA-7574', url: 'https://jira/MTA-7574' } },
+      remediation: { strategy: 'bump-direct', targetPackage: 'axios', targetVersion: '1.7.4' },
+    },
+    {
+      id: 'GHSA-2',
+      cve: 'CVE-2026-67320',
+      packageName: 'axios',
+      severity: 'high',
+      currentVersion: '1.6.0',
+      targetSafeVersion: '1.7.2',
+      title: 'Information disclosure in HTTP adapter',
+      sources: { jira: { ticketKey: 'MTA-7573', url: 'https://jira/MTA-7573' } },
+      remediation: { strategy: 'bump-direct', targetPackage: 'axios', targetVersion: '1.7.2' },
+    },
+  ];
+
+  const consolidated = consolidateVulnerabilitiesByPackage(rawFindings);
+  assert.equal(consolidated.length, 1);
+
+  const axiosPkg = consolidated[0];
+  assert.equal(axiosPkg.packageName, 'axios');
+  assert.equal(axiosPkg.severity, 'high');
+  assert.equal(axiosPkg.targetSafeVersion, '1.7.4');
+  assert.equal(axiosPkg.cves.length, 2);
+  assert.ok(axiosPkg.cves.includes('CVE-2026-67314'));
+  assert.ok(axiosPkg.cves.includes('CVE-2026-67320'));
+  assert.equal(axiosPkg.sources.jiraTickets.length, 2);
+  assert.equal(axiosPkg.advisories.length, 2);
+  assert.equal(axiosPkg.remediation.targetVersion, '1.7.4');
 });

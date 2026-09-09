@@ -1,3 +1,5 @@
+import semver from 'semver';
+
 export function isVersionCompatible(ticketVersions = [], targetVersions = []) {
   if (!targetVersions || targetVersions.length === 0) return true;
   if (!ticketVersions || ticketVersions.length === 0) return true;
@@ -17,6 +19,22 @@ export function isVersionCompatible(ticketVersions = [], targetVersions = []) {
   return false;
 }
 
+export function compareSeverities(a, b) {
+  const rank = { critical: 4, high: 3, moderate: 2, low: 1, info: 0 };
+  return (rank[b?.toLowerCase()] || 0) - (rank[a?.toLowerCase()] || 0);
+}
+
+export function pickHighestSafeVersion(verA, verB) {
+  if (!verA) return verB || null;
+  if (!verB) return verA || null;
+  const cleanA = semver.clean(String(verA).replace(/^[~^]/, ''));
+  const cleanB = semver.clean(String(verB).replace(/^[~^]/, ''));
+  if (cleanA && cleanB && semver.valid(cleanA) && semver.valid(cleanB)) {
+    return semver.gt(cleanB, cleanA) ? verB : verA;
+  }
+  return verA || verB;
+}
+
 export function matchJiraTicket(vuln, jiraTickets, branchName = null, branchMap = {}) {
   if (!jiraTickets || jiraTickets.length === 0) return null;
 
@@ -25,7 +43,6 @@ export function matchJiraTicket(vuln, jiraTickets, branchName = null, branchMap 
     : [];
 
   for (const ticket of jiraTickets) {
-    // Check version compatibility if branchMap is defined
     if (targetVersions.length > 0) {
       const compatible = isVersionCompatible(ticket.affectsVersions, targetVersions);
       if (!compatible) continue;
@@ -73,13 +90,155 @@ export function matchDependabotAlert(vuln, dependabotAlerts) {
   return null;
 }
 
+export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
+  const packageMap = new Map();
+
+  for (const v of rawVulnerabilities) {
+    const pkgKey = (v.packageName || 'unknown').toLowerCase();
+
+    if (!packageMap.has(pkgKey)) {
+      const cves = v.cve ? [v.cve] : [];
+      if (Array.isArray(v.cves)) {
+        for (const c of v.cves) {
+          if (!cves.includes(c)) cves.push(c);
+        }
+      }
+
+      packageMap.set(pkgKey, {
+        packageName: v.packageName,
+        severity: v.severity || 'moderate',
+        isDirect: Boolean(v.isDirect),
+        currentVersion: v.currentVersion || 'unknown',
+        targetSafeVersion: v.targetSafeVersion || null,
+        vulnerableVersionRange: v.vulnerableVersionRange || null,
+        id: v.id,
+        cve: v.cve || cves[0] || null,
+        cves,
+        title: v.title || `${v.packageName} vulnerability`,
+        url: v.url || null,
+        advisories: [
+          {
+            id: v.id,
+            cve: v.cve || null,
+            title: v.title,
+            severity: v.severity,
+            url: v.url,
+            vulnerableVersionRange: v.vulnerableVersionRange,
+            targetSafeVersion: v.targetSafeVersion,
+            sources: v.sources,
+          },
+        ],
+        dependencyPaths: [...(v.dependencyPaths || [])],
+        directRoots: [...(v.directRoots || [])],
+        sources: {
+          jiraTickets: v.sources?.jira ? [v.sources.jira] : [],
+          dependabotAlerts: v.sources?.dependabot ? [v.sources.dependabot] : [],
+          jira: v.sources?.jira || null,
+          dependabot: v.sources?.dependabot || null,
+          npmAudit: v.sources?.npmAudit || null,
+        },
+        remediation: v.remediation ? { ...v.remediation } : null,
+      });
+    } else {
+      const existing = packageMap.get(pkgKey);
+
+      // 1. Upgrade severity to highest
+      if (compareSeverities(existing.severity, v.severity) > 0) {
+        existing.severity = v.severity;
+      }
+
+      // 2. Target safe version: pick the highest
+      existing.targetSafeVersion = pickHighestSafeVersion(existing.targetSafeVersion, v.targetSafeVersion);
+
+      // 3. Mark isDirect true if any finding is direct
+      if (v.isDirect) existing.isDirect = true;
+
+      // 4. Collect unique CVEs
+      if (v.cve && !existing.cves.includes(v.cve)) {
+        existing.cves.push(v.cve);
+        if (!existing.cve) existing.cve = v.cve;
+      }
+      if (Array.isArray(v.cves)) {
+        for (const c of v.cves) {
+          if (!existing.cves.includes(c)) existing.cves.push(c);
+        }
+      }
+
+      // 5. Add advisory entry
+      existing.advisories.push({
+        id: v.id,
+        cve: v.cve || null,
+        title: v.title,
+        severity: v.severity,
+        url: v.url,
+        vulnerableVersionRange: v.vulnerableVersionRange,
+        targetSafeVersion: v.targetSafeVersion,
+        sources: v.sources,
+      });
+
+      // 6. Merge dependency paths
+      for (const p of v.dependencyPaths || []) {
+        if (!existing.dependencyPaths.includes(p)) {
+          existing.dependencyPaths.push(p);
+        }
+      }
+
+      // 7. Merge direct roots
+      for (const r of v.directRoots || []) {
+        if (!existing.directRoots.some((dr) => dr.name === r.name)) {
+          existing.directRoots.push(r);
+        }
+      }
+
+      // 8. Merge Jira tickets
+      if (v.sources?.jira) {
+        if (!existing.sources.jiraTickets.some((t) => t.ticketKey === v.sources.jira.ticketKey)) {
+          existing.sources.jiraTickets.push(v.sources.jira);
+        }
+        if (!existing.sources.jira) existing.sources.jira = v.sources.jira;
+      }
+
+      // 9. Merge Dependabot alerts
+      if (v.sources?.dependabot) {
+        if (!existing.sources.dependabotAlerts.some((a) => a.alertNumber === v.sources.dependabot.alertNumber)) {
+          existing.sources.dependabotAlerts.push(v.sources.dependabot);
+        }
+        if (!existing.sources.dependabot) existing.sources.dependabot = v.sources.dependabot;
+      }
+
+      // 10. Merge remediation plan
+      if (v.remediation) {
+        if (!existing.remediation) {
+          existing.remediation = { ...v.remediation };
+        } else {
+          if (existing.remediation.strategy === 'jira-tracker' && v.remediation.strategy !== 'jira-tracker') {
+            existing.remediation = { ...v.remediation };
+          }
+          if (existing.targetSafeVersion) {
+            existing.remediation.targetVersion = existing.targetSafeVersion;
+            for (const chg of existing.remediation.packageJsonChanges || []) {
+              if (chg.package === existing.packageName) {
+                const prefix = chg.from?.startsWith('~') ? '~' : chg.from?.startsWith('^') ? '^' : '';
+                chg.to = `${prefix}${existing.targetSafeVersion}`;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const consolidated = Array.from(packageMap.values());
+  consolidated.sort((a, b) => compareSeverities(b.severity, a.severity));
+  return consolidated;
+}
+
 export function blendVulnerabilitySources(
   branchReports = [],
   { jiraTickets = [], dependabotAlerts = [], branchMap = {} } = {}
 ) {
   const enrichedBranchReports = [];
 
-  // Extract branch-specific ticket and alert maps if available
   const jiraBranchMap = new Map();
   if (jiraTickets && typeof jiraTickets === 'object' && Array.isArray(jiraTickets.branches)) {
     for (const bg of jiraTickets.branches) {
@@ -111,10 +270,9 @@ export function blendVulnerabilitySources(
     const matchedJiraKeys = new Set();
     const matchedDependabotNumbers = new Set();
 
-    const vulnerabilities = (branchReport.vulnerabilities || []).map((v) => {
+    const rawVulns = (branchReport.vulnerabilities || []).map((v) => {
       const copy = { ...v, sources: { ...(v.sources || {}) } };
 
-      // 1. Blend Jira with branch version awareness
       const matchedJira = matchJiraTicket(copy, branchJiraTickets, branchName, branchMap);
       if (matchedJira) {
         matchedJiraKeys.add(matchedJira.ticketKey);
@@ -130,7 +288,6 @@ export function blendVulnerabilitySources(
         }
       }
 
-      // 2. Blend Dependabot
       const matchedDependabot = matchDependabotAlert(copy, branchDependabotAlerts);
       if (matchedDependabot) {
         matchedDependabotNumbers.add(matchedDependabot.alertNumber);
@@ -151,10 +308,10 @@ export function blendVulnerabilitySources(
       return copy;
     });
 
-    // Append any branch Jira tickets not matched to npm audit findings (e.g. when npmAudit is disabled or Jira has extra findings)
+    // Unmatched branch Jira tickets
     for (const ticket of branchJiraTickets) {
       if (!matchedJiraKeys.has(ticket.ticketKey)) {
-        vulnerabilities.push({
+        rawVulns.push({
           id: ticket.ticketKey,
           cve: ticket.cve,
           packageName: ticket.packageName || ticket.summary,
@@ -186,10 +343,10 @@ export function blendVulnerabilitySources(
       }
     }
 
-    // Append any branch Dependabot alerts not matched
+    // Unmatched branch Dependabot alerts
     for (const alert of branchDependabotAlerts) {
       if (!matchedDependabotNumbers.has(alert.alertNumber)) {
-        vulnerabilities.push({
+        rawVulns.push({
           id: alert.ghsaId || `DEP-${alert.alertNumber}`,
           cve: alert.cve,
           packageName: alert.packageName,
@@ -223,18 +380,21 @@ export function blendVulnerabilitySources(
       }
     }
 
+    // Consolidate packages to a single entry per package
+    const consolidatedPackages = consolidateVulnerabilitiesByPackage(rawVulns);
+
     const summary = {
-      critical: vulnerabilities.filter((v) => v.severity === 'critical').length,
-      high: vulnerabilities.filter((v) => v.severity === 'high').length,
-      moderate: vulnerabilities.filter((v) => v.severity === 'moderate').length,
-      low: vulnerabilities.filter((v) => v.severity === 'low').length,
-      total: vulnerabilities.length,
+      critical: consolidatedPackages.filter((v) => v.severity === 'critical').length,
+      high: consolidatedPackages.filter((v) => v.severity === 'high').length,
+      moderate: consolidatedPackages.filter((v) => v.severity === 'moderate').length,
+      low: consolidatedPackages.filter((v) => v.severity === 'low').length,
+      total: consolidatedPackages.length,
     };
 
     enrichedBranchReports.push({
       ...branchReport,
       summary,
-      vulnerabilities,
+      vulnerabilities: consolidatedPackages,
     });
   }
 

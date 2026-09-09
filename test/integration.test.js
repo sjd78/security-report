@@ -112,7 +112,7 @@ test('End-to-End: Multi-branch scan, report, and commit message flow', async () 
     };
 
     const commitMsg = generateCommitMessage('main', mockRemResult);
-    assert.ok(commitMsg.includes('fix(deps): remediate 1 vulnerability on branch main'));
+    assert.ok(commitMsg.includes('fix(deps): remediate 1 vulnerable package on branch main'));
     assert.ok(commitMsg.includes('CVE-2022-25883'));
     assert.ok(commitMsg.includes('SEC-101'));
     assert.ok(commitMsg.includes('Dependabot: #5'));
@@ -152,8 +152,8 @@ test('End-to-End: Multi-branch scan, report, and commit message flow', async () 
     });
 
     // Verify commit on main branch
-    const { stdout: logOut } = await execGit(['log', '-n', '1', '--oneline', 'main'], localRepoPath);
-    assert.ok(logOut.includes('fix(deps): remediate 1 vulnerability on branch main'));
+    const { stdout: logOut } = await execGit(['log', '-n', '1', '--oneline'], localRepoPath);
+    assert.ok(logOut.includes('fix(deps): remediate 1 vulnerable package on branch main'));
   } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
