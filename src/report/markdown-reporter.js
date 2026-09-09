@@ -77,7 +77,7 @@ export function generateMarkdownReport(report) {
     lines.push(`| :--- | :---: | :---: | :--- | :--- | :--- |`);
 
     for (const v of b.vulnerabilities) {
-      const typeLabel = v.isDirect ? 'Direct' : 'Indirect';
+      const typeLabel = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct' : 'Indirect (Transitive)'));
       const targetFix = v.targetSafeVersion ? `\`${v.targetSafeVersion}\`` : '_No fix_';
       const links = formatTicketLinks(v);
       lines.push(
@@ -113,9 +113,8 @@ export function generateMarkdownReport(report) {
         lines.push(`- **Dependabot Alert:** [#${v.sources.dependabot.alertNumber}](${v.sources.dependabot.url})`);
       }
 
-      lines.push(`- **Dependency Type:** ${v.isDirect ? 'Direct Dependency' : 'Indirect (Transitive)'}`);
-      lines.push(`- **Installed Version:** \`${v.currentVersion}\``);
-      lines.push(`- **Target Safe Version:** \`${v.targetSafeVersion || 'N/A'}\``);
+      const depTypeStr = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct Dependency' : 'Indirect (Transitive)'));
+      lines.push(`- **Dependency Type:** ${depTypeStr}`);
       lines.push(``);
       // List of individual advisories for this package
       if (v.advisories && v.advisories.length > 0) {
@@ -155,12 +154,13 @@ export function generateMarkdownReport(report) {
       }
 
       if (rem.packageJsonChanges && rem.packageJsonChanges.length > 0) {
-        lines.push(`1. Update \`package.json\`:`);
+        lines.push(`1. Update \`package.json\` file(s):`);
         for (const chg of rem.packageJsonChanges) {
+          const fileNote = chg.packageJsonPath ? ` (\`${chg.packageJsonPath}\`)` : '';
           if (chg.section === 'overrides') {
-            lines.push(`   - Add to \`overrides\`: \`"${chg.package}": "${chg.to}"\``);
+            lines.push(`   - Add to \`overrides\`: \`"${chg.package}": "${chg.to}"\`${fileNote}`);
           } else {
-            lines.push(`   - Bump \`${chg.package}\` from \`${chg.from || 'none'}\` to \`${chg.to}\` in \`${chg.section}\``);
+            lines.push(`   - Bump \`${chg.package}\` from \`${chg.from || 'none'}\` to \`${chg.to}\` in \`${chg.section}\`${fileNote}`);
           }
         }
       }

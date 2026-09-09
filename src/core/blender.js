@@ -139,6 +139,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         cves,
         title: v.title || `${v.packageName} vulnerability`,
         url: v.url || null,
+        workspaceDeclarations: [...(v.workspaceDeclarations || [])],
         advisories: [
           {
             id: v.id,
@@ -200,7 +201,15 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         }
       }
 
-      // 5. Add advisory entry
+      // 5. Merge workspace declarations
+      existing.workspaceDeclarations = existing.workspaceDeclarations || [];
+      for (const d of v.workspaceDeclarations || []) {
+        if (!existing.workspaceDeclarations.some((ed) => ed.packageJsonPath === d.packageJsonPath)) {
+          existing.workspaceDeclarations.push(d);
+        }
+      }
+
+      // 6. Add advisory entry
       existing.advisories.push({
         id: v.id,
         cve: v.cve || null,
@@ -212,21 +221,21 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         sources: v.sources,
       });
 
-      // 6. Merge dependency paths
+      // 7. Merge dependency paths
       for (const p of v.dependencyPaths || []) {
         if (!existing.dependencyPaths.includes(p)) {
           existing.dependencyPaths.push(p);
         }
       }
 
-      // 7. Merge direct roots
+      // 8. Merge direct roots
       for (const r of v.directRoots || []) {
         if (!existing.directRoots.some((dr) => dr.name === r.name)) {
           existing.directRoots.push(r);
         }
       }
 
-      // 8. Merge Jira tickets
+      // 9. Merge Jira tickets
       if (v.sources?.jira) {
         if (!existing.sources.jiraTickets.some((t) => t.ticketKey === v.sources.jira.ticketKey)) {
           existing.sources.jiraTickets.push(v.sources.jira);
@@ -234,7 +243,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         if (!existing.sources.jira) existing.sources.jira = v.sources.jira;
       }
 
-      // 9. Merge Dependabot alerts
+      // 10. Merge Dependabot alerts
       if (v.sources?.dependabot) {
         if (!existing.sources.dependabotAlerts.some((a) => a.alertNumber === v.sources.dependabot.alertNumber)) {
           existing.sources.dependabotAlerts.push(v.sources.dependabot);
@@ -242,7 +251,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         if (!existing.sources.dependabot) existing.sources.dependabot = v.sources.dependabot;
       }
 
-      // 10. Merge remediation plan
+      // 11. Merge remediation plan
       if (v.remediation) {
         if (!existing.remediation) {
           existing.remediation = { ...v.remediation };
@@ -261,23 +270,39 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
       if (pkg.remediation) {
         pkg.remediation.targetVersion = optimalSafeVersion;
 
-        // If package is Direct & Indirect, update strategy
-        if (pkg.dependencyType === 'Direct & Indirect' || (pkg.isDirect && pkg.isIndirect)) {
+        // If package is Direct or Direct & Indirect, ensure all workspace declarations are updated
+        const isDual = pkg.dependencyType === 'Direct & Indirect' || (pkg.isDirect && pkg.isIndirect);
+        if (isDual) {
           pkg.remediation.strategy = 'bump-direct-and-lockfile';
           pkg.remediation.note = 'Package is both a direct dependency and required transitively. Resolution updates package.json semver and synchronizes lockfile for all instances.';
         }
 
-        for (const chg of pkg.remediation.packageJsonChanges || []) {
-          if (chg.package === pkg.packageName) {
-            const prefix = chg.from?.startsWith('~') ? '~' : chg.from?.startsWith('^') ? '^' : '';
-            chg.to = `${prefix}${optimalSafeVersion}`;
+        if (pkg.isDirect && pkg.workspaceDeclarations && pkg.workspaceDeclarations.length > 0) {
+          const updatedChanges = [];
+          for (const decl of pkg.workspaceDeclarations) {
+            const currentRange = decl.range || `^${String(pkg.currentVersion || '').split(',')[0].trim()}`;
+            const prefix = currentRange.startsWith('~') ? '~' : currentRange.startsWith('^') ? '^' : '';
+            updatedChanges.push({
+              package: pkg.packageName,
+              section: decl.section || 'dependencies',
+              from: currentRange,
+              to: `${prefix}${optimalSafeVersion}`,
+              packageJsonPath: decl.packageJsonPath || 'package.json',
+              workspace: decl.workspace || null,
+            });
+          }
+          pkg.remediation.packageJsonChanges = updatedChanges;
+        } else {
+          for (const chg of pkg.remediation.packageJsonChanges || []) {
+            if (chg.package === pkg.packageName) {
+              const prefix = chg.from?.startsWith('~') ? '~' : chg.from?.startsWith('^') ? '^' : '';
+              chg.to = `${prefix}${optimalSafeVersion}`;
+            }
           }
         }
-        let targetRange = optimalSafeVersion;
-        const matchingChange = (pkg.remediation.packageJsonChanges || []).find((c) => c.package === pkg.packageName);
-        if (matchingChange && matchingChange.to) {
-          targetRange = matchingChange.to;
-        }
+
+        const primaryPrefix = pkg.remediation.packageJsonChanges?.[0]?.to?.startsWith('~') ? '~' : '^';
+        const targetRange = pkg.isDirect ? `${primaryPrefix}${optimalSafeVersion}` : optimalSafeVersion;
 
         if (pkg.remediation.lockfileActions) {
           pkg.remediation.lockfileActions = pkg.remediation.lockfileActions.map((act) =>
@@ -378,7 +403,8 @@ export function blendVulnerabilitySources(
           ticket.packageName,
           branchReport.pkgJson,
           branchReport.pkgLock,
-          branchReport.npmLsData
+          branchReport.npmLsData,
+          branchReport.workspaces || branchReport.worktreeDir
         );
 
         const currentVersion = pkgInfo.currentVersion !== 'unknown'
@@ -400,13 +426,16 @@ export function blendVulnerabilitySources(
           dependencyType,
           currentVersion,
           targetSafeVersion: targetSafe,
+          workspaceDeclarations: pkgInfo.workspaceDeclarations,
         };
 
         const remediation = buildRemediationSuggestion(
           dummyVuln,
           pkgInfo.directRoots,
           branchReport.pkgJson,
-          pkgInfo.chains
+          pkgInfo.chains,
+          pkgInfo.directInfo,
+          branchReport.workspaces || branchReport.worktreeDir
         );
 
         rawVulns.push({
@@ -419,6 +448,7 @@ export function blendVulnerabilitySources(
           isDirect,
           isIndirect,
           dependencyType,
+          workspaceDeclarations: pkgInfo.workspaceDeclarations,
           vulnerableVersionRange: ticket.vulnerableVersionRange || null,
           currentVersion,
           targetSafeVersion: targetSafe,
@@ -445,7 +475,8 @@ export function blendVulnerabilitySources(
           alert.packageName,
           branchReport.pkgJson,
           branchReport.pkgLock,
-          branchReport.npmLsData
+          branchReport.npmLsData,
+          branchReport.workspaces || branchReport.worktreeDir
         );
 
         const currentVersion = pkgInfo.currentVersion !== 'unknown'
@@ -465,13 +496,16 @@ export function blendVulnerabilitySources(
           dependencyType,
           currentVersion,
           targetSafeVersion: alert.targetSafeVersion,
+          workspaceDeclarations: pkgInfo.workspaceDeclarations,
         };
 
         const remediation = buildRemediationSuggestion(
           dummyVuln,
           pkgInfo.directRoots,
           branchReport.pkgJson,
-          pkgInfo.chains
+          pkgInfo.chains,
+          pkgInfo.directInfo,
+          branchReport.workspaces || branchReport.worktreeDir
         );
 
         rawVulns.push({
@@ -484,6 +518,7 @@ export function blendVulnerabilitySources(
           isDirect,
           isIndirect,
           dependencyType,
+          workspaceDeclarations: pkgInfo.workspaceDeclarations,
           vulnerableVersionRange: alert.vulnerableVersionRange,
           currentVersion,
           targetSafeVersion: alert.targetSafeVersion,

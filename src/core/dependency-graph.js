@@ -96,13 +96,18 @@ export function findWorkspacePackageJsons(worktreeDir, rootPkgJson = null) {
   return results;
 }
 
-export function getDirectDependencies(pkgJson, worktreeDir = null) {
+export function getDirectDependencies(pkgJson, worktreeOrWorkspaces = null) {
   const direct = new Map();
   const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
 
-  const workspaceEntries = worktreeDir
-    ? findWorkspacePackageJsons(worktreeDir, pkgJson)
-    : (pkgJson ? [{ pkgJson, relativePath: 'package.json', name: 'root', isRoot: true }] : []);
+  let workspaceEntries = [];
+  if (Array.isArray(worktreeOrWorkspaces)) {
+    workspaceEntries = worktreeOrWorkspaces;
+  } else if (typeof worktreeOrWorkspaces === 'string') {
+    workspaceEntries = findWorkspacePackageJsons(worktreeOrWorkspaces, pkgJson);
+  } else if (pkgJson) {
+    workspaceEntries = [{ pkgJson, relativePath: 'package.json', name: 'root', isRoot: true }];
+  }
 
   for (const ws of workspaceEntries) {
     const wsPkg = ws.pkgJson;
@@ -336,7 +341,7 @@ export function findDirectRoots(chains, directDeps) {
   return Array.from(rootsMap.values());
 }
 
-export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData = null, worktreeDir = null) {
+export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData = null, worktreeOrWorkspaces = null) {
   if (!pkgName) {
     return {
       isDirect: false,
@@ -352,7 +357,7 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
     };
   }
 
-  const directDeps = getDirectDependencies(pkgJson, worktreeDir);
+  const directDeps = getDirectDependencies(pkgJson, worktreeOrWorkspaces);
   const isDirect = directDeps.has(pkgName);
   const directInfo = isDirect ? directDeps.get(pkgName) : null;
   const workspaceDeclarations = directInfo?.declarations || [];
@@ -375,6 +380,17 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
 
   const chains = extractDependencyChains({ name: pkgName, nodes: installedPaths }, pkgLock, directDeps, npmLsData);
   const directRoots = findDirectRoots(chains, directDeps);
+
+  // If directly declared in a workspace or root, create direct path entry if not already present
+  if (isDirect && workspaceDeclarations.length > 0) {
+    const directVer = installedVersionSet.size > 0 ? Array.from(installedVersionSet)[0] : directInfo?.range || 'installed';
+    for (const decl of workspaceDeclarations) {
+      const directPathStr = decl.isRoot ? `${pkgName}@${directVer}` : `${decl.workspace} -> ${pkgName}@${directVer}`;
+      if (!chains.some((c) => c.length === 1 && c[0].name === pkgName)) {
+        chains.unshift([{ name: pkgName, version: directVer, specifier: directPathStr }]);
+      }
+    }
+  }
 
   const isIndirect = chains.some((c) => c.length > 1 || (c.length === 1 && c[0].name !== pkgName));
 

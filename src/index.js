@@ -8,7 +8,7 @@ import {
   stageAndCommit,
   pushBranch,
 } from './core/git-manager.js';
-import { readPackageJson, readPackageLock, runNpmLs } from './core/dependency-graph.js';
+import { readPackageJson, readPackageLock, runNpmLs, findWorkspacePackageJsons } from './core/dependency-graph.js';
 import { collectNpmAudit } from './collectors/npm-audit.js';
 import { fetchJiraCveTickets, groupJiraTicketsByBranch } from './collectors/jira.js';
 import { fetchDependabotAlerts, groupDependabotAlertsByBranch } from './collectors/dependabot.js';
@@ -89,6 +89,7 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
       const branchReport = await withWorktree(repoInfo.repoPath, branch, async (worktreeDir) => {
         const pkgJson = readPackageJson(worktreeDir);
         const pkgLock = readPackageLock(worktreeDir);
+        const workspaces = findWorkspacePackageJsons(worktreeDir, pkgJson);
         let npmLsData = null;
         try {
           npmLsData = await runNpmLs(worktreeDir);
@@ -106,6 +107,7 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
           pkgJson,
           pkgLock,
           npmLsData,
+          workspaces,
         };
       });
       rawBranchReports.push(branchReport);
