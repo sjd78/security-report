@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseJiraIssues, createJiraAuthHeader } from '../src/collectors/jira.js';
 import { parseDependabotAlerts } from '../src/collectors/dependabot.js';
-import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert } from '../src/core/blender.js';
+import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible } from '../src/core/blender.js';
+import { parseBranchMap } from '../src/config.js';
 
 test('createJiraAuthHeader: Basic Auth and Bearer token', () => {
   const basic = createJiraAuthHeader({ jira: { email: 'user@example.com', apiToken: 'secret123' } });
@@ -112,4 +113,64 @@ test('blendVulnerabilitySources: enriches npm audit with Jira and Dependabot', (
   assert.equal(vuln.targetSafeVersion, '4.17.21');
   assert.equal(vuln.sources.jira.ticketKey, 'SEC-500');
   assert.equal(vuln.sources.dependabot.alertNumber, 99);
+});
+
+test('parseBranchMap: parses key=val and JSON string formats', () => {
+  const parsedStr = parseBranchMap('main=8.3,release-0.11=8.2,release-0.10=8.1');
+  assert.deepEqual(parsedStr.main, ['8.3']);
+  assert.deepEqual(parsedStr['release-0.11'], ['8.2']);
+
+  const parsedJson = parseBranchMap('{"main":["8.3"],"release-0.11":["8.2"]}');
+  assert.deepEqual(parsedJson.main, ['8.3']);
+});
+
+test('isVersionCompatible: matches version strings correctly', () => {
+  assert.equal(isVersionCompatible(['MTA 8.2.0', 'mta-8.2'], ['8.2.x', '8.2']), true);
+  assert.equal(isVersionCompatible(['MTA 8.1.0'], ['8.2.x', '8.2']), false);
+  assert.equal(isVersionCompatible(['MTA 8.1.0'], ['8.1']), true);
+});
+
+test('blendVulnerabilitySources: filters Jira tickets based on branch translation table', () => {
+  const branchReports = [
+    {
+      branch: 'release-0.11',
+      vulnerabilities: [{ id: 'GHSA-qs', packageName: 'qs', severity: 'high', cve: 'CVE-2026-82417' }],
+    },
+    {
+      branch: 'release-0.10',
+      vulnerabilities: [{ id: 'GHSA-qs', packageName: 'qs', severity: 'high', cve: 'CVE-2026-82417' }],
+    },
+  ];
+
+  const jiraTickets = [
+    {
+      ticketKey: 'MTA-7680',
+      summary: 'qs vulnerability [mta-8.2]',
+      cve: 'CVE-2026-82417',
+      packageName: 'qs',
+      affectsVersions: ['MTA 8.2.0', 'mta-8.2', '8.2'],
+      url: 'https://jira.example.com/browse/MTA-7680',
+    },
+    {
+      ticketKey: 'MTA-7679',
+      summary: 'qs vulnerability [mta-8.1]',
+      cve: 'CVE-2026-82417',
+      packageName: 'qs',
+      affectsVersions: ['MTA 8.1.0', 'mta-8.1', '8.1'],
+      url: 'https://jira.example.com/browse/MTA-7679',
+    },
+  ];
+
+  const branchMap = {
+    'release-0.11': ['8.2', 'mta-8.2', 'MTA 8.2'],
+    'release-0.10': ['8.1', 'mta-8.1', 'MTA 8.1'],
+  };
+
+  const blended = blendVulnerabilitySources(branchReports, { jiraTickets, branchMap });
+
+  // On release-0.11, it should match MTA-7680 (8.2)
+  assert.equal(blended[0].vulnerabilities[0].sources.jira.ticketKey, 'MTA-7680');
+
+  // On release-0.10, it should match MTA-7679 (8.1)
+  assert.equal(blended[1].vulnerabilities[0].sources.jira.ticketKey, 'MTA-7679');
 });

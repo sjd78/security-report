@@ -74,6 +74,7 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
   const blendedBranches = blendVulnerabilitySources(rawBranchReports, {
     jiraTickets,
     dependabotAlerts,
+    branchMap: config.branchMap,
   });
 
   const report = generateJsonReport(repoInfo, blendedBranches);

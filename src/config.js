@@ -1,6 +1,31 @@
 import path from 'node:path';
 import fs from 'node:fs';
 
+export function parseBranchMap(mapInput) {
+  if (!mapInput) return {};
+  if (typeof mapInput === 'object') return mapInput;
+
+  // Try JSON parse
+  if (typeof mapInput === 'string') {
+    try {
+      return JSON.parse(mapInput);
+    } catch {
+      // Parse key=val,key2=val2 format (e.g., "main=8.3,release-0.11=8.2,release-0.10=8.1")
+      const result = {};
+      const pairs = mapInput.split(',').map((p) => p.trim()).filter(Boolean);
+      for (const pair of pairs) {
+        const [k, v] = pair.split('=').map((s) => s.trim());
+        if (k && v) {
+          result[k] = v.split('|').map((s) => s.trim());
+        }
+      }
+      return result;
+    }
+  }
+
+  return {};
+}
+
 export function loadConfig(options = {}) {
   const cwd = process.cwd();
   let fileConfig = {};
@@ -31,6 +56,13 @@ export function loadConfig(options = {}) {
     options.reportsDir || process.env.SEC_REPORTS_DIR || fileConfig.reportsDir || 'reports'
   );
 
+  const rawBranchMap = options.branchMap || process.env.SEC_BRANCH_MAP || fileConfig.branchMap || {
+    main: ['8.3.x', '8.3', 'mta-8.3', 'MTA 8.3'],
+    'release-0.12': ['8.3.x', '8.3', 'mta-8.3', 'MTA 8.3'],
+    'release-0.11': ['8.2.x', '8.2', 'mta-8.2', 'MTA 8.2'],
+    'release-0.10': ['8.1.x', '8.1', 'mta-8.1', 'MTA 8.1'],
+  };
+
   return {
     reposDir,
     reportsDir,
@@ -41,11 +73,12 @@ export function loadConfig(options = {}) {
       baseUrl: options.jiraBaseUrl || process.env.JIRA_BASE_URL || fileConfig.jira?.baseUrl || '',
       email: options.jiraEmail || process.env.JIRA_EMAIL || fileConfig.jira?.email || '',
       apiToken: options.jiraApiToken || process.env.JIRA_API_TOKEN || fileConfig.jira?.apiToken || '',
-      project: options.jiraProject || process.env.JIRA_PROJECT || fileConfig.jira?.project || 'SEC',
+      project: options.jiraProject || process.env.JIRA_PROJECT || fileConfig.jira?.project || 'MTA',
       jql: options.jiraJql || process.env.JIRA_JQL || fileConfig.jira?.jql || '',
     },
+    branchMap: parseBranchMap(rawBranchMap),
     defaultBranches: options.branches || fileConfig.branches || ['main'],
-    semverUpdateType: options.semverUpdateType || fileConfig.semverUpdateType || 'minor', // or 'patch', 'latest'
+    semverUpdateType: options.semverUpdateType || fileConfig.semverUpdateType || 'minor',
     allowOverrides: options.allowOverrides ?? fileConfig.allowOverrides ?? true,
     ...options,
   };

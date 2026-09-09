@@ -7,3 +7,4 @@ reports/
 .env.local
 coverage/
 tmp/
+.security-report.json

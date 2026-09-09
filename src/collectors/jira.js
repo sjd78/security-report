@@ -28,6 +28,20 @@ export function extractPackageNameFromText(text) {
   return null;
 }
 
+export function extractVersionTagsFromText(text) {
+  if (!text) return [];
+  const tags = new Set();
+  const matches = text.matchAll(/\[(?:mta-)?([0-9]+(?:\.[0-9]+)*)\]/gi);
+  for (const m of matches) {
+    if (m[1]) {
+      tags.add(m[1]);
+      tags.add(`mta-${m[1]}`);
+      tags.add(`MTA ${m[1]}`);
+    }
+  }
+  return Array.from(tags);
+}
+
 export function flattenAdfText(doc) {
   if (!doc) return '';
   if (typeof doc === 'string') return doc;
@@ -61,12 +75,14 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
     return [];
   }
 
-  const jql = customJql || `project = "${project || 'SEC'}" AND (summary ~ "CVE*" OR text ~ "CVE*" OR labels in (Security, SecurityTracking))`;
+  const jql = customJql || `project = "${project || 'MTA'}" AND (summary ~ "CVE*" OR text ~ "CVE*" OR labels in (Security, SecurityTracking))`;
   const cleanBase = baseUrl.replace(/\/+$/, '');
   const maxResults = options.maxResults || 50;
 
+  const fields = 'summary,description,status,labels,created,updated,versions,fixVersions,components';
+
   // Try 1: Modern Jira Cloud /rest/api/3/search/jql
-  const jqlUrl = `${cleanBase}/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}&fields=summary,description,status,labels,created,updated`;
+  const jqlUrl = `${cleanBase}/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}&fields=${fields}`;
 
   try {
     const res = await fetch(jqlUrl, {
@@ -93,33 +109,13 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
       },
       body: JSON.stringify({
         jql,
-        fields: ['summary', 'description', 'status', 'created', 'updated', 'labels'],
+        fields: ['summary', 'description', 'status', 'created', 'updated', 'labels', 'versions', 'fixVersions'],
         maxResults,
       }),
     });
 
     if (postRes.ok) {
       return parseJiraIssues(await postRes.json(), cleanBase);
-    }
-
-    // Fallback 3: Legacy POST /rest/api/2/search
-    const fallbackUrl = `${cleanBase}/rest/api/2/search`;
-    const fallbackRes = await fetch(fallbackUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: authHeader,
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        jql,
-        fields: ['summary', 'description', 'status', 'created', 'updated', 'labels'],
-        maxResults,
-      }),
-    });
-
-    if (fallbackRes.ok) {
-      return parseJiraIssues(await fallbackRes.json(), cleanBase);
     }
 
     console.warn(`[Jira] Jira search returned HTTP ${res.status}: ${res.statusText}`);
@@ -156,6 +152,29 @@ export function parseJiraIssues(data, baseUrl) {
 
     const packageName = extractPackageNameFromText(summary) || extractPackageNameFromText(descText);
 
+    // Extract affectsVersions and fixVersions
+    const versionsSet = new Set();
+    if (Array.isArray(issue.fields?.versions)) {
+      for (const v of issue.fields.versions) {
+        if (v.name) {
+          versionsSet.add(v.name);
+          const simple = v.name.replace(/^MTA\s*/i, '');
+          versionsSet.add(simple);
+        }
+      }
+    }
+    if (Array.isArray(issue.fields?.fixVersions)) {
+      for (const v of issue.fields.fixVersions) {
+        if (v.name) versionsSet.add(v.name);
+      }
+    }
+
+    // Also extract version tags from summary e.g. [mta-8.2]
+    const summaryTags = extractVersionTagsFromText(summary);
+    for (const st of summaryTags) {
+      versionsSet.add(st);
+    }
+
     tickets.push({
       ticketKey: key,
       summary,
@@ -164,6 +183,7 @@ export function parseJiraIssues(data, baseUrl) {
       cve,
       packageName,
       labels,
+      affectsVersions: Array.from(versionsSet),
     });
   }
 

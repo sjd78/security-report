@@ -22,6 +22,7 @@ export function createCli() {
     .option('--jira-api-token <token>', 'Jira API token or Personal Access Token')
     .option('--jira-project <project>', 'Jira Project Key (default: SEC)', 'SEC')
     .option('--jira-jql <query>', 'Custom JQL query for Jira ticket retrieval')
+    .option('--branch-map <mapping>', 'Branch to downstream version mapping (e.g. main=8.3,release-0.11=8.2,release-0.10=8.1)')
     .action(async (repo, options) => {
       try {
         await scanRepository(repo, options);
@@ -49,6 +50,7 @@ export function createCli() {
     .option('--jira-api-token <token>', 'Jira API token')
     .option('--jira-project <project>', 'Jira Project Key', 'SEC')
     .option('--jira-jql <query>', 'Custom JQL query for Jira ticket retrieval')
+    .option('--branch-map <mapping>', 'Branch to downstream version mapping (e.g. main=8.3,release-0.11=8.2,release-0.10=8.1)')
     .action(async (repo, options) => {
       try {
         await remediateRepository(repo, options);

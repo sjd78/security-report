@@ -75,14 +75,15 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
 | :--- | :--- | :--- | :--- |
 | `SEC_REPOS_DIR` | `--repos-dir <path>` | Directory where repositories are cloned and cached | `./REPOS` |
 | `SEC_REPORTS_DIR` | `--reports-dir <path>` | Directory where JSON and Markdown reports are saved | `./reports` |
+| `SEC_BRANCH_MAP` | `--branch-map <mapping>` | Translation table mapping upstream branches to downstream versions (e.g. `main=8.3,release-0.11=8.2,release-0.10=8.1`) | Built-in MTA map |
 | `GIT_PROTOCOL` | — | Git clone protocol (`https` or `ssh`) | `https` |
 | `GITHUB_TOKEN` | `--github-token <token>` | GitHub Personal Access Token for Dependabot alerts and private repos | `""` |
 | `GITHUB_API_URL` | — | Base URL for GitHub API (for GitHub Enterprise) | `https://api.github.com` |
 | `JIRA_BASE_URL` | `--jira-base-url <url>` | Atlassian Jira instance URL (e.g., `https://my-org.atlassian.net`) | `""` |
 | `JIRA_EMAIL` | `--jira-email <email>` | Jira user email address (for Basic Auth) | `""` |
 | `JIRA_API_TOKEN` | `--jira-api-token <token>`| Jira API token or Personal Access Token (PAT) | `""` |
-| `JIRA_PROJECT` | `--jira-project <key>` | Jira Project Key for CVE tickets | `SEC` |
-| `JIRA_JQL` | — | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
+| `JIRA_PROJECT` | `--jira-project <key>` | Jira Project Key for CVE tickets | `MTA` |
+| `JIRA_JQL` | `--jira-jql <query>` | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
 
 ### Example Configuration File (`.security-report.json`)
 
@@ -91,10 +92,17 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
   "reposDir": "REPOS",
   "reportsDir": "reports",
   "gitProtocol": "https",
-  "branches": ["main", "release/v1.0"],
+  "branches": ["main", "release-0.12", "release-0.11", "release-0.10"],
+  "branchMap": {
+    "main": ["8.3.x", "8.3", "mta-8.3", "MTA 8.3"],
+    "release-0.12": ["8.3.x", "8.3", "mta-8.3", "MTA 8.3"],
+    "release-0.11": ["8.2.x", "8.2", "mta-8.2", "MTA 8.2"],
+    "release-0.10": ["8.1.x", "8.1", "mta-8.1", "MTA 8.1"]
+  },
   "jira": {
-    "baseUrl": "https://company.atlassian.net",
-    "project": "SEC"
+    "baseUrl": "https://redhat.atlassian.net",
+    "project": "MTA",
+    "jql": "project = \"Migration Toolkit for Applications\" and labels = \"security\" and (summary ~ \"mta-ui-rhel8\" or summary ~ \"mta-ui-rhel9\" or summary ~ \"mta-ui-rhel10\") and status != Closed"
   },
   "allowOverrides": true
 }
