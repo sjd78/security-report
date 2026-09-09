@@ -123,6 +123,14 @@ security-report/
 - **Solution**: `src/config.js` and `src/core/blender.js` maintain a configurable translation table (`branchMap`) mapping upstream branches to target downstream versions.
 - **Matching Rule**: When auditing `release-0.11`, the blender only correlates tickets affecting `8.2.x` / `mta-8.2` (e.g. `MTA-7680`). When auditing `release-0.10`, it correlates tickets affecting `8.1.x` / `mta-8.1` (e.g. `MTA-7679`).
 
+### F. Unified Upstream Branch Grouping across Collectors
+- **Problem**: `npm-audit` naturally evaluates branch worktrees individually, but external API collectors (`jira`, `dependabot`) return repository-wide or project-wide lists.
+- **Solution**: Both `jira` and `dependabot` collectors now structure their findings into upstream branch sections before reaching the blender:
+  - `security-jira-collection.json`: Groups issues into `branches: [{ branch: "release-0.11", mappedVersions: ["8.2"], tickets: [...] }]` plus an `unassigned: [...]` section.
+  - `security-dependabot-collection.json`: Groups alerts into `branches: [{ branch: "main", isDefaultBranch: true, alerts: [...] }, { branch: "release-0.11", alerts: [], note: "..." }]`.
+  - `security-npm-audit-collection.json`: Contains the raw branch audit results.
+- **Benefit**: All debug JSONs and intermediate data structures have a consistent, branch-scoped representation, enabling inspection and deterministic blender correlation.
+
 ## 5. Configuration & Environment Variables
 
 | Variable | CLI Flag / Field | Description | Default |

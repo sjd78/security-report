@@ -1,15 +1,55 @@
+export function groupDependabotAlertsByBranch(alerts = [], branches = ['main'], defaultBranch = 'main') {
+  const branchGroups = [];
+
+  for (const branch of branches) {
+    const isDefault = branch === defaultBranch || (branch === 'master' && !branches.includes('main'));
+    if (isDefault) {
+      branchGroups.push({
+        branch,
+        isDefaultBranch: true,
+        alertCount: alerts.length,
+        alerts,
+      });
+    } else {
+      branchGroups.push({
+        branch,
+        isDefaultBranch: false,
+        alertCount: 0,
+        alerts: [],
+        note: `GitHub Dependabot alerts natively track the repository default branch (${defaultBranch}).`,
+      });
+    }
+  }
+
+  return {
+    defaultBranch,
+    branches: branchGroups,
+    totalAlerts: alerts.length,
+    allAlerts: alerts,
+  };
+}
+
 export async function fetchDependabotAlerts(options = {}) {
-  const { org, name, githubToken, githubApiUrl = 'https://api.github.com' } = options;
+  const {
+    org,
+    name,
+    githubToken,
+    githubApiUrl = 'https://api.github.com',
+    branches = ['main'],
+    defaultBranch = 'main',
+  } = options;
 
   if (!org || !name) {
-    return [];
+    return groupDependabotAlertsByBranch([], branches, defaultBranch);
   }
 
   if (!githubToken) {
-    return [];
+    return groupDependabotAlertsByBranch([], branches, defaultBranch);
   }
 
   const endpoint = `${githubApiUrl.replace(/\/+$/, '')}/repos/${org}/${name}/dependabot/alerts?state=open&per_page=100`;
+
+  let rawAlerts = [];
 
   try {
     const res = await fetch(endpoint, {
@@ -22,20 +62,21 @@ export async function fetchDependabotAlerts(options = {}) {
 
     if (res.status === 404) {
       // Dependabot alerts not enabled or repo not found
-      return [];
+      return groupDependabotAlertsByBranch([], branches, defaultBranch);
     }
 
     if (!res.ok) {
       console.warn(`[Dependabot] GitHub API returned HTTP ${res.status}: ${res.statusText}`);
-      return [];
+      return groupDependabotAlertsByBranch([], branches, defaultBranch);
     }
 
     const data = await res.json();
-    return parseDependabotAlerts(data);
+    rawAlerts = parseDependabotAlerts(data);
   } catch (err) {
     console.warn(`[Dependabot] Error fetching Dependabot alerts: ${err.message}`);
-    return [];
   }
+
+  return groupDependabotAlertsByBranch(rawAlerts, branches, defaultBranch);
 }
 
 export function parseDependabotAlerts(data) {

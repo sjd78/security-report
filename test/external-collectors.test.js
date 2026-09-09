@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseJiraIssues, createJiraAuthHeader } from '../src/collectors/jira.js';
-import { parseDependabotAlerts } from '../src/collectors/dependabot.js';
+import { parseJiraIssues, createJiraAuthHeader, groupJiraTicketsByBranch } from '../src/collectors/jira.js';
+import { parseDependabotAlerts, groupDependabotAlertsByBranch } from '../src/collectors/dependabot.js';
 import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible } from '../src/core/blender.js';
 import { parseBranchMap } from '../src/config.js';
 
@@ -65,6 +65,37 @@ test('parseDependabotAlerts: parses GitHub Dependabot alert structure', () => {
   assert.equal(parsed[0].ghsaId, 'GHSA-35jh-r3h4-6jhm');
   assert.equal(parsed[0].cve, 'CVE-2021-23337');
   assert.equal(parsed[0].targetSafeVersion, '4.17.21');
+});
+
+test('groupJiraTicketsByBranch: groups tickets into branch sections', () => {
+  const tickets = [
+    { ticketKey: 'MTA-1', affectsVersions: ['8.2', 'mta-8.2'] },
+    { ticketKey: 'MTA-2', affectsVersions: ['8.1', 'mta-8.1'] },
+    { ticketKey: 'MTA-3', affectsVersions: ['9.0'] },
+  ];
+  const branchMap = {
+    'release-0.11': ['8.2'],
+    'release-0.10': ['8.1'],
+  };
+  const grouped = groupJiraTicketsByBranch(tickets, ['release-0.11', 'release-0.10'], branchMap);
+  assert.equal(grouped.branches.length, 2);
+  assert.equal(grouped.branches[0].branch, 'release-0.11');
+  assert.equal(grouped.branches[0].tickets.length, 1);
+  assert.equal(grouped.branches[0].tickets[0].ticketKey, 'MTA-1');
+  assert.equal(grouped.branches[1].tickets[0].ticketKey, 'MTA-2');
+  assert.equal(grouped.unassigned.length, 1);
+  assert.equal(grouped.unassigned[0].ticketKey, 'MTA-3');
+});
+
+test('groupDependabotAlertsByBranch: assigns alerts to default branch and notes others', () => {
+  const alerts = [{ alertNumber: 1, packageName: 'lodash' }];
+  const grouped = groupDependabotAlertsByBranch(alerts, ['main', 'release-0.11'], 'main');
+  assert.equal(grouped.branches.length, 2);
+  assert.equal(grouped.branches[0].branch, 'main');
+  assert.equal(grouped.branches[0].alerts.length, 1);
+  assert.equal(grouped.branches[1].branch, 'release-0.11');
+  assert.equal(grouped.branches[1].alerts.length, 0);
+  assert.ok(grouped.branches[1].note);
 });
 
 test('blendVulnerabilitySources: enriches npm audit with Jira and Dependabot', () => {

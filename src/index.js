@@ -53,17 +53,20 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
   // Fetch external sources in parallel
   console.log(`📡 [Scan] Fetching Jira CVE tickets and GitHub Dependabot alerts...`);
   const [jiraTickets, dependabotAlerts] = await Promise.all([
-    fetchJiraCveTickets(config, { maxResults: 100 }),
+    fetchJiraCveTickets(config, { maxResults: 100, branches: branchesToScan }),
     fetchDependabotAlerts({
       org: repoInfo.org,
       name: repoInfo.name,
       githubToken: config.githubToken,
       githubApiUrl: config.githubApiUrl,
+      branches: branchesToScan,
+      defaultBranch: branchesToScan[0] || 'main',
     }),
   ]);
 
-  console.log(`ℹ️ [Scan] Fetched ${jiraTickets.length} Jira CVE ticket(s) and ${dependabotAlerts.length} Dependabot alert(s)`);
-
+  const jiraCount = jiraTickets.totalTickets ?? (Array.isArray(jiraTickets) ? jiraTickets.length : 0);
+  const dependabotCount = dependabotAlerts.totalAlerts ?? (Array.isArray(dependabotAlerts) ? dependabotAlerts.length : 0);
+  console.log(`ℹ️ [Scan] Fetched ${jiraCount} Jira CVE ticket(s) and ${dependabotCount} Dependabot alert(s) across ${branchesToScan.length} branch(es)`);
   // Run npm audit across all branch worktrees
   const rawBranchReports = [];
   for (const branch of branchesToScan) {
