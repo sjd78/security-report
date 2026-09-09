@@ -1,4 +1,5 @@
 import { extractCveFromText } from './npm-audit.js';
+import { extractGhsaId, extractCveId, fetchAdvisoryDetails } from './advisories.js';
 
 export function createJiraAuthHeader(config) {
   const { email, apiToken } = config.jira || {};
@@ -116,6 +117,25 @@ export function groupJiraTicketsByBranch(tickets = [], branches = [], branchMap 
   };
 }
 
+export async function fetchJiraIssueRemoteLinks(baseUrl, issueKey, authHeader) {
+  try {
+    const url = `${baseUrl}/rest/api/3/issue/${issueKey}/remotelink`;
+    const res = await fetch(url, {
+      headers: {
+        Authorization: authHeader,
+        Accept: 'application/json',
+      },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return Array.isArray(data) ? data : [];
+    }
+  } catch (err) {
+    // ignore
+  }
+  return [];
+}
+
 export async function fetchJiraCveTickets(config = {}, options = {}) {
   const { baseUrl, project, jql: customJql } = config.jira || {};
   const branches = options.branches || config.defaultBranches || ['main'];
@@ -180,6 +200,43 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
   } catch (err) {
     console.warn(`[Jira] Error fetching Jira CVE tickets: ${err.message}`);
   }
+
+  // Enrich tickets with remote links and matching GitHub Security Advisories
+  const advisoryCache = new Map();
+
+  await Promise.all(
+    rawTickets.map(async (ticket) => {
+      const remoteLinks = await fetchJiraIssueRemoteLinks(cleanBase, ticket.ticketKey, authHeader);
+      ticket.remoteLinks = remoteLinks.map((rl) => rl.object?.url).filter(Boolean);
+
+      // Find GHSA link or CVE ID
+      const ghsaUrl = ticket.remoteLinks.find((url) => url.includes('github.com') && url.includes('/advisories/GHSA-'));
+      const ghsaId = extractGhsaId(ghsaUrl) || extractGhsaId(ticket.summary);
+      const cveId = ticket.cve || extractCveId(ticket.summary);
+
+      const lookupRef = ghsaId || cveId;
+
+      if (lookupRef) {
+        if (!advisoryCache.has(lookupRef)) {
+          const advPromise = fetchAdvisoryDetails(lookupRef, {
+            githubToken: config.githubToken,
+            githubApiUrl: config.githubApiUrl,
+          });
+          advisoryCache.set(lookupRef, advPromise);
+        }
+
+        const advDetails = await advisoryCache.get(lookupRef);
+        if (advDetails) {
+          if (!ticket.cve && advDetails.cve) ticket.cve = advDetails.cve;
+          if (!ticket.packageName && advDetails.packageName) ticket.packageName = advDetails.packageName;
+          ticket.ghsaId = advDetails.ghsaId || ghsaId;
+          ticket.advisoryUrl = advDetails.url || ghsaUrl;
+          ticket.vulnerableVersionRange = advDetails.vulnerableVersionRange;
+          ticket.targetSafeVersion = advDetails.targetSafeVersion;
+        }
+      }
+    })
+  );
 
   return groupJiraTicketsByBranch(rawTickets, branches, branchMap);
 }

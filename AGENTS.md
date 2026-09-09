@@ -130,6 +130,13 @@ security-report/
   - `security-npm-audit-collection.json`: Contains the raw branch audit results.
 - **Benefit**: All debug JSONs and intermediate data structures have a consistent, branch-scoped representation, enabling inspection and deterministic blender correlation.
 
+### G. Jira Remote Link Advisory Resolution & Optimal Safe Version Calculation
+- **Problem**: Jira CVE tickets describe downstream flaws and include web links (`remotelink`) to GitHub Security Advisories, but don't natively list upstream npm package fix versions.
+- **Solution**:
+  1. `src/collectors/jira.js` queries `/rest/api/3/issue/{key}/remotelink` to extract attached GHSA and CVE URLs.
+  2. `src/collectors/advisories.js` fetches the advisory data from GitHub Advisory API (and OSV API), resolving `vulnerableVersionRange` and `first_patched_version` (e.g. `qs` $\rightarrow$ `6.16.0`, `js-yaml` $\rightarrow$ `4.3.2`).
+  3. `src/core/blender.js` calculates the **optimal target safe version** that satisfies all combined advisories for that package on the target branch.
+
 ## 5. Configuration & Environment Variables
 
 | Variable | CLI Flag / Field | Description | Default |

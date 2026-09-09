@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseJiraIssues, createJiraAuthHeader, groupJiraTicketsByBranch } from '../src/collectors/jira.js';
 import { parseDependabotAlerts, groupDependabotAlertsByBranch } from '../src/collectors/dependabot.js';
-import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible, consolidateVulnerabilitiesByPackage } from '../src/core/blender.js';
+import { extractGhsaId, extractCveId } from '../src/collectors/advisories.js';
+import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible, consolidateVulnerabilitiesByPackage, calculateOptimalSafeVersion } from '../src/core/blender.js';
 import { parseBranchMap, parseCollectorSettings } from '../src/config.js';
 
 test('createJiraAuthHeader: Basic Auth and Bearer token', () => {
@@ -301,4 +302,23 @@ test('consolidateVulnerabilitiesByPackage: groups multiple CVEs and Jira tickets
   assert.equal(axiosPkg.sources.jiraTickets.length, 2);
   assert.equal(axiosPkg.advisories.length, 2);
   assert.equal(axiosPkg.remediation.targetVersion, '1.7.4');
+});
+
+test('extractGhsaId and extractCveId: parses identifiers from URLs and text', () => {
+  assert.equal(
+    extractGhsaId('https://github.com/nodeca/js-yaml/security/advisories/GHSA-2883-xcg3-v3hh'),
+    'GHSA-2883-XCG3-V3HH'
+  );
+  assert.equal(extractGhsaId('GHSA-4mjr-xmp4-gh2g in summary'), 'GHSA-4MJR-XMP4-GH2G');
+  assert.equal(extractCveId('https://www.cve.org/CVERecord?id=CVE-2026-82417'), 'CVE-2026-82417');
+});
+
+test('calculateOptimalSafeVersion: picks highest patched version satisfying all advisories', () => {
+  const advisories = [
+    { targetSafeVersion: '1.7.2' },
+    { targetSafeVersion: '1.7.4' },
+    { targetSafeVersion: '1.6.8' },
+  ];
+  const optimal = calculateOptimalSafeVersion('1.6.0', advisories);
+  assert.equal(optimal, '1.7.4');
 });

@@ -35,6 +35,25 @@ export function pickHighestSafeVersion(verA, verB) {
   return verA || verB;
 }
 
+export function calculateOptimalSafeVersion(installedVersion, advisories = []) {
+  const candidateVersions = [];
+
+  for (const adv of advisories) {
+    if (adv.targetSafeVersion) {
+      candidateVersions.push(adv.targetSafeVersion);
+    }
+  }
+
+  if (candidateVersions.length === 0) return null;
+
+  let highest = candidateVersions[0];
+  for (const candidate of candidateVersions) {
+    highest = pickHighestSafeVersion(highest, candidate);
+  }
+
+  return highest;
+}
+
 export function matchJiraTicket(vuln, jiraTickets, branchName = null, branchMap = {}) {
   if (!jiraTickets || jiraTickets.length === 0) return null;
 
@@ -147,13 +166,10 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         existing.severity = v.severity;
       }
 
-      // 2. Target safe version: pick the highest
-      existing.targetSafeVersion = pickHighestSafeVersion(existing.targetSafeVersion, v.targetSafeVersion);
-
-      // 3. Mark isDirect true if any finding is direct
+      // 2. Mark isDirect true if any finding is direct
       if (v.isDirect) existing.isDirect = true;
 
-      // 4. Collect unique CVEs
+      // 3. Collect unique CVEs
       if (v.cve && !existing.cves.includes(v.cve)) {
         existing.cves.push(v.cve);
         if (!existing.cve) existing.cve = v.cve;
@@ -164,7 +180,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         }
       }
 
-      // 5. Add advisory entry
+      // 4. Add advisory entry
       existing.advisories.push({
         id: v.id,
         cve: v.cve || null,
@@ -176,21 +192,21 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         sources: v.sources,
       });
 
-      // 6. Merge dependency paths
+      // 5. Merge dependency paths
       for (const p of v.dependencyPaths || []) {
         if (!existing.dependencyPaths.includes(p)) {
           existing.dependencyPaths.push(p);
         }
       }
 
-      // 7. Merge direct roots
+      // 6. Merge direct roots
       for (const r of v.directRoots || []) {
         if (!existing.directRoots.some((dr) => dr.name === r.name)) {
           existing.directRoots.push(r);
         }
       }
 
-      // 8. Merge Jira tickets
+      // 7. Merge Jira tickets
       if (v.sources?.jira) {
         if (!existing.sources.jiraTickets.some((t) => t.ticketKey === v.sources.jira.ticketKey)) {
           existing.sources.jiraTickets.push(v.sources.jira);
@@ -198,7 +214,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         if (!existing.sources.jira) existing.sources.jira = v.sources.jira;
       }
 
-      // 9. Merge Dependabot alerts
+      // 8. Merge Dependabot alerts
       if (v.sources?.dependabot) {
         if (!existing.sources.dependabotAlerts.some((a) => a.alertNumber === v.sources.dependabot.alertNumber)) {
           existing.sources.dependabotAlerts.push(v.sources.dependabot);
@@ -206,23 +222,34 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         if (!existing.sources.dependabot) existing.sources.dependabot = v.sources.dependabot;
       }
 
-      // 10. Merge remediation plan
+      // 9. Merge remediation plan
       if (v.remediation) {
         if (!existing.remediation) {
           existing.remediation = { ...v.remediation };
-        } else {
-          if (existing.remediation.strategy === 'jira-tracker' && v.remediation.strategy !== 'jira-tracker') {
-            existing.remediation = { ...v.remediation };
+        } else if (existing.remediation.strategy === 'jira-tracker' && v.remediation.strategy !== 'jira-tracker') {
+          existing.remediation = { ...v.remediation };
+        }
+      }
+    }
+  }
+
+  // Optimize target safe versions across all advisories for each package
+  for (const pkg of packageMap.values()) {
+    const optimalSafeVersion = calculateOptimalSafeVersion(pkg.currentVersion, pkg.advisories);
+    if (optimalSafeVersion) {
+      pkg.targetSafeVersion = optimalSafeVersion;
+      if (pkg.remediation) {
+        pkg.remediation.targetVersion = optimalSafeVersion;
+        for (const chg of pkg.remediation.packageJsonChanges || []) {
+          if (chg.package === pkg.packageName) {
+            const prefix = chg.from?.startsWith('~') ? '~' : chg.from?.startsWith('^') ? '^' : '';
+            chg.to = `${prefix}${optimalSafeVersion}`;
           }
-          if (existing.targetSafeVersion) {
-            existing.remediation.targetVersion = existing.targetSafeVersion;
-            for (const chg of existing.remediation.packageJsonChanges || []) {
-              if (chg.package === existing.packageName) {
-                const prefix = chg.from?.startsWith('~') ? '~' : chg.from?.startsWith('^') ? '^' : '';
-                chg.to = `${prefix}${existing.targetSafeVersion}`;
-              }
-            }
-          }
+        }
+        if (pkg.remediation.lockfileActions) {
+          pkg.remediation.lockfileActions = pkg.remediation.lockfileActions.map((act) =>
+            act.replace(new RegExp(`${pkg.packageName}@[^\\s]+`), `${pkg.packageName}@${optimalSafeVersion}`)
+          );
         }
       }
     }
@@ -286,6 +313,9 @@ export function blendVulnerabilitySources(
         if (!copy.cve && matchedJira.cve) {
           copy.cve = matchedJira.cve;
         }
+        if (!copy.targetSafeVersion && matchedJira.targetSafeVersion) {
+          copy.targetSafeVersion = matchedJira.targetSafeVersion;
+        }
       }
 
       const matchedDependabot = matchDependabotAlert(copy, branchDependabotAlerts);
@@ -312,16 +342,16 @@ export function blendVulnerabilitySources(
     for (const ticket of branchJiraTickets) {
       if (!matchedJiraKeys.has(ticket.ticketKey)) {
         rawVulns.push({
-          id: ticket.ticketKey,
+          id: ticket.ghsaId || ticket.ticketKey,
           cve: ticket.cve,
           packageName: ticket.packageName || ticket.summary,
           severity: 'high',
           title: ticket.summary,
-          url: ticket.url,
+          url: ticket.advisoryUrl || ticket.url,
           isDirect: false,
-          vulnerableVersionRange: null,
+          vulnerableVersionRange: ticket.vulnerableVersionRange || null,
           currentVersion: 'downstream-tracker',
-          targetSafeVersion: null,
+          targetSafeVersion: ticket.targetSafeVersion || null,
           dependencyPaths: [ticket.packageName || ticket.summary],
           directRoots: [],
           sources: {
@@ -334,9 +364,13 @@ export function blendVulnerabilitySources(
             },
           },
           remediation: {
-            strategy: 'jira-tracker',
+            strategy: ticket.targetSafeVersion ? 'lockfile-update' : 'jira-tracker',
+            targetPackage: ticket.packageName,
+            targetVersion: ticket.targetSafeVersion,
             packageJsonChanges: [],
-            lockfileActions: [],
+            lockfileActions: ticket.targetSafeVersion
+              ? [`npm install ${ticket.packageName}@${ticket.targetSafeVersion} --package-lock-only`]
+              : [],
             note: `Tracked in Jira issue ${ticket.ticketKey} (${ticket.status})`,
           },
         });
