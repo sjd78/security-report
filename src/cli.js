@@ -21,6 +21,7 @@ export function createCli() {
     .option('--jira-email <email>', 'Jira user email address')
     .option('--jira-api-token <token>', 'Jira API token or Personal Access Token')
     .option('--jira-project <project>', 'Jira Project Key (default: SEC)', 'SEC')
+    .option('--jira-jql <query>', 'Custom JQL query for Jira ticket retrieval')
     .action(async (repo, options) => {
       try {
         await scanRepository(repo, options);
@@ -47,6 +48,7 @@ export function createCli() {
     .option('--jira-email <email>', 'Jira user email')
     .option('--jira-api-token <token>', 'Jira API token')
     .option('--jira-project <project>', 'Jira Project Key', 'SEC')
+    .option('--jira-jql <query>', 'Custom JQL query for Jira ticket retrieval')
     .action(async (repo, options) => {
       try {
         await remediateRepository(repo, options);
