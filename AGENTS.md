@@ -137,6 +137,14 @@ security-report/
   2. `src/collectors/advisories.js` fetches the advisory data from GitHub Advisory API (and OSV API), resolving `vulnerableVersionRange` and `first_patched_version` (e.g. `qs` $\rightarrow$ `6.16.0`, `js-yaml` $\rightarrow$ `4.3.2`).
   3. `src/core/blender.js` calculates the **optimal target safe version** that satisfies all combined advisories for that package on the target branch.
 
+
+### H. Upstream Lockfile Assessment for Jira Findings & Dual Direct/Indirect Resolution
+- **Problem**: Jira tickets track downstream flaws, but the tool needs to know what is actually installed in the target branch's `package-lock.json`. Furthermore, packages like `js-yaml` may be both directly declared in `package.json` and pulled in transitively by tools like `eslint`.
+- **Solution**:
+  1. `src/core/dependency-graph.js` (`lookupPackageInstalledInfo`) scans the branch worktree's `package.json` and `package-lock.json` to extract all installed versions (e.g. `3.15.1, 4.3.1`) and ancestor paths.
+  2. Detects dual dependency status: `dependencyType: "Direct & Indirect"`.
+  3. Formulates a dual resolution plan (`bump-direct-and-lockfile`): updates the `package.json` semver constraint for the direct dependency AND issues lockfile commands (`npm install <pkg>@<safeVersion> --package-lock-only`) to synchronize all transitive instances.
+
 ## 5. Configuration & Environment Variables
 
 | Variable | CLI Flag / Field | Description | Default |

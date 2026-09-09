@@ -5,6 +5,7 @@ import { parseDependabotAlerts, groupDependabotAlertsByBranch } from '../src/col
 import { extractGhsaId, extractCveId } from '../src/collectors/advisories.js';
 import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible, consolidateVulnerabilitiesByPackage, calculateOptimalSafeVersion } from '../src/core/blender.js';
 import { parseBranchMap, parseCollectorSettings } from '../src/config.js';
+import { lookupPackageInstalledInfo } from '../src/core/dependency-graph.js';
 
 test('createJiraAuthHeader: Basic Auth and Bearer token', () => {
   const basic = createJiraAuthHeader({ jira: { email: 'user@example.com', apiToken: 'secret123' } });
@@ -321,4 +322,107 @@ test('calculateOptimalSafeVersion: picks highest patched version satisfying all 
   ];
   const optimal = calculateOptimalSafeVersion('1.6.0', advisories);
   assert.equal(optimal, '1.7.4');
+});
+test('lookupPackageInstalledInfo: detects dual Direct & Indirect dependency (like js-yaml)', () => {
+  const pkgJson = {
+    dependencies: {
+      'js-yaml': '^4.1.0',
+      'some-tool': '^1.0.0',
+    },
+  };
+
+  const pkgLock = {
+    packages: {
+      '': {
+        dependencies: { 'js-yaml': '^4.1.0', 'some-tool': '^1.0.0' },
+      },
+      'node_modules/js-yaml': {
+        version: '4.1.0',
+      },
+      'node_modules/some-tool': {
+        version: '1.0.0',
+        dependencies: { 'js-yaml': '^3.14.1' },
+      },
+      'node_modules/some-tool/node_modules/js-yaml': {
+        version: '3.14.1',
+      },
+    },
+  };
+
+  const info = lookupPackageInstalledInfo('js-yaml', pkgJson, pkgLock);
+  assert.equal(info.isDirect, true);
+  assert.equal(info.isIndirect, true);
+  assert.equal(info.dependencyType, 'Direct & Indirect');
+  assert.ok(info.currentVersion.includes('4.1.0'));
+  assert.ok(info.currentVersion.includes('3.14.1'));
+});
+
+test('blendVulnerabilitySources: Jira findings assess actual lockfile versions and dual remediation', () => {
+  const pkgJson = {
+    dependencies: {
+      'js-yaml': '^4.1.0',
+      'some-tool': '^1.0.0',
+    },
+  };
+
+  const pkgLock = {
+    packages: {
+      '': {
+        dependencies: { 'js-yaml': '^4.1.0', 'some-tool': '^1.0.0' },
+      },
+      'node_modules/js-yaml': {
+        version: '4.1.0',
+      },
+      'node_modules/some-tool': {
+        version: '1.0.0',
+        dependencies: { 'js-yaml': '^3.14.1' },
+      },
+      'node_modules/some-tool/node_modules/js-yaml': {
+        version: '3.14.1',
+      },
+    },
+  };
+
+  const branchReports = [
+    {
+      branch: 'release-0.10',
+      vulnerabilities: [],
+      pkgJson,
+      pkgLock,
+    },
+  ];
+
+  const jiraTickets = {
+    branches: [
+      {
+        branch: 'release-0.10',
+        tickets: [
+          {
+            ticketKey: 'MTA-7652',
+            summary: 'CVE-2026-84375 js-yaml DoS [mta-8.2]',
+            cve: 'CVE-2026-84375',
+            packageName: 'js-yaml',
+            status: 'POST',
+            affectsVersions: ['8.2'],
+            targetSafeVersion: '4.3.2',
+            url: 'https://jira.example.com/browse/MTA-7652',
+          },
+        ],
+      },
+    ],
+  };
+
+  const blended = blendVulnerabilitySources(branchReports, { jiraTickets, dependabotAlerts: [] });
+  assert.equal(blended[0].vulnerabilities.length, 1);
+
+  const jsYaml = blended[0].vulnerabilities[0];
+  assert.equal(jsYaml.packageName, 'js-yaml');
+  assert.equal(jsYaml.dependencyType, 'Direct & Indirect');
+  assert.ok(jsYaml.currentVersion.includes('4.1.0'));
+  assert.equal(jsYaml.targetSafeVersion, '4.3.2');
+  assert.equal(jsYaml.remediation.strategy, 'bump-direct-and-lockfile');
+  assert.equal(jsYaml.remediation.packageJsonChanges.length, 1);
+  assert.equal(jsYaml.remediation.packageJsonChanges[0].package, 'js-yaml');
+  assert.equal(jsYaml.remediation.packageJsonChanges[0].to, '^4.3.2');
+  assert.ok(jsYaml.remediation.lockfileActions[0].includes('npm install js-yaml@^4.3.2 --package-lock-only'));
 });

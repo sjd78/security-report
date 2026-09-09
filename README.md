@@ -18,7 +18,8 @@ Managing security vulnerabilities across large Node.js repositories is often fra
    - Consolidates multiple CVEs and advisories per package to calculate the optimal safe version that resolves all flaws.
    - Outputs machine-readable JSON (`reports/security-report.json`) and human-readable Markdown (`reports/security-report.md`).
 
-2. **Step 2: Automated Remediation (4-Tier Preference Hierarchy)**
+2. **Step 2: Automated Remediation (5-Tier Preference Hierarchy)**
+   - **`bump-direct-and-lockfile`**: For dual dependencies (`Direct & Indirect`, e.g. `js-yaml`), bumps the direct `package.json` semver constraint AND issues lockfile updates to synchronize all transitive instances.
    - **`bump-direct`**: Directly updates `package.json` semver constraints for direct dependencies (preserving formatting and `^`/`~` prefixes).
    - **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an update available that patches the transitive dependency, bumps the direct parent in `package.json`.
    - **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), updates the lockfile directly without introducing unnecessary `package.json` overrides.

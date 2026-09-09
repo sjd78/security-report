@@ -84,8 +84,6 @@ export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps) {
   if (!pkgLock?.packages) return [];
   const packages = pkgLock.packages;
 
-  // Build package lookup and dependents map
-  // Map: childName -> array of { parentPath, parentName, requiredRange }
   const dependentsMap = new Map();
   const packageVersions = new Map();
 
@@ -112,7 +110,6 @@ export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps) {
     }
   }
 
-  // Find all installed paths for targetPkgName
   const targetPaths = Object.keys(packages).filter(
     (p) => p === `node_modules/${targetPkgName}` || p.endsWith(`/node_modules/${targetPkgName}`)
   );
@@ -142,6 +139,7 @@ export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps) {
       }
     }
   }
+
   const initialLink = {
     name: targetPkgName,
     version: targetVersion,
@@ -235,6 +233,84 @@ export function findDirectRoots(chains, directDeps) {
   }
 
   return Array.from(rootsMap.values());
+}
+
+export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData = null) {
+  if (!pkgName) {
+    return {
+      isDirect: false,
+      isIndirect: false,
+      dependencyType: 'Unknown',
+      currentVersion: 'unknown',
+      installedVersions: [],
+      directRoots: [],
+      dependencyPaths: [],
+      chains: [],
+      directInfo: null,
+    };
+  }
+
+  const directDeps = getDirectDependencies(pkgJson);
+  const isDirect = directDeps.has(pkgName);
+  const directInfo = isDirect ? directDeps.get(pkgName) : null;
+
+  // Find all installed instances and paths in package-lock.json
+  const installedVersionSet = new Set();
+  const installedPaths = [];
+
+  if (pkgLock?.packages) {
+    for (const [pPath, pInfo] of Object.entries(pkgLock.packages)) {
+      if (pPath === `node_modules/${pkgName}` || pPath.endsWith(`/node_modules/${pkgName}`)) {
+        if (pInfo.version) installedVersionSet.add(pInfo.version);
+        installedPaths.push(pPath);
+      }
+    }
+  } else if (pkgLock?.dependencies) {
+    if (pkgLock.dependencies[pkgName]?.version) {
+      installedVersionSet.add(pkgLock.dependencies[pkgName].version);
+    }
+  }
+
+  // Extract chains
+  const chains = extractDependencyChains({ name: pkgName, nodes: installedPaths }, pkgLock, directDeps, npmLsData);
+  const directRoots = findDirectRoots(chains, directDeps);
+
+  // Check if there are indirect chains (chain length > 1 or chain not starting with direct pkgName)
+  const isIndirect = chains.some((c) => c.length > 1 || (c.length === 1 && c[0].name !== pkgName));
+
+  let dependencyType = 'Unknown';
+  if (isDirect && isIndirect) {
+    dependencyType = 'Direct & Indirect';
+  } else if (isDirect) {
+    dependencyType = 'Direct';
+  } else if (isIndirect) {
+    dependencyType = 'Indirect (Transitive)';
+  }
+
+  const versionsList = Array.from(installedVersionSet);
+  let currentVersion = 'unknown';
+
+  if (versionsList.length === 1) {
+    currentVersion = versionsList[0];
+  } else if (versionsList.length > 1) {
+    currentVersion = versionsList.join(', ');
+  } else if (directInfo?.range) {
+    currentVersion = directInfo.range;
+  }
+
+  const dependencyPaths = chains.map((c) => c.map((link) => link.specifier).join(' -> '));
+
+  return {
+    isDirect,
+    isIndirect,
+    dependencyType,
+    currentVersion,
+    installedVersions: versionsList,
+    directRoots,
+    dependencyPaths,
+    chains,
+    directInfo,
+  };
 }
 
 export async function runNpmLs(cwd, pkgName = null) {

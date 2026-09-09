@@ -1,4 +1,6 @@
 import semver from 'semver';
+import { lookupPackageInstalledInfo } from './dependency-graph.js';
+import { buildRemediationSuggestion } from '../collectors/npm-audit.js';
 
 export function isVersionCompatible(ticketVersions = [], targetVersions = []) {
   if (!targetVersions || targetVersions.length === 0) return true;
@@ -127,6 +129,8 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         packageName: v.packageName,
         severity: v.severity || 'moderate',
         isDirect: Boolean(v.isDirect),
+        isIndirect: Boolean(v.isIndirect),
+        dependencyType: v.dependencyType || (v.isDirect ? 'Direct' : 'Indirect (Transitive)'),
         currentVersion: v.currentVersion || 'unknown',
         targetSafeVersion: v.targetSafeVersion || null,
         vulnerableVersionRange: v.vulnerableVersionRange || null,
@@ -166,10 +170,26 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         existing.severity = v.severity;
       }
 
-      // 2. Mark isDirect true if any finding is direct
+      // 2. Mark isDirect and isIndirect
       if (v.isDirect) existing.isDirect = true;
+      if (v.isIndirect) existing.isIndirect = true;
 
-      // 3. Collect unique CVEs
+      if (existing.isDirect && existing.isIndirect) {
+        existing.dependencyType = 'Direct & Indirect';
+      } else if (existing.isDirect) {
+        existing.dependencyType = 'Direct';
+      } else if (existing.isIndirect) {
+        existing.dependencyType = 'Indirect (Transitive)';
+      }
+
+      // 3. Update current version if existing was placeholder
+      if (existing.currentVersion === 'downstream-tracker' || existing.currentVersion === 'unknown') {
+        if (v.currentVersion && v.currentVersion !== 'downstream-tracker' && v.currentVersion !== 'unknown') {
+          existing.currentVersion = v.currentVersion;
+        }
+      }
+
+      // 4. Collect unique CVEs
       if (v.cve && !existing.cves.includes(v.cve)) {
         existing.cves.push(v.cve);
         if (!existing.cve) existing.cve = v.cve;
@@ -180,7 +200,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         }
       }
 
-      // 4. Add advisory entry
+      // 5. Add advisory entry
       existing.advisories.push({
         id: v.id,
         cve: v.cve || null,
@@ -192,21 +212,21 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         sources: v.sources,
       });
 
-      // 5. Merge dependency paths
+      // 6. Merge dependency paths
       for (const p of v.dependencyPaths || []) {
         if (!existing.dependencyPaths.includes(p)) {
           existing.dependencyPaths.push(p);
         }
       }
 
-      // 6. Merge direct roots
+      // 7. Merge direct roots
       for (const r of v.directRoots || []) {
         if (!existing.directRoots.some((dr) => dr.name === r.name)) {
           existing.directRoots.push(r);
         }
       }
 
-      // 7. Merge Jira tickets
+      // 8. Merge Jira tickets
       if (v.sources?.jira) {
         if (!existing.sources.jiraTickets.some((t) => t.ticketKey === v.sources.jira.ticketKey)) {
           existing.sources.jiraTickets.push(v.sources.jira);
@@ -214,7 +234,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         if (!existing.sources.jira) existing.sources.jira = v.sources.jira;
       }
 
-      // 8. Merge Dependabot alerts
+      // 9. Merge Dependabot alerts
       if (v.sources?.dependabot) {
         if (!existing.sources.dependabotAlerts.some((a) => a.alertNumber === v.sources.dependabot.alertNumber)) {
           existing.sources.dependabotAlerts.push(v.sources.dependabot);
@@ -222,7 +242,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         if (!existing.sources.dependabot) existing.sources.dependabot = v.sources.dependabot;
       }
 
-      // 9. Merge remediation plan
+      // 10. Merge remediation plan
       if (v.remediation) {
         if (!existing.remediation) {
           existing.remediation = { ...v.remediation };
@@ -240,15 +260,28 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
       pkg.targetSafeVersion = optimalSafeVersion;
       if (pkg.remediation) {
         pkg.remediation.targetVersion = optimalSafeVersion;
+
+        // If package is Direct & Indirect, update strategy
+        if (pkg.dependencyType === 'Direct & Indirect' || (pkg.isDirect && pkg.isIndirect)) {
+          pkg.remediation.strategy = 'bump-direct-and-lockfile';
+          pkg.remediation.note = 'Package is both a direct dependency and required transitively. Resolution updates package.json semver and synchronizes lockfile for all instances.';
+        }
+
         for (const chg of pkg.remediation.packageJsonChanges || []) {
           if (chg.package === pkg.packageName) {
             const prefix = chg.from?.startsWith('~') ? '~' : chg.from?.startsWith('^') ? '^' : '';
             chg.to = `${prefix}${optimalSafeVersion}`;
           }
         }
+        let targetRange = optimalSafeVersion;
+        const matchingChange = (pkg.remediation.packageJsonChanges || []).find((c) => c.package === pkg.packageName);
+        if (matchingChange && matchingChange.to) {
+          targetRange = matchingChange.to;
+        }
+
         if (pkg.remediation.lockfileActions) {
           pkg.remediation.lockfileActions = pkg.remediation.lockfileActions.map((act) =>
-            act.replace(new RegExp(`${pkg.packageName}@[^\\s]+`), `${pkg.packageName}@${optimalSafeVersion}`)
+            act.replace(new RegExp(`${pkg.packageName}@[^\\s]+`), `${pkg.packageName}@${targetRange}`)
           );
         }
       }
@@ -338,9 +371,44 @@ export function blendVulnerabilitySources(
       return copy;
     });
 
-    // Unmatched branch Jira tickets
+    // Unmatched branch Jira tickets: assess actual installed version & dependency type from branch repo lockfile
     for (const ticket of branchJiraTickets) {
       if (!matchedJiraKeys.has(ticket.ticketKey)) {
+        const pkgInfo = lookupPackageInstalledInfo(
+          ticket.packageName,
+          branchReport.pkgJson,
+          branchReport.pkgLock,
+          branchReport.npmLsData
+        );
+
+        const currentVersion = pkgInfo.currentVersion !== 'unknown'
+          ? pkgInfo.currentVersion
+          : 'downstream-tracker';
+
+        const isDirect = pkgInfo.isDirect;
+        const isIndirect = pkgInfo.isIndirect || (!isDirect && currentVersion !== 'unknown');
+        const dependencyType = pkgInfo.dependencyType !== 'Unknown'
+          ? pkgInfo.dependencyType
+          : (isDirect ? 'Direct' : 'Indirect (Transitive)');
+
+        const targetSafe = ticket.targetSafeVersion || null;
+
+        const dummyVuln = {
+          packageName: ticket.packageName,
+          isDirect,
+          isIndirect,
+          dependencyType,
+          currentVersion,
+          targetSafeVersion: targetSafe,
+        };
+
+        const remediation = buildRemediationSuggestion(
+          dummyVuln,
+          pkgInfo.directRoots,
+          branchReport.pkgJson,
+          pkgInfo.chains
+        );
+
         rawVulns.push({
           id: ticket.ghsaId || ticket.ticketKey,
           cve: ticket.cve,
@@ -348,12 +416,14 @@ export function blendVulnerabilitySources(
           severity: 'high',
           title: ticket.summary,
           url: ticket.advisoryUrl || ticket.url,
-          isDirect: false,
+          isDirect,
+          isIndirect,
+          dependencyType,
           vulnerableVersionRange: ticket.vulnerableVersionRange || null,
-          currentVersion: 'downstream-tracker',
-          targetSafeVersion: ticket.targetSafeVersion || null,
-          dependencyPaths: [ticket.packageName || ticket.summary],
-          directRoots: [],
+          currentVersion,
+          targetSafeVersion: targetSafe,
+          dependencyPaths: pkgInfo.dependencyPaths.length > 0 ? pkgInfo.dependencyPaths : [ticket.packageName || ticket.summary],
+          directRoots: pkgInfo.directRoots,
           sources: {
             jira: {
               ticketKey: ticket.ticketKey,
@@ -363,16 +433,7 @@ export function blendVulnerabilitySources(
               affectsVersions: ticket.affectsVersions || [],
             },
           },
-          remediation: {
-            strategy: ticket.targetSafeVersion ? 'lockfile-update' : 'jira-tracker',
-            targetPackage: ticket.packageName,
-            targetVersion: ticket.targetSafeVersion,
-            packageJsonChanges: [],
-            lockfileActions: ticket.targetSafeVersion
-              ? [`npm install ${ticket.packageName}@${ticket.targetSafeVersion} --package-lock-only`]
-              : [],
-            note: `Tracked in Jira issue ${ticket.ticketKey} (${ticket.status})`,
-          },
+          remediation,
         });
       }
     }
@@ -380,6 +441,39 @@ export function blendVulnerabilitySources(
     // Unmatched branch Dependabot alerts
     for (const alert of branchDependabotAlerts) {
       if (!matchedDependabotNumbers.has(alert.alertNumber)) {
+        const pkgInfo = lookupPackageInstalledInfo(
+          alert.packageName,
+          branchReport.pkgJson,
+          branchReport.pkgLock,
+          branchReport.npmLsData
+        );
+
+        const currentVersion = pkgInfo.currentVersion !== 'unknown'
+          ? pkgInfo.currentVersion
+          : 'dependabot-alert';
+
+        const isDirect = pkgInfo.isDirect;
+        const isIndirect = pkgInfo.isIndirect || (!isDirect && currentVersion !== 'unknown');
+        const dependencyType = pkgInfo.dependencyType !== 'Unknown'
+          ? pkgInfo.dependencyType
+          : (isDirect ? 'Direct' : 'Indirect (Transitive)');
+
+        const dummyVuln = {
+          packageName: alert.packageName,
+          isDirect,
+          isIndirect,
+          dependencyType,
+          currentVersion,
+          targetSafeVersion: alert.targetSafeVersion,
+        };
+
+        const remediation = buildRemediationSuggestion(
+          dummyVuln,
+          pkgInfo.directRoots,
+          branchReport.pkgJson,
+          pkgInfo.chains
+        );
+
         rawVulns.push({
           id: alert.ghsaId || `DEP-${alert.alertNumber}`,
           cve: alert.cve,
@@ -387,12 +481,14 @@ export function blendVulnerabilitySources(
           severity: alert.severity || 'moderate',
           title: alert.summary,
           url: alert.url,
-          isDirect: false,
+          isDirect,
+          isIndirect,
+          dependencyType,
           vulnerableVersionRange: alert.vulnerableVersionRange,
-          currentVersion: 'dependabot-alert',
+          currentVersion,
           targetSafeVersion: alert.targetSafeVersion,
-          dependencyPaths: [alert.packageName],
-          directRoots: [],
+          dependencyPaths: pkgInfo.dependencyPaths.length > 0 ? pkgInfo.dependencyPaths : [alert.packageName],
+          directRoots: pkgInfo.directRoots,
           sources: {
             dependabot: {
               alertNumber: alert.alertNumber,
@@ -401,15 +497,7 @@ export function blendVulnerabilitySources(
               severity: alert.severity,
             },
           },
-          remediation: {
-            strategy: 'lockfile-update',
-            targetPackage: alert.packageName,
-            targetVersion: alert.targetSafeVersion,
-            packageJsonChanges: [],
-            lockfileActions: alert.targetSafeVersion
-              ? [`npm install ${alert.packageName}@${alert.targetSafeVersion} --package-lock-only`]
-              : [],
-          },
+          remediation,
         });
       }
     }

@@ -7,6 +7,7 @@ import {
   getDirectDependencies,
   extractDependencyChains,
   findDirectRoots,
+  lookupPackageInstalledInfo,
   runNpmLs,
 } from '../core/dependency-graph.js';
 
@@ -67,7 +68,6 @@ export function canBeResolvedInLockfile(safeVersion, chains = []) {
 
   for (const chain of chains) {
     if (chain.length < 2) continue;
-    // Get immediate parent of the target package
     const immediateParent = chain[chain.length - 2];
     const targetLink = chain[chain.length - 1];
 
@@ -89,13 +89,44 @@ export function canBeResolvedInLockfile(safeVersion, chains = []) {
 
 export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = []) {
   const isDirect = vuln.isDirect;
+  const isIndirect = vuln.isIndirect;
+  const dependencyType = vuln.dependencyType;
   const fix = vuln.fixAvailable;
   const safeVersion = vuln.targetSafeVersion;
 
-  // 1. Direct Dependency Bump
+  // 1. Dual Dependency Type (Direct & Indirect, like js-yaml)
+  if (dependencyType === 'Direct & Indirect' || (isDirect && isIndirect)) {
+    const directInfo = directRoots.find((r) => r.name === vuln.packageName) || getDirectDependencies(pkgJson).get(vuln.packageName);
+    const rawCurrent = String(vuln.currentVersion || '').split(',')[0].trim();
+    const currentRange = directInfo?.currentRange || directInfo?.range || `^${rawCurrent}`;
+    const prefix = currentRange.startsWith('~') ? '~' : currentRange.startsWith('^') ? '^' : '';
+    const targetRange = safeVersion ? `${prefix}${safeVersion}` : (fix?.version ? `${prefix}${fix.version}` : null);
+
+    return {
+      strategy: 'bump-direct-and-lockfile',
+      targetPackage: vuln.packageName,
+      targetVersion: safeVersion || fix?.version || null,
+      packageJsonChanges: targetRange
+        ? [
+            {
+              package: vuln.packageName,
+              section: directInfo?.section || 'dependencies',
+              from: currentRange,
+              to: targetRange,
+            },
+          ]
+        : [],
+      lockfileActions: targetRange
+        ? [`npm install ${vuln.packageName}@${targetRange} --package-lock-only`]
+        : [`npm update ${vuln.packageName} --package-lock-only`],
+      note: 'Package is both a direct dependency and required transitively. Resolution updates package.json semver and synchronizes lockfile for all instances.',
+    };
+  }
+
+  // 2. Pure Direct Dependency Bump
   if (isDirect) {
-    const directInfo = directRoots.find((r) => r.name === vuln.packageName);
-    const currentRange = directInfo?.currentRange || `^${vuln.currentVersion}`;
+    const directInfo = directRoots.find((r) => r.name === vuln.packageName) || getDirectDependencies(pkgJson).get(vuln.packageName);
+    const currentRange = directInfo?.currentRange || directInfo?.range || `^${vuln.currentVersion}`;
     const prefix = currentRange.startsWith('~') ? '~' : currentRange.startsWith('^') ? '^' : '';
     const targetRange = safeVersion ? `${prefix}${safeVersion}` : (fix?.version ? `${prefix}${fix.version}` : null);
 
@@ -119,10 +150,10 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     };
   }
 
-  // 2. Direct Root Parent Fix Available (npm audit identified fix)
+  // 3. Direct Root Parent Fix Available (npm audit identified parent fix)
   if (fix && typeof fix === 'object' && fix.name && fix.version) {
-    const directInfo = directRoots.find((r) => r.name === fix.name);
-    const currentRange = directInfo?.currentRange || `^${fix.version}`;
+    const directInfo = directRoots.find((r) => r.name === fix.name) || getDirectDependencies(pkgJson).get(fix.name);
+    const currentRange = directInfo?.currentRange || directInfo?.range || `^${fix.version}`;
     const prefix = currentRange.startsWith('~') ? '~' : currentRange.startsWith('^') ? '^' : '';
     const targetRange = `${prefix}${fix.version}`;
 
@@ -144,7 +175,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     };
   }
 
-  // 3. In-Range Transitive Lockfile Bump (parent range allows safe version)
+  // 4. In-Range Transitive Lockfile Bump (parent range allows safe version)
   if (safeVersion && canBeResolvedInLockfile(safeVersion, chains)) {
     return {
       strategy: 'lockfile-update',
@@ -160,7 +191,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     };
   }
 
-  // 4. Transitive with identified Direct Root Parent (e.g. msw)
+  // 5. Transitive with identified Direct Root Parent (e.g. msw)
   if (directRoots.length > 0) {
     const primaryRoot = directRoots[0];
     return {
@@ -177,7 +208,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     };
   }
 
-  // 5. Fallback: Package Override
+  // 6. Fallback: Package Override
   if (safeVersion) {
     return {
       strategy: 'package-override',
@@ -218,10 +249,13 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
   const rawVulns = auditJson.vulnerabilities || {};
 
   for (const [pkgName, vulnData] of Object.entries(rawVulns)) {
-    const isDirect = Boolean(vulnData.isDirect);
+    const pkgInfo = lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData);
+    const isDirect = pkgInfo.isDirect || Boolean(vulnData.isDirect);
+    const isIndirect = pkgInfo.isIndirect || !isDirect;
+    const dependencyType = pkgInfo.dependencyType !== 'Unknown' ? pkgInfo.dependencyType : (isDirect ? 'Direct' : 'Indirect (Transitive)');
+
     const rawVias = vulnData.via || [];
 
-    // Extract primary advisory info
     let advisoryId = null;
     let cve = null;
     let title = `${vulnData.name} vulnerability`;
@@ -239,7 +273,6 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
         if (item.cwe && Array.isArray(item.cwe)) cwe = item.cwe;
         if (item.cvss) cvss = item.cvss;
 
-        // Check if CVE is mentioned in url, title, or cve fields
         const foundCve = extractCveFromText(item.url) || extractCveFromText(item.title) || (item.cve ? item.cve : null);
         if (foundCve && !cve) cve = foundCve;
       }
@@ -249,14 +282,20 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
       advisoryId = `AUDIT-${pkgName}-${vulnData.severity || 'vuln'}`;
     }
 
-    const chains = extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData);
-    const directRoots = findDirectRoots(chains, directDeps);
+    const chains = pkgInfo.chains.length > 0
+      ? pkgInfo.chains
+      : extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData);
 
-    // Format dependency path strings
+    const directRoots = pkgInfo.directRoots.length > 0
+      ? pkgInfo.directRoots
+      : findDirectRoots(chains, directDeps);
+
     const dependencyPaths = chains.map((chain) => chain.map((c) => c.specifier).join(' -> '));
 
-    // Get current version from chains or package-lock
-    const currentVersion = chains[0]?.slice(-1)[0]?.version || vulnData.range || 'unknown';
+    const currentVersion = pkgInfo.currentVersion !== 'unknown'
+      ? pkgInfo.currentVersion
+      : (chains[0]?.slice(-1)[0]?.version || vulnData.range || 'unknown');
+
     const targetSafeVersion = determineSafeVersion(vulnData.range, currentVersion, vulnData.fixAvailable);
 
     const vulnRecord = {
@@ -269,6 +308,8 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
       cwe,
       cvss,
       isDirect,
+      isIndirect,
+      dependencyType,
       vulnerableVersionRange: vulnData.range || null,
       currentVersion,
       targetSafeVersion,
@@ -289,7 +330,6 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
     vulnerabilities.push(vulnRecord);
   }
 
-  // Sort vulnerabilities by severity
   const severityRank = { critical: 4, high: 3, moderate: 2, low: 1, info: 0 };
   vulnerabilities.sort((a, b) => (severityRank[b.severity] || 0) - (severityRank[a.severity] || 0));
 

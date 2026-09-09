@@ -8,6 +8,7 @@ import {
   stageAndCommit,
   pushBranch,
 } from './core/git-manager.js';
+import { readPackageJson, readPackageLock, runNpmLs } from './core/dependency-graph.js';
 import { collectNpmAudit } from './collectors/npm-audit.js';
 import { fetchJiraCveTickets, groupJiraTicketsByBranch } from './collectors/jira.js';
 import { fetchDependabotAlerts, groupDependabotAlertsByBranch } from './collectors/dependabot.js';
@@ -80,28 +81,39 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
     console.log(`📡 [Scan] Fetched ${jiraCount} Jira CVE ticket(s) and ${dependabotCount} Dependabot alert(s) across ${branchesToScan.length} branch(es)`);
   }
 
-  // Run npm audit across all branch worktrees conditionally
+  // Run branch inspection and audit
   const rawBranchReports = [];
   for (const branch of branchesToScan) {
-    if (config.collectors.npmAudit) {
-      console.log(`🔬 [Scan] Inspecting branch: ${branch}`);
-      try {
-        const branchReport = await withWorktree(repoInfo.repoPath, branch, async (worktreeDir) => {
-          return await collectNpmAudit(worktreeDir, branch);
-        });
-        rawBranchReports.push(branchReport);
-      } catch (err) {
-        console.warn(`⚠️ [Scan] Failed to audit branch ${branch}: ${err.message}`);
-        rawBranchReports.push({
+    console.log(`🔬 [Scan] Inspecting branch: ${branch}`);
+    try {
+      const branchReport = await withWorktree(repoInfo.repoPath, branch, async (worktreeDir) => {
+        const pkgJson = readPackageJson(worktreeDir);
+        const pkgLock = readPackageLock(worktreeDir);
+        let npmLsData = null;
+        try {
+          npmLsData = await runNpmLs(worktreeDir);
+        } catch {
+          // ignore
+        }
+
+        const audit = config.collectors.npmAudit
+          ? await collectNpmAudit(worktreeDir, branch)
+          : { summary: { critical: 0, high: 0, moderate: 0, low: 0, total: 0 }, vulnerabilities: [] };
+
+        return {
+          ...audit,
           branch,
-          error: err.message,
-          summary: { critical: 0, high: 0, moderate: 0, low: 0, total: 0 },
-          vulnerabilities: [],
-        });
-      }
-    } else {
+          pkgJson,
+          pkgLock,
+          npmLsData,
+        };
+      });
+      rawBranchReports.push(branchReport);
+    } catch (err) {
+      console.warn(`⚠️ [Scan] Failed to inspect branch ${branch}: ${err.message}`);
       rawBranchReports.push({
         branch,
+        error: err.message,
         summary: { critical: 0, high: 0, moderate: 0, low: 0, total: 0 },
         vulnerabilities: [],
       });
