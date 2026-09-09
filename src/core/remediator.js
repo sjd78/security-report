@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import semver from 'semver';
 import { collectNpmAudit } from '../collectors/npm-audit.js';
+import { findWorkspacePackageJsons } from './dependency-graph.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -13,66 +14,143 @@ export function detectIndentation(jsonStr) {
 }
 
 export function updatePackageJsonFile(worktreeDir, changes = [], options = {}) {
-  const pkgPath = path.resolve(worktreeDir, 'package.json');
-  if (!fs.existsSync(pkgPath)) {
+  const rootPkgPath = path.resolve(worktreeDir, 'package.json');
+  if (!fs.existsSync(rootPkgPath)) {
     throw new Error(`package.json not found in ${worktreeDir}`);
   }
 
-  const rawContent = fs.readFileSync(pkgPath, 'utf8');
-  const indent = detectIndentation(rawContent);
-  const pkgJson = JSON.parse(rawContent);
+  const workspaces = findWorkspacePackageJsons(worktreeDir);
+  const loadedFiles = new Map();
+
+  for (const ws of workspaces) {
+    if (fs.existsSync(ws.packageJsonPath)) {
+      const raw = fs.readFileSync(ws.packageJsonPath, 'utf8');
+      loadedFiles.set(ws.packageJsonPath, {
+        path: ws.packageJsonPath,
+        relativePath: ws.relativePath,
+        raw,
+        indent: detectIndentation(raw),
+        pkgJson: JSON.parse(raw),
+        modified: false,
+      });
+    }
+  }
+
   const applied = [];
+  const depSections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
 
   for (const change of changes) {
-    const { package: pkgName, section = 'dependencies', to, from } = change;
+    const { package: pkgName, section = 'dependencies', to, from, packageJsonPath, workspace } = change;
     if (!pkgName || !to) continue;
 
     if (section === 'overrides') {
       if (options.allowOverrides !== false) {
-        pkgJson.overrides = pkgJson.overrides || {};
-        const prev = pkgJson.overrides[pkgName] || null;
-        pkgJson.overrides[pkgName] = to;
-        applied.push({
-          package: pkgName,
-          section: 'overrides',
-          from: prev,
-          to,
-        });
+        const rootEntry = loadedFiles.get(rootPkgPath);
+        if (rootEntry) {
+          rootEntry.pkgJson.overrides = rootEntry.pkgJson.overrides || {};
+          const prev = rootEntry.pkgJson.overrides[pkgName] || null;
+          rootEntry.pkgJson.overrides[pkgName] = to;
+          rootEntry.modified = true;
+          applied.push({
+            package: pkgName,
+            section: 'overrides',
+            from: prev,
+            to,
+            packageJsonPath: 'package.json',
+          });
+        }
       }
       continue;
     }
 
-    // Check specified section or search across all dep sections
-    const depSections = [section, 'dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
-    let targetSection = null;
+    let updatedAny = false;
 
-    for (const sec of depSections) {
-      if (pkgJson[sec] && pkgJson[sec][pkgName] !== undefined) {
-        targetSection = sec;
-        break;
+    // If specific file targeted
+    if (packageJsonPath) {
+      const targetAbs = path.resolve(worktreeDir, packageJsonPath);
+      const entry = loadedFiles.get(targetAbs);
+      if (entry) {
+        let targetSec = section;
+        for (const sec of depSections) {
+          if (entry.pkgJson[sec] && entry.pkgJson[sec][pkgName] !== undefined) {
+            targetSec = sec;
+            break;
+          }
+        }
+        entry.pkgJson[targetSec] = entry.pkgJson[targetSec] || {};
+        const cur = entry.pkgJson[targetSec][pkgName] || from;
+        entry.pkgJson[targetSec][pkgName] = to;
+        entry.modified = true;
+        updatedAny = true;
+        applied.push({
+          package: pkgName,
+          section: targetSec,
+          from: cur,
+          to,
+          packageJsonPath: entry.relativePath,
+        });
+      }
+    } else {
+      // Search across all loaded package.json files
+      for (const entry of loadedFiles.values()) {
+        let foundSection = null;
+        for (const sec of depSections) {
+          if (entry.pkgJson[sec] && entry.pkgJson[sec][pkgName] !== undefined) {
+            foundSection = sec;
+            break;
+          }
+        }
+
+        if (foundSection) {
+          const cur = entry.pkgJson[foundSection][pkgName];
+          entry.pkgJson[foundSection][pkgName] = to;
+          entry.modified = true;
+          updatedAny = true;
+          applied.push({
+            package: pkgName,
+            section: foundSection,
+            from: cur,
+            to,
+            packageJsonPath: entry.relativePath,
+          });
+        }
+      }
+
+      // If not found anywhere, default to root package.json
+      if (!updatedAny) {
+        const rootEntry = loadedFiles.get(rootPkgPath);
+        if (rootEntry) {
+          rootEntry.pkgJson[section] = rootEntry.pkgJson[section] || {};
+          const cur = rootEntry.pkgJson[section][pkgName] || from;
+          rootEntry.pkgJson[section][pkgName] = to;
+          rootEntry.modified = true;
+          applied.push({
+            package: pkgName,
+            section,
+            from: cur,
+            to,
+            packageJsonPath: 'package.json',
+          });
+        }
       }
     }
-
-    if (!targetSection) {
-      // Default to dependencies if not found
-      targetSection = section || 'dependencies';
-      pkgJson[targetSection] = pkgJson[targetSection] || {};
-    }
-
-    const currentRange = pkgJson[targetSection][pkgName] || null;
-    pkgJson[targetSection][pkgName] = to;
-
-    applied.push({
-      package: pkgName,
-      section: targetSection,
-      from: currentRange,
-      to,
-    });
   }
 
-  // Write back formatted JSON
-  fs.writeFileSync(pkgPath, JSON.stringify(pkgJson, null, indent) + '\n', 'utf8');
-  return { applied, pkgJson };
+  // Write back all modified files preserving indentation
+  for (const entry of loadedFiles.values()) {
+    if (entry.modified) {
+      fs.writeFileSync(entry.path, JSON.stringify(entry.pkgJson, null, entry.indent) + '\n', 'utf8');
+    }
+  }
+
+  const rootResult = loadedFiles.get(rootPkgPath)?.pkgJson || {};
+  return {
+    applied,
+    pkgJson: rootResult,
+    touchedFiles: Array.from(loadedFiles.values())
+      .filter((e) => e.modified)
+      .map((e) => e.relativePath),
+  };
 }
 
 export async function syncLockfile(worktreeDir, options = {}) {
@@ -89,7 +167,6 @@ export async function syncLockfile(worktreeDir, options = {}) {
     });
     return { success: true, stdout, stderr };
   } catch (err) {
-    // Retry with --legacy-peer-deps if peer dependency conflict occurred
     if (!options.legacyPeerDeps && (err.stderr?.includes('ERESOLVE') || err.stdout?.includes('ERESOLVE'))) {
       return await syncLockfile(worktreeDir, { ...options, legacyPeerDeps: true });
     }
@@ -112,7 +189,6 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
     };
   }
 
-  // Collect all package.json updates from the report
   const pendingChanges = [];
   const changesMap = new Map();
 
@@ -121,14 +197,12 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
     if (!rem || !rem.packageJsonChanges) continue;
 
     for (const chg of rem.packageJsonChanges) {
-      const key = `${chg.section || 'dependencies'}:${chg.package}`;
-      // Deduplicate / keep the latest or highest target version
+      const key = `${chg.packageJsonPath || 'root'}:${chg.section || 'dependencies'}:${chg.package}`;
       if (!changesMap.has(key)) {
         changesMap.set(key, chg);
         pendingChanges.push(chg);
       } else {
         const existing = changesMap.get(key);
-        // If clean semver, pick the higher version
         const cleanExisting = semver.clean(existing.to.replace(/^[~^]/, ''));
         const cleanNew = semver.clean(chg.to.replace(/^[~^]/, ''));
         if (cleanExisting && cleanNew && semver.gt(cleanNew, cleanExisting)) {
@@ -149,8 +223,8 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
     };
   }
 
-  // Step 2a: Update package.json
-  const { applied } = updatePackageJsonFile(worktreeDir, pendingChanges, options);
+  // Step 2a: Update package.json files (root and workspaces)
+  const { applied, touchedFiles } = updatePackageJsonFile(worktreeDir, pendingChanges, options);
 
   // Step 2b: Update package-lock.json
   await syncLockfile(worktreeDir, options);
@@ -177,6 +251,7 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
     branch: branchName,
     dryRun: false,
     appliedChanges: applied,
+    touchedFiles,
     resolved,
     remaining,
     isClean: remaining.length === 0,

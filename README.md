@@ -13,7 +13,7 @@ Managing security vulnerabilities across large Node.js repositories is often fra
 1. **Step 1: Aggregate & Analyze**
    - Clones target repositories (GitHub `org/repo` format, URLs, or local folders) into an isolated `REPOS/` directory.
    - Spins up detached `git worktree` instances per target branch to prevent workspace contamination.
-   - Runs `npm audit` and parses the full `npm ls` ancestor hierarchy to trace direct vs. indirect (transitive) dependency chains.
+   - Runs `npm audit` and parses the full `npm ls` ancestor hierarchy to trace direct vs. indirect (transitive) dependency chains across root and **npm workspaces** (nested `package.json` files).
    - Cross-references findings with Jira CVE tickets (resolving attached GitHub Security Advisory links to extract affected ranges and patched versions) and GitHub Dependabot alerts.
    - Consolidates multiple CVEs and advisories per package to calculate the optimal safe version that resolves all flaws.
    - Outputs machine-readable JSON (`reports/security-report.json`) and human-readable Markdown (`reports/security-report.md`).

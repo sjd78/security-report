@@ -18,19 +18,121 @@ export function readPackageLock(dir) {
   return JSON.parse(fs.readFileSync(lockPath, 'utf8'));
 }
 
-export function getDirectDependencies(pkgJson) {
-  if (!pkgJson) return new Map();
-  const direct = new Map();
+export function findWorkspacePackageJsons(worktreeDir, rootPkgJson = null) {
+  if (!worktreeDir) return [];
+  const root = rootPkgJson || readPackageJson(worktreeDir);
+  if (!root) return [];
 
+  const results = [];
+  const rootPkgPath = path.resolve(worktreeDir, 'package.json');
+  results.push({
+    name: root.name || 'root',
+    workspacePath: worktreeDir,
+    relativePath: 'package.json',
+    packageJsonPath: rootPkgPath,
+    pkgJson: root,
+    isRoot: true,
+  });
+
+  let patterns = [];
+  if (Array.isArray(root.workspaces)) {
+    patterns = root.workspaces;
+  } else if (root.workspaces && typeof root.workspaces === 'object' && Array.isArray(root.workspaces.packages)) {
+    patterns = root.workspaces.packages;
+  }
+
+  const seenPaths = new Set([rootPkgPath]);
+
+  for (const pattern of patterns) {
+    const cleanPattern = pattern.replace(/\/+$/, '');
+    if (cleanPattern.endsWith('/*')) {
+      const parentDir = path.resolve(worktreeDir, cleanPattern.replace(/\/\*$/, ''));
+      if (fs.existsSync(parentDir) && fs.statSync(parentDir).isDirectory()) {
+        const entries = fs.readdirSync(parentDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory()) {
+            const nestedPkgPath = path.join(parentDir, entry.name, 'package.json');
+            if (fs.existsSync(nestedPkgPath) && !seenPaths.has(nestedPkgPath)) {
+              seenPaths.add(nestedPkgPath);
+              try {
+                const nestedPkg = JSON.parse(fs.readFileSync(nestedPkgPath, 'utf8'));
+                results.push({
+                  name: nestedPkg.name || entry.name,
+                  workspacePath: path.join(parentDir, entry.name),
+                  relativePath: path.relative(worktreeDir, nestedPkgPath),
+                  packageJsonPath: nestedPkgPath,
+                  pkgJson: nestedPkg,
+                  isRoot: false,
+                });
+              } catch {
+                // ignore
+              }
+            }
+          }
+        }
+      }
+    } else {
+      const directDir = path.resolve(worktreeDir, cleanPattern);
+      const nestedPkgPath = path.join(directDir, 'package.json');
+      if (fs.existsSync(nestedPkgPath) && !seenPaths.has(nestedPkgPath)) {
+        seenPaths.add(nestedPkgPath);
+        try {
+          const nestedPkg = JSON.parse(fs.readFileSync(nestedPkgPath, 'utf8'));
+          results.push({
+            name: nestedPkg.name || path.basename(directDir),
+            workspacePath: directDir,
+            relativePath: path.relative(worktreeDir, nestedPkgPath),
+            packageJsonPath: nestedPkgPath,
+            pkgJson: nestedPkg,
+            isRoot: false,
+          });
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  return results;
+}
+
+export function getDirectDependencies(pkgJson, worktreeDir = null) {
+  const direct = new Map();
   const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
-  for (const section of sections) {
-    if (pkgJson[section] && typeof pkgJson[section] === 'object') {
-      for (const [name, range] of Object.entries(pkgJson[section])) {
-        direct.set(name, {
-          name,
-          range,
-          section,
-        });
+
+  const workspaceEntries = worktreeDir
+    ? findWorkspacePackageJsons(worktreeDir, pkgJson)
+    : (pkgJson ? [{ pkgJson, relativePath: 'package.json', name: 'root', isRoot: true }] : []);
+
+  for (const ws of workspaceEntries) {
+    const wsPkg = ws.pkgJson;
+    if (!wsPkg) continue;
+
+    for (const section of sections) {
+      if (wsPkg[section] && typeof wsPkg[section] === 'object') {
+        for (const [name, range] of Object.entries(wsPkg[section])) {
+          const decl = {
+            workspace: ws.name,
+            packageJsonPath: ws.relativePath,
+            section,
+            range,
+            isRoot: ws.isRoot,
+          };
+
+          if (!direct.has(name)) {
+            direct.set(name, {
+              name,
+              range,
+              section,
+              workspace: ws.isRoot ? null : ws.name,
+              packageJsonPath: ws.relativePath,
+              declarations: [decl],
+            });
+          } else {
+            const existing = direct.get(name);
+            existing.declarations.push(decl);
+          }
+        }
       }
     }
   }
@@ -152,7 +254,6 @@ export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps) {
 }
 
 export function extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData = null) {
-  // 1. Try npm ls graph first if available
   if (npmLsData) {
     const lsChains = extractChainsFromNpmLs(npmLsData, vulnData.name);
     if (lsChains.length > 0) {
@@ -160,7 +261,6 @@ export function extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData
     }
   }
 
-  // 2. Try package-lock.json dependency graph traversal
   if (pkgLock?.packages) {
     const lockChains = tracePathsFromPackageLock(pkgLock, vulnData.name, directDeps);
     if (lockChains.length > 0) {
@@ -168,7 +268,6 @@ export function extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData
     }
   }
 
-  // 3. Fallback to audit nodes parsing
   const chains = [];
   const nodes = vulnData.nodes || [];
 
@@ -199,7 +298,6 @@ export function extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData
     chains.push(chain);
   }
 
-  // 4. Default direct representation
   if (chains.length === 0) {
     const isDirect = directDeps.has(vulnData.name);
     const directInfo = directDeps.get(vulnData.name);
@@ -228,6 +326,9 @@ export function findDirectRoots(chains, directDeps) {
         currentRange: directInfo.range,
         section: directInfo.section,
         installedVersion: top.version,
+        workspace: directInfo.workspace,
+        packageJsonPath: directInfo.packageJsonPath,
+        declarations: directInfo.declarations || [],
       });
     }
   }
@@ -235,7 +336,7 @@ export function findDirectRoots(chains, directDeps) {
   return Array.from(rootsMap.values());
 }
 
-export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData = null) {
+export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData = null, worktreeDir = null) {
   if (!pkgName) {
     return {
       isDirect: false,
@@ -247,14 +348,15 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
       dependencyPaths: [],
       chains: [],
       directInfo: null,
+      workspaceDeclarations: [],
     };
   }
 
-  const directDeps = getDirectDependencies(pkgJson);
+  const directDeps = getDirectDependencies(pkgJson, worktreeDir);
   const isDirect = directDeps.has(pkgName);
   const directInfo = isDirect ? directDeps.get(pkgName) : null;
+  const workspaceDeclarations = directInfo?.declarations || [];
 
-  // Find all installed instances and paths in package-lock.json
   const installedVersionSet = new Set();
   const installedPaths = [];
 
@@ -271,11 +373,9 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
     }
   }
 
-  // Extract chains
   const chains = extractDependencyChains({ name: pkgName, nodes: installedPaths }, pkgLock, directDeps, npmLsData);
   const directRoots = findDirectRoots(chains, directDeps);
 
-  // Check if there are indirect chains (chain length > 1 or chain not starting with direct pkgName)
   const isIndirect = chains.some((c) => c.length > 1 || (c.length === 1 && c[0].name !== pkgName));
 
   let dependencyType = 'Unknown';
@@ -310,6 +410,7 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
     dependencyPaths,
     chains,
     directInfo,
+    workspaceDeclarations,
   };
 }
 

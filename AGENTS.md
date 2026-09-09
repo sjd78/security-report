@@ -145,6 +145,14 @@ security-report/
   2. Detects dual dependency status: `dependencyType: "Direct & Indirect"`.
   3. Formulates a dual resolution plan (`bump-direct-and-lockfile`): updates the `package.json` semver constraint for the direct dependency AND issues lockfile commands (`npm install <pkg>@<safeVersion> --package-lock-only`) to synchronize all transitive instances.
 
+
+### I. npm Workspaces & Monorepo Direct Dependency Support
+- **Problem**: In monorepos using npm workspaces (`workspaces: ["packages/*"]`), direct dependencies can be declared in nested `package.json` files (e.g. `packages/ui/package.json`) rather than only root `package.json`.
+- **Solution**:
+  1. `src/core/dependency-graph.js` (`findWorkspacePackageJsons`, `getDirectDependencies`) discovers all nested workspace packages.
+  2. Dependency checks aggregate direct dependencies across root and all workspaces, tracking the exact declaring workspace and file path.
+  3. Remediation (`updatePackageJsonFile`) updates the specific workspace `package.json` file where the dependency is declared.
+
 ## 5. Configuration & Environment Variables
 
 | Variable | CLI Flag / Field | Description | Default |

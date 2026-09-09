@@ -8,7 +8,7 @@ import {
   detectIndentation,
   remediateBranch,
 } from '../src/core/remediator.js';
-
+import { findWorkspacePackageJsons, getDirectDependencies } from '../src/core/dependency-graph.js';
 test('detectIndentation: detects 2 spaces and 4 spaces', () => {
   assert.equal(detectIndentation('{\n  "name": "foo"\n}'), '  ');
   assert.equal(detectIndentation('{\n    "name": "foo"\n}'), '    ');
@@ -71,4 +71,58 @@ test('remediateBranch: dry-run mode', async () => {
   assert.equal(result.dryRun, true);
   assert.equal(result.appliedChanges.length, 1);
   assert.equal(result.appliedChanges[0].package, 'lodash');
+});
+
+test('npm workspaces: discovers nested packages and updates workspace package.json', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-rem-test-'));
+  try {
+    // Root package.json with workspaces
+    const rootPkg = {
+      name: 'monorepo',
+      version: '1.0.0',
+      workspaces: ['packages/*'],
+      devDependencies: {
+        eslint: '^8.0.0',
+      },
+    };
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify(rootPkg, null, 2) + '\n');
+
+    // Nested workspace: packages/ui
+    const uiDir = path.join(tmpDir, 'packages', 'ui');
+    fs.mkdirSync(uiDir, { recursive: true });
+    const uiPkg = {
+      name: '@monorepo/ui',
+      version: '1.0.0',
+      dependencies: {
+        'js-yaml': '^4.1.0',
+      },
+    };
+    fs.writeFileSync(path.join(uiDir, 'package.json'), JSON.stringify(uiPkg, null, 2) + '\n');
+
+    // 1. Verify workspace discovery
+    const workspaces = findWorkspacePackageJsons(tmpDir, rootPkg);
+    assert.equal(workspaces.length, 2);
+    assert.equal(workspaces[0].isRoot, true);
+    assert.equal(workspaces[1].name, '@monorepo/ui');
+
+    // 2. Verify direct dependencies across workspaces
+    const directDeps = getDirectDependencies(rootPkg, tmpDir);
+    assert.ok(directDeps.has('eslint'));
+    assert.ok(directDeps.has('js-yaml'));
+    assert.equal(directDeps.get('js-yaml').workspace, '@monorepo/ui');
+    assert.equal(directDeps.get('js-yaml').packageJsonPath, 'packages/ui/package.json');
+
+    // 3. Update dependency in nested workspace
+    const changes = [
+      { package: 'js-yaml', section: 'dependencies', to: '^4.3.2', packageJsonPath: 'packages/ui/package.json' },
+    ];
+    const { applied } = updatePackageJsonFile(tmpDir, changes);
+    assert.equal(applied.length, 1);
+    assert.equal(applied[0].packageJsonPath, 'packages/ui/package.json');
+
+    const updatedUiPkg = JSON.parse(fs.readFileSync(path.join(uiDir, 'package.json'), 'utf8'));
+    assert.equal(updatedUiPkg.dependencies['js-yaml'], '^4.3.2');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
