@@ -96,6 +96,45 @@ export function findWorkspacePackageJsons(worktreeDir, rootPkgJson = null) {
   return results;
 }
 
+export function buildWorkspaceLookup(pkgLock = null, worktreeOrWorkspaces = null) {
+  const pathToName = new Map();
+  const nameToPath = new Map();
+  const workspacePaths = new Set(['']);
+
+  // 1. Ingest preloaded workspaces list
+  if (Array.isArray(worktreeOrWorkspaces)) {
+    for (const ws of worktreeOrWorkspaces) {
+      if (!ws.isRoot) {
+        const folder = ws.relativePath.replace(/[/\\]package\.json$/, '');
+        pathToName.set(folder, ws.name);
+        nameToPath.set(ws.name, folder);
+        workspacePaths.add(folder);
+      }
+    }
+  }
+
+  // 2. Ingest package-lock.json packages entries
+  if (pkgLock?.packages) {
+    for (const [pPath, pInfo] of Object.entries(pkgLock.packages)) {
+      if (pPath !== '' && !pPath.includes('node_modules')) {
+        const wsName = pInfo.name || pPath;
+        pathToName.set(pPath, wsName);
+        nameToPath.set(wsName, pPath);
+        workspacePaths.add(pPath);
+      }
+    }
+  }
+
+  return {
+    pathToName,
+    nameToPath,
+    workspacePaths,
+    getWorkspaceName: (folderPath) => pathToName.get(folderPath) || folderPath,
+    getFolderPath: (wsName) => nameToPath.get(wsName) || wsName,
+    isWorkspaceFolder: (folderPath) => workspacePaths.has(folderPath),
+  };
+}
+
 export function getDirectDependencies(pkgJson, worktreeOrWorkspaces = null) {
   const direct = new Map();
   const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
@@ -151,7 +190,7 @@ export function parseNodePath(nodePathStr) {
   return segments.map((s) => s.replace(/[/\\]$/, ''));
 }
 
-export function extractChainsFromNpmLs(npmLsData, targetPkgName) {
+export function extractChainsFromNpmLs(npmLsData, targetPkgName, workspaceLookup = null) {
   if (!npmLsData) return [];
   const results = [];
 
@@ -187,15 +226,24 @@ export function extractChainsFromNpmLs(npmLsData, targetPkgName) {
   return results;
 }
 
-export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps) {
+export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps, worktreeOrWorkspaces = null) {
   if (!pkgLock?.packages) return [];
   const packages = pkgLock.packages;
+  const wsLookup = buildWorkspaceLookup(pkgLock, worktreeOrWorkspaces);
 
   const dependentsMap = new Map();
   const packageVersions = new Map();
 
   for (const [pkgPath, pkgInfo] of Object.entries(packages)) {
-    const parentName = pkgPath === '' ? '__ROOT__' : pkgPath.replace(/^.*node_modules\//, '');
+    let parentName = pkgPath;
+    if (pkgPath === '') {
+      parentName = '__ROOT__';
+    } else if (wsLookup.isWorkspaceFolder(pkgPath)) {
+      parentName = wsLookup.getWorkspaceName(pkgPath);
+    } else {
+      parentName = pkgPath.replace(/^.*node_modules\//, '');
+    }
+
     const ver = pkgInfo.version || 'unknown';
     packageVersions.set(pkgPath, ver);
 
@@ -213,6 +261,7 @@ export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps) {
         parentPath: pkgPath,
         parentName,
         requiredRange: range,
+        isWorkspaceRoot: wsLookup.isWorkspaceFolder(pkgPath),
       });
     }
   }
@@ -229,8 +278,21 @@ export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps) {
     const parents = dependentsMap.get(currentPkgName) || [];
 
     for (const parent of parents) {
-      if (parent.parentName === '__ROOT__') {
+      if (parent.parentPath === '') {
         chains.push(currentPath);
+      } else if (parent.isWorkspaceRoot) {
+        // Reached workspace root folder (e.g. 'client', 'cypress')
+        const wsName = wsLookup.getWorkspaceName(parent.parentPath);
+        const wsFolder = parent.parentPath;
+        const wsSpecifier = `${wsName} (${wsFolder}/package.json)`;
+        const wsLink = {
+          name: wsName,
+          version: 'workspace',
+          specifier: wsSpecifier,
+          isWorkspaceRoot: true,
+          folderPath: wsFolder,
+        };
+        chains.push([wsLink, ...currentPath]);
       } else {
         const parentVer = packageVersions.get(parent.parentPath) || 'unknown';
         const link = {
@@ -258,16 +320,18 @@ export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps) {
   return chains;
 }
 
-export function extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData = null) {
+export function extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData = null, worktreeOrWorkspaces = null) {
+  const wsLookup = buildWorkspaceLookup(pkgLock, worktreeOrWorkspaces);
+
   if (npmLsData) {
-    const lsChains = extractChainsFromNpmLs(npmLsData, vulnData.name);
+    const lsChains = extractChainsFromNpmLs(npmLsData, vulnData.name, wsLookup);
     if (lsChains.length > 0) {
       return lsChains;
     }
   }
 
   if (pkgLock?.packages) {
-    const lockChains = tracePathsFromPackageLock(pkgLock, vulnData.name, directDeps);
+    const lockChains = tracePathsFromPackageLock(pkgLock, vulnData.name, directDeps, worktreeOrWorkspaces);
     if (lockChains.length > 0) {
       return lockChains;
     }
@@ -378,7 +442,7 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
     }
   }
 
-  const chains = extractDependencyChains({ name: pkgName, nodes: installedPaths }, pkgLock, directDeps, npmLsData);
+  const chains = extractDependencyChains({ name: pkgName, nodes: installedPaths }, pkgLock, directDeps, npmLsData, worktreeOrWorkspaces);
   const directRoots = findDirectRoots(chains, directDeps);
 
   // If directly declared in a workspace or root, add every declaration as a direct path entry
