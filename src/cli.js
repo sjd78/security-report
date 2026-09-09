@@ -10,7 +10,7 @@ export function createCli() {
     .version('1.0.0');
 
   program
-    .command('scan <repo>')
+    .command('scan [repo]')
     .description('Scan target repository across branches, blend vulnerability sources, and produce intermediate reports')
     .option('-b, --branches <branches>', 'Comma-separated list of branches to scan (e.g., main,release/1.0)')
     .option('--all-branches', 'Scan all branches found in the repository')
@@ -33,7 +33,7 @@ export function createCli() {
     });
 
   program
-    .command('fix <repo>')
+    .command('fix [repo]')
     .alias('remediate')
     .description('Remediate vulnerabilities on target repository branches (package.json + lockfile + commit)')
     .option('-b, --branches <branches>', 'Comma-separated list of branches to remediate')
@@ -61,7 +61,7 @@ export function createCli() {
     });
 
   program
-    .command('report <repo>')
+    .command('report [repo]')
     .description('Alias for scan')
     .option('-b, --branches <branches>', 'Comma-separated list of branches')
     .option('--reports-dir <path>', 'Custom directory for generated reports', 'reports')

@@ -45,6 +45,13 @@ export function loadConfig(options = {}) {
       }
     }
   }
+  const repo =
+    options.repo ||
+    options.repository ||
+    process.env.SEC_REPO ||
+    fileConfig.repo ||
+    fileConfig.repository ||
+    null;
 
   const reposDir = path.resolve(
     cwd,
@@ -64,6 +71,7 @@ export function loadConfig(options = {}) {
   };
 
   return {
+    repo,
     reposDir,
     reportsDir,
     gitProtocol: options.gitProtocol || process.env.GIT_PROTOCOL || fileConfig.gitProtocol || 'https',

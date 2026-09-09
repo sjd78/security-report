@@ -73,6 +73,7 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
 
 | Variable | CLI Flag | Description | Default |
 | :--- | :--- | :--- | :--- |
+| `SEC_REPO` | `repo` / `[repo]` | Target repository specifier (`org/repo`, URL, or local path) | `null` |
 | `SEC_REPOS_DIR` | `--repos-dir <path>` | Directory where repositories are cloned and cached | `./REPOS` |
 | `SEC_REPORTS_DIR` | `--reports-dir <path>` | Directory where JSON and Markdown reports are saved | `./reports` |
 | `SEC_BRANCH_MAP` | `--branch-map <mapping>` | Translation table mapping upstream branches to downstream versions (e.g. `main=8.3,release-0.11=8.2,release-0.10=8.1`) | Built-in MTA map |
@@ -89,10 +90,11 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
 
 ```json
 {
+  "repo": "konveyor/tackle2-ui",
+  "branches": ["main", "release-0.12", "release-0.11", "release-0.10"],
   "reposDir": "REPOS",
   "reportsDir": "reports",
   "gitProtocol": "https",
-  "branches": ["main", "release-0.12", "release-0.11", "release-0.10"],
   "branchMap": {
     "main": ["8.3.x", "8.3", "mta-8.3", "MTA 8.3"],
     "release-0.12": ["8.3.x", "8.3", "mta-8.3", "MTA 8.3"],
@@ -112,12 +114,12 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
 
 ## 4. CLI Commands Reference
 
-### `sec-remediate scan <repo>` (or `sec-remediate report <repo>`)
+### `sec-remediate scan [repo]` (or `sec-remediate report [repo]`)
 
-Scans target repository across branches, blends vulnerability sources, and produces intermediate reports.
+Scans target repository across branches, blends vulnerability sources, and produces intermediate reports. If `[repo]` is omitted, the `repo` value from `.security-report.json` is used.
 
 ```bash
-sec-remediate scan <repo> [options]
+sec-remediate scan [repo] [options]
 ```
 
 **Options:**
@@ -133,12 +135,12 @@ sec-remediate scan <repo> [options]
 
 ---
 
-### `sec-remediate fix <repo>` (or `sec-remediate remediate <repo>`)
+### `sec-remediate fix [repo]` (or `sec-remediate remediate [repo]`)
 
-Applies remediations (`package.json` updates + lockfile updates), verifies resolution, and optionally creates Git commits.
+Applies remediations (`package.json` updates + lockfile updates), verifies resolution, and optionally creates Git commits. If `[repo]` is omitted, the `repo` value from `.security-report.json` is used.
 
 ```bash
-sec-remediate fix <repo> [options]
+sec-remediate fix [repo] [options]
 ```
 
 **Options:**

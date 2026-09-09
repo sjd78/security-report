@@ -18,11 +18,16 @@ import { generateCommitMessage } from './core/commit-generator.js';
 
 export async function scanRepository(repoSpec, cliOptions = {}) {
   const config = loadConfig(cliOptions);
-  console.log(`\n🔍 [Scan] Target repository: ${repoSpec}`);
+  const targetRepo = repoSpec || config.repo;
+  if (!targetRepo) {
+    throw new Error('No target repository specified. Please provide a repository (e.g. "org/repo") or define "repo" in .security-report.json');
+  }
+
+  console.log(`\n🔍 [Scan] Target repository: ${targetRepo}`);
   console.log(`📁 [Scan] REPOS directory: ${config.reposDir}`);
 
   // Step 1: Ensure repository in REPOS/
-  const repoInfo = await ensureRepo(repoSpec, config);
+  const repoInfo = await ensureRepo(targetRepo, config);
   console.log(`✅ [Scan] Local repo ready at: ${repoInfo.repoPath}`);
 
   // Determine branches to scan
@@ -96,8 +101,14 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
 }
 
 export async function remediateRepository(repoSpec, cliOptions = {}) {
+  const initialConfig = loadConfig(cliOptions);
+  const targetRepo = repoSpec || initialConfig.repo;
+  if (!targetRepo) {
+    throw new Error('No target repository specified. Please provide a repository (e.g. "org/repo") or define "repo" in .security-report.json');
+  }
+
   // Step 1: Scan and create intermediate report
-  const scanResult = await scanRepository(repoSpec, cliOptions);
+  const scanResult = await scanRepository(targetRepo, cliOptions);
   const { config, repository, report } = scanResult;
 
   const isDryRun = Boolean(cliOptions.dryRun);

@@ -11,6 +11,7 @@ import {
   withWorktree,
   stageAndCommit,
 } from '../src/core/git-manager.js';
+import { loadConfig } from '../src/config.js';
 
 test('parseRepoSpec: GitHub org/repo shorthand', () => {
   const parsed = parseRepoSpec('my-org/my-app');
@@ -31,6 +32,11 @@ test('parseRepoSpec: Local directory', () => {
   const parsed = parseRepoSpec(process.cwd());
   assert.equal(parsed.type, 'local');
   assert.equal(parsed.name, 'security-report');
+});
+
+test('loadConfig: extracts repo from options and config file', () => {
+  const conf = loadConfig({ repo: 'konveyor/tackle2-ui' });
+  assert.equal(conf.repo, 'konveyor/tackle2-ui');
 });
 
 test('Git Worktree and commit lifecycle', async () => {

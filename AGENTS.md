@@ -125,17 +125,19 @@ security-report/
 
 ## 5. Configuration & Environment Variables
 
-| Variable | CLI Flag | Description | Default |
+| Variable | CLI Flag / Field | Description | Default |
 | :--- | :--- | :--- | :--- |
+| `SEC_REPO` | `repo` / `[repo]` | Target repository specifier (`org/repo`, URL, or local path) | `null` |
 | `SEC_REPOS_DIR` | `--repos-dir` | Directory where repositories are cloned | `./REPOS` |
 | `SEC_REPORTS_DIR` | `--reports-dir` | Output directory for reports | `./reports` |
+| `SEC_BRANCH_MAP` | `--branch-map` | Upstream branch to downstream version translation table | Built-in MTA map |
 | `GITHUB_TOKEN` | `--github-token` | GitHub API Token for Dependabot and private clones | `""` |
 | `GITHUB_API_URL` | — | Base URL for GitHub API (Enterprise support) | `https://api.github.com` |
 | `JIRA_BASE_URL` | `--jira-base-url` | Atlassian Jira instance URL | `""` |
 | `JIRA_EMAIL` | `--jira-email` | Jira user email (for Basic Auth) | `""` |
 | `JIRA_API_TOKEN` | `--jira-api-token` | Jira API Token or PAT | `""` |
-| `JIRA_PROJECT` | `--jira-project` | Jira Project Key for CVE tickets | `SEC` |
-| `JIRA_JQL` | — | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
+| `JIRA_PROJECT` | `--jira-project` | Jira Project Key for CVE tickets | `MTA` |
+| `JIRA_JQL` | `--jira-jql` | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
 
 ---
 
@@ -143,16 +145,20 @@ security-report/
 
 ```bash
 # 1. Scan target branches and produce intermediate reports (Step 1)
-sec-remediate scan org/repo-name --branches main,release/1.0,release/2.0
+# Uses `repo` and `branches` from .security-report.json if omitted
+sec-remediate scan
+
+# Or specify repo and branches explicitly
+sec-remediate scan konveyor/tackle2-ui --branches main,release-0.12,release-0.11,release-0.10
 
 # 2. Dry-run remediation: preview changes and commit message without disk edits
-sec-remediate fix org/repo-name --branches main --dry-run
+sec-remediate fix --dry-run
 
 # 3. Apply remediation and create Git commits on each branch (Step 2 & Step 3)
-sec-remediate fix org/repo-name --branches main,release/1.0 --commit
+sec-remediate fix --commit
 
 # 4. Apply remediation, commit, and push to remote
-sec-remediate fix org/repo-name --branches main,release/1.0 --commit --push
+sec-remediate fix --commit --push
 ```
 
 ---
