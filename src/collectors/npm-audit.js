@@ -87,6 +87,17 @@ export function canBeResolvedInLockfile(safeVersion, chains = []) {
   return anyParentHasRange;
 }
 
+/**
+ * Lockfile remediation is expressed as a list of package names to re-resolve with
+ * `npm update <pkg> --package-lock-only`. `npm install <pkg>@<version>` is deliberately
+ * not used: it also writes the package to the root package.json, which would silently
+ * promote a transitive dependency to a direct one. Pinning a version that no parent
+ * range allows is the job of the `package-override` strategy.
+ */
+export function formatLockfileUpdate(packageName) {
+  return `npm update ${packageName} --package-lock-only`;
+}
+
 export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = [], directInfo = null, worktreeDir = null) {
   const isDirect = vuln.isDirect;
   const isIndirect = vuln.isIndirect;
@@ -119,9 +130,6 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       }
     }
 
-    const primaryPrefix = packageJsonChanges[0]?.to?.startsWith('~') ? '~' : '^';
-    const lockfileTarget = safeVersion ? `${primaryPrefix}${safeVersion}` : (fix?.version ? `${primaryPrefix}${fix.version}` : vuln.packageName);
-
     const isDual = isIndirect || dependencyType === 'Direct & Indirect';
 
     return {
@@ -130,9 +138,9 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       targetVersion: safeVersion || fix?.version || null,
       workspaceDeclarations: declarations,
       packageJsonChanges,
-      lockfileActions: safeVersion || fix?.version
-        ? [`npm install ${vuln.packageName}@${lockfileTarget} --package-lock-only`]
-        : [`npm update ${vuln.packageName} --package-lock-only`],
+      // A pure direct bump is fully carried by the package.json edit plus the base
+      // lockfile sync; transitive instances need an explicit re-resolution.
+      lockfileUpdates: isDual || packageJsonChanges.length === 0 ? [vuln.packageName] : [],
       note: isDual
         ? 'Package is both a direct dependency and required transitively. Resolution updates package.json semver and synchronizes lockfile for all instances.'
         : undefined,
@@ -167,7 +175,9 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       isSemVerMajor: Boolean(fix.isSemVerMajor),
       directRoot: parentDirectInfo?.name || fix.name,
       packageJsonChanges,
-      lockfileActions: [`npm install ${fix.name}@^${fix.version} --package-lock-only`],
+      lockfileUpdates: packageJsonChanges.length > 0
+        ? [vuln.packageName]
+        : [fix.name, vuln.packageName],
     };
   }
 
@@ -179,10 +189,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       targetVersion: safeVersion,
       directRoot: directRoots[0]?.name || null,
       packageJsonChanges: [],
-      lockfileActions: [
-        `npm install ${vuln.packageName}@${safeVersion} --package-lock-only`,
-        `npm update ${vuln.packageName} --package-lock-only`,
-      ],
+      lockfileUpdates: [vuln.packageName],
       note: 'Transitive safe version is permitted within parent declared semver ranges. Can be updated directly in lockfile.',
     };
   }
@@ -196,10 +203,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       targetVersion: null,
       directRoot: primaryRoot.name,
       packageJsonChanges: [],
-      lockfileActions: [
-        `npm update ${primaryRoot.name} --package-lock-only`,
-        `npm install ${vuln.packageName}@${safeVersion || 'latest'} --package-lock-only`,
-      ],
+      lockfileUpdates: [primaryRoot.name, vuln.packageName],
       note: `Introduced via direct root "${primaryRoot.name}". Check for newer release of ${primaryRoot.name} or lockfile update.`,
     };
   }
@@ -219,7 +223,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
           packageJsonPath: 'package.json',
         },
       ],
-      lockfileActions: ['npm install --package-lock-only'],
+      lockfileUpdates: [],
     };
   }
 
@@ -228,7 +232,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     targetPackage: vuln.packageName,
     targetVersion: null,
     packageJsonChanges: [],
-    lockfileActions: [`npm update ${vuln.packageName} --package-lock-only`],
+    lockfileUpdates: [vuln.packageName],
   };
 }
 

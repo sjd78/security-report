@@ -72,6 +72,10 @@ test('End-to-End: Multi-branch scan, report, and commit message flow', async () 
       reposDir,
       reportsDir,
       debug: true,
+      // Hermetic: never read the developer's .security-report.json, never hit the network.
+      noConfigFile: true,
+      collectors: 'npm-audit',
+      githubToken: '',
     });
 
     assert.ok(scanResult);
@@ -151,8 +155,8 @@ test('End-to-End: Multi-branch scan, report, and commit message flow', async () 
       assert.ok(commitResult.commitHash);
     });
 
-    // Verify commit on main branch
-    const { stdout: logOut } = await execGit(['log', '-n', '1', '--oneline'], localRepoPath);
+    // The branch ref itself must carry the commit, not just the worktree HEAD.
+    const { stdout: logOut } = await execGit(['log', '-n', '1', '--oneline', 'main'], localRepoPath);
     assert.ok(logOut.includes('fix(deps): remediate 1 vulnerable package on branch main'));
   } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });

@@ -79,10 +79,12 @@ export function loadConfig(options = {}) {
   const cwd = process.cwd();
   let fileConfig = {};
 
-  const configPaths = [
-    path.resolve(cwd, '.security-report.json'),
-    path.resolve(cwd, 'security-report.config.json'),
-  ];
+  const configPaths = options.noConfigFile
+    ? []
+    : [
+        path.resolve(cwd, '.security-report.json'),
+        path.resolve(cwd, 'security-report.config.json'),
+      ];
 
   for (const cp of configPaths) {
     if (fs.existsSync(cp)) {
@@ -176,6 +178,9 @@ export function loadConfig(options = {}) {
     branchMap: parseBranchMap(rawBranchMap),
     defaultBranches: options.branches || fileConfig.branches || ['main'],
     semverUpdateType: options.semverUpdateType || fileConfig.semverUpdateType || 'minor',
-    allowOverrides: options.allowOverrides ?? fileConfig.allowOverrides ?? true,
+    // `--no-overrides` reaches us as options.overrides === false (commander negation).
+    allowOverrides: options.overrides === false
+      ? false
+      : (options.allowOverrides ?? fileConfig.allowOverrides ?? true),
   };
 }

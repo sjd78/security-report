@@ -314,15 +314,6 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
             }
           }
         }
-
-        const primaryPrefix = pkg.remediation.packageJsonChanges?.[0]?.to?.startsWith('~') ? '~' : '^';
-        const targetRange = pkg.isDirect ? `${primaryPrefix}${optimalSafeVersion}` : optimalSafeVersion;
-
-        if (pkg.remediation.lockfileActions) {
-          pkg.remediation.lockfileActions = pkg.remediation.lockfileActions.map((act) =>
-            act.replace(new RegExp(`${pkg.packageName}@[^\\s]+`), `${pkg.packageName}@${targetRange}`)
-          );
-        }
       }
     }
   }

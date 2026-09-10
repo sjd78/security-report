@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 import { parseJiraIssues, createJiraAuthHeader, groupJiraTicketsByBranch } from '../src/collectors/jira.js';
 import { parseDependabotAlerts, groupDependabotAlertsByBranch } from '../src/collectors/dependabot.js';
 import { extractGhsaId, extractCveId } from '../src/collectors/advisories.js';
@@ -424,12 +427,13 @@ test('blendVulnerabilitySources: Jira findings assess actual lockfile versions a
   assert.equal(jsYaml.remediation.packageJsonChanges.length, 1);
   assert.equal(jsYaml.remediation.packageJsonChanges[0].package, 'js-yaml');
   assert.equal(jsYaml.remediation.packageJsonChanges[0].to, '^4.3.2');
-  assert.ok(jsYaml.remediation.lockfileActions[0].includes('npm install js-yaml@^4.3.2 --package-lock-only'));
+  assert.deepEqual(jsYaml.remediation.lockfileUpdates, ['js-yaml']);
 });
 
 test('loadConfig: disables Jira collector when Jira configuration is incomplete', () => {
   // Missing baseUrl
   const confNoBase = loadConfig({
+    noConfigFile: true,
     collectors: 'jira',
     jiraBaseUrl: '',
     jiraApiToken: 'my-token',
@@ -438,6 +442,7 @@ test('loadConfig: disables Jira collector when Jira configuration is incomplete'
 
   // Missing apiToken
   const confNoToken = loadConfig({
+    noConfigFile: true,
     collectors: 'jira',
     jiraBaseUrl: 'https://jira.example.com',
     jiraApiToken: '',
@@ -446,11 +451,37 @@ test('loadConfig: disables Jira collector when Jira configuration is incomplete'
 
   // Complete configuration
   const confComplete = loadConfig({
+    noConfigFile: true,
     collectors: 'jira',
     jiraBaseUrl: 'https://jira.example.com',
     jiraApiToken: 'my-token',
   });
   assert.equal(confComplete.collectors.jira, true);
+});
+
+test('loadConfig: --no-overrides disables overrides, and noConfigFile ignores on-disk config', () => {
+  assert.equal(loadConfig({ noConfigFile: true }).allowOverrides, true);
+  // commander maps `--no-overrides` to options.overrides === false
+  assert.equal(loadConfig({ noConfigFile: true, overrides: false }).allowOverrides, false);
+  assert.equal(loadConfig({ noConfigFile: true, allowOverrides: false }).allowOverrides, false);
+
+  // A config file in the working directory must not leak into the loaded config.
+  const cwd = process.cwd();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfg-hermetic-'));
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, '.security-report.json'),
+      JSON.stringify({ repo: 'from/file', githubToken: 'file-token', allowOverrides: false })
+    );
+    process.chdir(tmpDir);
+    assert.equal(loadConfig({ noConfigFile: true, silent: true }).repo, null);
+    assert.equal(loadConfig({ noConfigFile: true, silent: true }).githubToken, '');
+    assert.equal(loadConfig({ noConfigFile: true, silent: true }).allowOverrides, true);
+    assert.equal(loadConfig({ silent: true }).repo, 'from/file');
+  } finally {
+    process.chdir(cwd);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test('sortVulnerabilities: sorts by severity descending and package name ascending', () => {

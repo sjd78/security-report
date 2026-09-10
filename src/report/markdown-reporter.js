@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { sortVulnerabilities } from '../core/blender.js';
+import { formatLockfileUpdate } from '../collectors/npm-audit.js';
 
 export function formatTicketLinks(v) {
   const links = [];
@@ -255,10 +256,10 @@ export function generateMarkdownReport(report) {
         }
       }
 
-      if (rem.lockfileActions && rem.lockfileActions.length > 0) {
+      if (rem.lockfileUpdates && rem.lockfileUpdates.length > 0) {
         lines.push(`2. Synchronize lockfile:`);
-        for (const act of rem.lockfileActions) {
-          lines.push(`   \`\`\`bash\n   ${act}\n   \`\`\``);
+        for (const pkgName of rem.lockfileUpdates) {
+          lines.push(`   \`\`\`bash\n   ${formatLockfileUpdate(pkgName)}\n   \`\`\``);
         }
       }
       lines.push(``);

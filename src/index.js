@@ -183,6 +183,9 @@ export async function remediateRepository(repoSpec, cliOptions = {}) {
 
     console.log(`\n🚀 [Remediate] Processing branch \`${branch}\` (${vulnCount} vulnerabilities)...`);
 
+    // Without --commit the worktree is the only place the fix exists: keep it.
+    const keepWorktree = !isDryRun && !shouldCommit;
+
     await withWorktree(repository.repoPath, branch, async (worktreeDir) => {
       // Step 2: Apply package.json and lockfile remediations
       const remResult = await remediateBranch(worktreeDir, branchReport, {
@@ -191,6 +194,7 @@ export async function remediateRepository(repoSpec, cliOptions = {}) {
       });
 
       console.log(`   - Applied changes: ${remResult.appliedChanges.length}`);
+      console.log(`   - Lockfile updates: ${(remResult.lockfileUpdates || []).length}`);
       console.log(`   - Resolved vulnerabilities: ${remResult.resolved.length}`);
       console.log(`   - Remaining vulnerabilities: ${remResult.remaining.length}`);
 
@@ -203,28 +207,33 @@ export async function remediateRepository(repoSpec, cliOptions = {}) {
         return;
       }
 
-      if (shouldCommit && remResult.appliedChanges.length > 0) {
-        console.log(`📝 [Commit] Creating Git commit on branch \`${branch}\`...`);
-        const commitRes = await stageAndCommit(worktreeDir, {
-          message: commitMessage,
-          files: ['package.json', 'package-lock.json'],
-        });
-
-        if (commitRes.committed) {
-          console.log(`✅ [Commit] Created commit ${commitRes.commitHash.substring(0, 7)} on \`${branch}\``);
-
-          if (shouldPush) {
-            console.log(`⬆️ [Push] Pushing \`${branch}\` to remote...`);
-            await pushBranch(worktreeDir, branch);
-            console.log(`✅ [Push] Successfully pushed \`${branch}\``);
-          }
-        }
-
-        remediationSummary.push({ branch, remResult, commit: commitRes, commitMessage });
-      } else {
-        remediationSummary.push({ branch, remResult, committed: false, commitMessage });
+      if (!shouldCommit) {
+        console.log(`📂 [Remediate] Worktree retained for review (no --commit): ${worktreeDir}`);
+        remediationSummary.push({ branch, remResult, committed: false, commitMessage, worktreeDir });
+        return;
       }
-    });
+
+      console.log(`📝 [Commit] Creating Git commit on branch \`${branch}\`...`);
+      const commitRes = await stageAndCommit(worktreeDir, {
+        message: commitMessage,
+        files: ['package-lock.json', ...(remResult.touchedFiles?.length ? remResult.touchedFiles : ['package.json'])],
+        branch,
+      });
+
+      if (commitRes.committed) {
+        console.log(`✅ [Commit] Created commit ${commitRes.commitHash.substring(0, 7)} on \`${branch}\``);
+
+        if (shouldPush) {
+          console.log(`⬆️ [Push] Pushing \`${branch}\` to remote...`);
+          await pushBranch(worktreeDir, branch);
+          console.log(`✅ [Push] Successfully pushed \`${branch}\``);
+        }
+      } else {
+        console.log(`ℹ️ [Commit] Nothing to commit on \`${branch}\`: ${commitRes.reason}`);
+      }
+
+      remediationSummary.push({ branch, remResult, commit: commitRes, commitMessage });
+    }, { keepWorktree });
   }
 
   console.log(`\n🎉 [Remediate] Completed remediation across all branches!`);

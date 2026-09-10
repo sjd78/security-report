@@ -73,6 +73,65 @@ test('remediateBranch: dry-run mode', async () => {
   assert.equal(result.appliedChanges[0].package, 'lodash');
 });
 
+test('remediateBranch: highest requested version wins and lockfile updates are collected', async () => {
+  const branchReport = {
+    branch: 'main',
+    vulnerabilities: [
+      {
+        packageName: 'lodash',
+        remediation: {
+          strategy: 'bump-direct',
+          packageJsonChanges: [{ package: 'lodash', section: 'dependencies', packageJsonPath: 'package.json', to: '^4.17.15' }],
+          lockfileUpdates: [],
+        },
+      },
+      {
+        packageName: 'lodash',
+        remediation: {
+          strategy: 'bump-direct-and-lockfile',
+          packageJsonChanges: [{ package: 'lodash', section: 'dependencies', packageJsonPath: 'package.json', to: '^4.17.21' }],
+          lockfileUpdates: ['lodash'],
+        },
+      },
+      {
+        packageName: '@xmldom/xmldom',
+        remediation: {
+          strategy: 'lockfile-update',
+          packageJsonChanges: [],
+          lockfileUpdates: ['@xmldom/xmldom', 'lodash'],
+        },
+      },
+    ],
+  };
+
+  const result = await remediateBranch('/dummy/path', branchReport, { dryRun: true });
+  assert.equal(result.appliedChanges.length, 1);
+  assert.equal(result.appliedChanges[0].to, '^4.17.21');
+  assert.deepEqual(result.lockfileUpdates, ['lodash', '@xmldom/xmldom']);
+});
+
+test('updatePackageJsonFile: allowOverrides false suppresses overrides', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rem-no-overrides-'));
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      JSON.stringify({ name: 'sample-app', dependencies: { lodash: '^4.17.15' } }, null, 2) + '\n'
+    );
+
+    const { applied } = updatePackageJsonFile(
+      tmpDir,
+      [{ package: 'semver', section: 'overrides', to: '7.5.4' }],
+      { allowOverrides: false }
+    );
+
+    assert.equal(applied.length, 0);
+    const reRead = JSON.parse(fs.readFileSync(path.join(tmpDir, 'package.json'), 'utf8'));
+    assert.equal(reRead.overrides, undefined);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('npm workspaces: discovers nested packages and updates workspace package.json', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ws-rem-test-'));
   try {

@@ -130,7 +130,7 @@ test('extractDependencyChains: traces hoisted transitive dependency (e.g. msw ->
   const rem = buildRemediationSuggestion(vuln, roots, pkgJson, chains);
   assert.equal(rem.strategy, 'lockfile-update');
   assert.equal(rem.packageJsonChanges.length, 0);
-  assert.ok(rem.lockfileActions[0].includes('npm install @xmldom/xmldom@0.8.8 --package-lock-only'));
+  assert.deepEqual(rem.lockfileUpdates, ['@xmldom/xmldom']);
 });
 
 test('generateJsonReport and generateMarkdownReport', () => {
@@ -154,7 +154,7 @@ test('generateJsonReport and generateMarkdownReport', () => {
           remediation: {
             strategy: 'package-override',
             packageJsonChanges: [{ package: 'vuln-lib', section: 'overrides', to: '1.1.0' }],
-            lockfileActions: ['npm install --package-lock-only'],
+            lockfileUpdates: ['vuln-lib'],
           },
         },
       ],
@@ -168,6 +168,7 @@ test('generateJsonReport and generateMarkdownReport', () => {
   assert.ok(mdReport.includes('Remote Code Execution'));
   assert.ok(mdReport.includes('CVE-2023-9999'));
   assert.ok(mdReport.includes('package-override'));
+  assert.ok(mdReport.includes('npm update vuln-lib --package-lock-only'));
 });
 
 test('formatCompactDependencyPaths: formats direct and transitive paths compactly', () => {

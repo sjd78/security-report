@@ -93,7 +93,8 @@ security-report/
 - **Solution**:
   1. **Remote Fetch on Each Run**: `ensureRepo` executes `git fetch --all --prune --tags` to guarantee all remote branch pointers (`origin/*`) are up to date.
   2. **Remote HEAD Reset**: `createWorktree` creates worktrees with `git worktree add -B <branch> <worktreeDir> origin/<branch>`, automatically resetting and fast-forwarding the local branch to the latest remote HEAD on every report run.
-  3. **Base Detachment & Branch Commits**: Base repositories are detached so all branch names remain available for worktrees. Commits created within worktrees update branch references via `git update-ref refs/heads/<branch> <commitHash>`.
+  3. **Base Detachment & Branch Commits**: Base repositories — including repositories targeted by a local path — are detached (`git checkout --detach`, logged when it happens) so all branch names remain available for worktrees and no commit can land on a detached worktree HEAD. Worktree commits therefore advance `refs/heads/<branch>` directly; when they cannot (branch held by another worktree), `stageAndCommit` performs a compare-and-swap `git update-ref refs/heads/<branch> <new> <old>` or aborts with the holding worktree's path rather than stranding the commit.
+  4. **Worktree Retention**: `withWorktree` removes the worktree only after the callback succeeds. `sec-remediate fix` without `--commit` keeps it and prints its path, because it is the only copy of the applied fix; a failed callback keeps it too.
 
 ### B. Direct vs. Indirect Ancestor Chain Resolution & 4-Tier Remediation Strategy
 - **Problem**: `npm audit` reports hoisted paths (e.g. `node_modules/@xmldom/xmldom`), obscuring the logical parent (e.g. `msw -> @mswjs/interceptors -> @xmldom/xmldom`).
@@ -101,7 +102,7 @@ security-report/
 - **4-Tier Remediation Strategy**:
   1. **`bump-direct`**: Directly updates `package.json` if the package is declared in `dependencies`/`devDependencies`.
   2. **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an updated version available that pulls in the safe dependency, updates the direct parent in `package.json`.
-  3. **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), updates the lockfile directly via `npm install <pkg>@<safeVersion> --package-lock-only` without adding unnecessary `package.json` overrides.
+  3. **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), re-resolves the package inside the lockfile via `npm update <pkg> --package-lock-only` without adding unnecessary `package.json` overrides. `npm install <pkg>@<version>` is deliberately not used: it would also add the transitive package to the root `package.json`.
   4. **`package-override`**: Fallback applied if and only if parent ranges strictly forbid the safe version and no direct parent bump is available.
 
 ### C. Deterministic JS Clients & Automatic Configuration Validation
@@ -109,12 +110,14 @@ security-report/
 - **Jira Integration**: Supports Basic Auth (`email` + `apiToken`) and Personal Access Tokens (PAT Bearer auth) against Jira Cloud (v3) and Jira Server/Data Center (v2).
 - **Graceful Degradation**: If the Jira collector is enabled but its configuration is incomplete (missing `baseUrl` or `apiToken`), the tool automatically disables the Jira collector, logs an informative notice, and continues scanning with remaining enabled collectors without crashing.
 - **Dependabot Integration**: Uses GitHub REST API (`/repos/{owner}/{repo}/dependabot/alerts`) with bearer token authentication.
+- **Credential Handling**: `GITHUB_TOKEN` is never embedded in a clone URL. `parseRepoSpec` always produces a credential-free remote; `gitAuthEnv` passes `Authorization: Basic <base64(x-access-token:TOKEN)>` per invocation through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`, so the token reaches neither `argv` (visible via `ps`) nor `.git/config`. Every `execGit` failure message is passed through `redactCredentials` before it is thrown or logged.
+- **Configuration Isolation**: `loadConfig({ noConfigFile: true })` skips `.security-report.json` / `security-report.config.json` discovery entirely. Tests MUST set it — otherwise `node --test` picks up the developer's real credentials and issues authenticated Jira/GitHub requests.
 
 ### D. 3-Step Remediation Pipeline
 1. **Step 1 (Intermediate Report)**: Aggregates findings and generates a single structured JSON schema + Markdown file before touching any code.
 2. **Step 2 (Remediation)**:
    - Modifies `package.json` while maintaining exact original file indentation.
-   - Runs `npm install --package-lock-only` to update `package-lock.json` atomically.
+   - Runs `npm install --package-lock-only` to rebuild `package-lock.json` from the updated ranges, followed by one `npm update <pkg> --package-lock-only` per package listed in `remediation.lockfileUpdates`.
    - Re-runs `npm audit` in the worktree to verify remaining issues.
 3. **Step 3 (Commit Message Generation)**:
    - Formats a conventional commit message with CVE identifiers, Jira ticket URLs, Dependabot alert links, dependency chains, and verification status.
@@ -146,7 +149,7 @@ security-report/
 - **Solution**:
   1. `src/core/dependency-graph.js` (`lookupPackageInstalledInfo`) scans the branch worktree's `package.json` and `package-lock.json` to extract all installed versions (e.g. `3.15.1, 4.3.1`) and ancestor paths.
   2. Detects dual dependency status: `dependencyType: "Direct & Indirect"`.
-  3. Formulates a dual resolution plan (`bump-direct-and-lockfile`): updates the `package.json` semver constraint for the direct dependency AND issues lockfile commands (`npm install <pkg>@<safeVersion> --package-lock-only`) to synchronize all transitive instances.
+  3. Formulates a dual resolution plan (`bump-direct-and-lockfile`): updates the `package.json` semver constraint for the direct dependency AND lists the package in `remediation.lockfileUpdates`, so `npm update <pkg> --package-lock-only` synchronizes all transitive instances.
 
 
 ### I. npm Workspaces & Monorepo Direct Dependency Support

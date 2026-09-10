@@ -24,7 +24,7 @@ Managing security vulnerabilities across large Node.js repositories is often fra
    - **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an update available that patches the transitive dependency, bumps the direct parent in `package.json`.
    - **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), updates the lockfile directly without introducing unnecessary `package.json` overrides.
    - **`package-override`**: Fallback applied only when parent ranges strictly forbid the safe version and no direct parent update exists.
-   - Performs atomic lockfile synchronizations (`npm install --package-lock-only`) and post-remediation audit verification.
+   - Performs atomic lockfile synchronization (`npm install --package-lock-only`, then `npm update <pkg> --package-lock-only` for each package that must move within existing ranges) and post-remediation audit verification.
 3. **Step 3: Structured Commit Generation & Publishing**
    - Generates conventional commit messages linking CVE IDs, GHSA identifiers, advisory URLs, Jira tickets, Dependabot alert numbers, and the exact dependency path.
    - Stages and commits changes directly on the target branch worktrees with optional remote push.

@@ -5,16 +5,44 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
+const CREDENTIAL_IN_URL = /\/\/[^@/\s]*@/g;
+
+export function redactCredentials(value) {
+  return String(value ?? '').replace(CREDENTIAL_IN_URL, '//***@');
+}
+
+/**
+ * Per-invocation credentials for an https remote. The token is passed through
+ * GIT_CONFIG_* environment variables so it never reaches argv (visible in `ps`)
+ * nor `.git/config` (plaintext secret at rest).
+ */
+export function gitAuthEnv(url, token) {
+  if (!token || !url || !url.startsWith('https://')) return {};
+  let origin;
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    return {};
+  }
+  const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
+  return {
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: `http.${origin}/.extraHeader`,
+    GIT_CONFIG_VALUE_0: `Authorization: Basic ${basic}`,
+  };
+}
+
 export async function execGit(args, cwd, env = {}) {
   try {
     const { stdout, stderr } = await execFileAsync('git', args, {
       cwd,
-      env: { ...process.env, ...env },
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
       maxBuffer: 20 * 1024 * 1024,
     });
     return { stdout: stdout.trim(), stderr: stderr.trim() };
   } catch (err) {
-    const error = new Error(`git ${args.join(' ')} failed in ${cwd}: ${err.stderr || err.message}`);
+    const detail = redactCredentials(err.stderr || err.message);
+    const error = new Error(`git ${redactCredentials(args.join(' '))} failed in ${cwd}: ${detail}`);
     error.code = err.code;
     error.stdout = err.stdout;
     error.stderr = err.stderr;
@@ -24,7 +52,6 @@ export async function execGit(args, cwd, env = {}) {
 
 export function parseRepoSpec(spec, options = {}) {
   const protocol = options.gitProtocol || 'https';
-  const token = options.githubToken || '';
 
   // Case 1: Local directory path
   if (fs.existsSync(spec) && fs.statSync(spec).isDirectory()) {
@@ -72,14 +99,9 @@ export function parseRepoSpec(spec, options = {}) {
   const parts = spec.split('/');
   if (parts.length === 2 && parts[0] && parts[1]) {
     const [org, name] = parts;
-    let cloneUrl;
-    if (protocol === 'ssh') {
-      cloneUrl = `git@github.com:${org}/${name}.git`;
-    } else if (token) {
-      cloneUrl = `https://x-access-token:${token}@github.com/${org}/${name}.git`;
-    } else {
-      cloneUrl = `https://github.com/${org}/${name}.git`;
-    }
+    const cloneUrl = protocol === 'ssh'
+      ? `git@github.com:${org}/${name}.git`
+      : `https://github.com/${org}/${name}.git`;
 
     return {
       type: 'github',
@@ -94,15 +116,37 @@ export function parseRepoSpec(spec, options = {}) {
   throw new Error(`Invalid repository specification: "${spec}". Expected "org/repo", git URL, or local path.`);
 }
 
+/**
+ * Detaches HEAD so every branch name stays available for worktrees.
+ * Returns true when this call performed the detachment.
+ */
+export async function detachHead(repoPath) {
+  const { stdout } = await execGit(['symbolic-ref', '-q', 'HEAD'], repoPath).catch(() => ({ stdout: '' }));
+  if (!stdout.trim()) return false;
+  try {
+    await execGit(['checkout', '--detach'], repoPath);
+    return true;
+  } catch (err) {
+    console.warn(`[GitManager] Warning: could not detach HEAD in ${repoPath}: ${err.message}`);
+    return false;
+  }
+}
+
 export async function ensureRepo(spec, config = {}) {
   const parsed = parseRepoSpec(spec, config);
   const reposDir = config.reposDir || path.resolve(process.cwd(), 'REPOS');
+  const authEnv = gitAuthEnv(parsed.cloneUrl, config.githubToken);
 
   if (parsed.type === 'local') {
     try {
-      await execGit(['fetch', '--all', '--prune'], parsed.localPath);
+      await execGit(['fetch', '--all', '--prune', '--tags'], parsed.localPath);
     } catch {
       // ignore if offline or no remotes
+    }
+    // Detach so a branch checked out here cannot force worktrees onto a detached
+    // HEAD, which would strand remediation commits outside refs/heads/<branch>.
+    if (await detachHead(parsed.localPath)) {
+      console.log(`ℹ️ [GitManager] Detached HEAD in ${parsed.localPath} so all branches are available for worktrees.`);
     }
     return {
       ...parsed,
@@ -115,8 +159,8 @@ export async function ensureRepo(spec, config = {}) {
   if (fs.existsSync(path.join(targetDir, '.git'))) {
     // Repo already exists, fetch latest references
     try {
-      await execGit(['fetch', '--all', '--prune', '--tags'], targetDir);
-      await execGit(['checkout', '--detach'], targetDir).catch(() => {});
+      await execGit(['fetch', '--all', '--prune', '--tags'], targetDir, authEnv);
+      await detachHead(targetDir);
     } catch (err) {
       console.warn(`[GitManager] Warning: 'git fetch' failed in ${targetDir}: ${err.message}`);
     }
@@ -130,9 +174,9 @@ export async function ensureRepo(spec, config = {}) {
   fs.mkdirSync(path.dirname(targetDir), { recursive: true });
 
   // Clone repo
-  await execGit(['clone', parsed.cloneUrl, targetDir], path.dirname(targetDir));
+  await execGit(['clone', parsed.cloneUrl, targetDir], path.dirname(targetDir), authEnv);
   // Detach base repo HEAD so all branch names are free for worktrees
-  await execGit(['checkout', '--detach'], targetDir).catch(() => {});
+  await detachHead(targetDir);
 
   return {
     ...parsed,
@@ -236,22 +280,55 @@ export async function removeWorktree(repoPath, worktreeDir) {
 
 export async function withWorktree(repoPath, branch, fn, options = {}) {
   const worktreeDir = await createWorktree(repoPath, branch, options.worktreeDir);
+  let succeeded = false;
   try {
-    return await fn(worktreeDir);
+    const result = await fn(worktreeDir);
+    succeeded = true;
+    return result;
   } finally {
-    if (!options.keepWorktree) {
+    // Keep the worktree when the caller asked for it, and whenever the callback
+    // failed: removing it would destroy edits that were already written to disk.
+    if (succeeded && !options.keepWorktree) {
       await removeWorktree(repoPath, worktreeDir);
     }
   }
 }
 
+async function resolveRef(cwd, ref) {
+  const { stdout } = await execGit(['rev-parse', '--verify', '--quiet', ref], cwd).catch(() => ({ stdout: '' }));
+  return stdout.trim() || null;
+}
+
+function realPath(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/** Path of another worktree that currently has <branch> checked out, if any. */
+async function findWorktreeHolding(cwd, branch, selfDir) {
+  const { stdout } = await execGit(['worktree', 'list', '--porcelain'], cwd).catch(() => ({ stdout: '' }));
+  const self = realPath(selfDir);
+  let current = null;
+  for (const line of stdout.split('\n')) {
+    if (line.startsWith('worktree ')) current = line.slice('worktree '.length).trim();
+    else if (line.trim() === `branch refs/heads/${branch}` && current && realPath(current) !== self) return current;
+  }
+  return null;
+}
+
 export async function stageAndCommit(worktreeDir, { message, files = ['.'], allowEmpty = false, branch = null }) {
-  await execGit(['add', ...files], worktreeDir);
+  await execGit(['add', '--', ...files], worktreeDir);
 
   const { stdout: status } = await execGit(['status', '--porcelain'], worktreeDir);
   if (!status.trim() && !allowEmpty) {
     return { committed: false, commitHash: null, reason: 'No changes to commit' };
   }
+
+  const refName = branch ? `refs/heads/${branch}` : null;
+  const refBefore = refName ? await resolveRef(worktreeDir, refName) : null;
 
   const commitArgs = ['commit', '-m', message];
   if (allowEmpty) commitArgs.push('--allow-empty');
@@ -260,17 +337,26 @@ export async function stageAndCommit(worktreeDir, { message, files = ['.'], allo
   const { stdout: commitHash } = await execGit(['rev-parse', 'HEAD'], worktreeDir);
   const hash = commitHash.trim();
 
-  if (branch) {
-    try {
-      await execGit(['update-ref', `refs/heads/${branch}`, hash], worktreeDir);
-    } catch (err) {
-      console.warn(`[GitManager] Warning updating branch ref ${branch}: ${err.message}`);
+  if (refName) {
+    // An attached worktree already advanced the branch; a detached one did not.
+    const refAfter = await resolveRef(worktreeDir, refName);
+    if (refAfter !== hash) {
+      const holder = await findWorktreeHolding(worktreeDir, branch, worktreeDir);
+      if (holder) {
+        throw new Error(
+          `Commit ${hash} was created on a detached HEAD because branch "${branch}" is checked out at ${holder}. ` +
+          `Refusing to move refs/heads/${branch} underneath it — release that checkout and re-run.`
+        );
+      }
+      // Compare-and-swap: fails loudly if the branch moved since the commit started.
+      await execGit(['update-ref', refName, hash, refBefore ?? ''], worktreeDir);
     }
   }
 
   return {
     committed: true,
     commitHash: hash,
+    branch,
     message,
   };
 }

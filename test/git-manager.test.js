@@ -6,12 +6,13 @@ import os from 'node:os';
 import {
   parseRepoSpec,
   execGit,
+  gitAuthEnv,
+  ensureRepo,
   createWorktree,
   removeWorktree,
   withWorktree,
   stageAndCommit,
 } from '../src/core/git-manager.js';
-import { loadConfig } from '../src/config.js';
 
 test('parseRepoSpec: GitHub org/repo shorthand', () => {
   const parsed = parseRepoSpec('my-org/my-app');
@@ -34,9 +35,34 @@ test('parseRepoSpec: Local directory', () => {
   assert.equal(parsed.name, 'security-report');
 });
 
-test('loadConfig: extracts repo from options and config file', () => {
-  const conf = loadConfig({ repo: 'konveyor/tackle2-ui' });
-  assert.equal(conf.repo, 'konveyor/tackle2-ui');
+test('parseRepoSpec: never embeds the GitHub token in the clone URL', () => {
+  const parsed = parseRepoSpec('my-org/my-app', { githubToken: 's3cr3t-token' });
+  assert.equal(parsed.cloneUrl, 'https://github.com/my-org/my-app.git');
+  assert.ok(!parsed.cloneUrl.includes('s3cr3t-token'));
+
+  const env = gitAuthEnv(parsed.cloneUrl, 's3cr3t-token');
+  assert.equal(env.GIT_CONFIG_KEY_0, 'http.https://github.com/.extraHeader');
+  assert.equal(
+    env.GIT_CONFIG_VALUE_0,
+    `Authorization: Basic ${Buffer.from('x-access-token:s3cr3t-token').toString('base64')}`
+  );
+  assert.deepEqual(gitAuthEnv('git@github.com:my-org/my-app.git', 's3cr3t-token'), {});
+});
+
+test('execGit: redacts credentials from failure messages', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-redact-test-'));
+  try {
+    await assert.rejects(
+      () => execGit(['frobnicate', 'https://x-access-token:s3cr3t-token@github.com/o/r.git'], tmpDir),
+      (err) => {
+        assert.ok(!err.message.includes('s3cr3t-token'), `token leaked: ${err.message}`);
+        assert.ok(err.message.includes('//***@github.com'));
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test('Git Worktree and commit lifecycle', async () => {
@@ -127,5 +153,94 @@ test('createWorktree: resets local branch to latest fetched remote origin/branch
     });
   } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+async function initRepo(dir, branch = 'main') {
+  await execGit(['init', '-b', branch], dir);
+  await execGit(['config', 'user.name', 'Test Runner'], dir);
+  await execGit(['config', 'user.email', 'test@example.com'], dir);
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'app', version: '1.0.0' }, null, 2));
+  await execGit(['add', '.'], dir);
+  await execGit(['commit', '-m', 'Initial commit'], dir);
+}
+
+test('ensureRepo: detaches a local repo so branch commits land on refs/heads/<branch>', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-local-detach-'));
+  try {
+    await initRepo(tmpDir);
+
+    const info = await ensureRepo(tmpDir, { reposDir: tmpDir });
+    assert.equal(info.repoPath, path.resolve(tmpDir));
+    // HEAD detached => "main" is free for a worktree instead of forcing the detached fallback.
+    await assert.rejects(() => execGit(['symbolic-ref', '-q', 'HEAD'], tmpDir));
+
+    const { stdout: before } = await execGit(['rev-parse', 'refs/heads/main'], tmpDir);
+
+    await withWorktree(info.repoPath, 'main', async (wtPath) => {
+      fs.writeFileSync(path.join(wtPath, 'package.json'), JSON.stringify({ name: 'app', version: '1.1.0' }, null, 2));
+      const res = await stageAndCommit(wtPath, {
+        message: 'fix(deps): remediate 1 vulnerable package on branch main',
+        files: ['package.json'],
+        branch: 'main',
+      });
+      assert.equal(res.committed, true);
+    });
+
+    const { stdout: after } = await execGit(['rev-parse', 'refs/heads/main'], tmpDir);
+    assert.notEqual(after, before);
+    const { stdout: log } = await execGit(['log', '-n', '1', '--oneline', 'main'], tmpDir);
+    assert.ok(log.includes('fix(deps): remediate 1 vulnerable package on branch main'));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('stageAndCommit: refuses to move a branch checked out in another worktree', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-branch-guard-'));
+  let worktreeDir;
+  try {
+    await initRepo(tmpDir);
+    const { stdout: before } = await execGit(['rev-parse', 'refs/heads/main'], tmpDir);
+
+    // "main" is checked out in the base repo, so the worktree is detached.
+    worktreeDir = await createWorktree(tmpDir, 'main');
+    fs.writeFileSync(path.join(worktreeDir, 'package.json'), JSON.stringify({ name: 'app', version: '2.0.0' }, null, 2));
+
+    await assert.rejects(
+      () => stageAndCommit(worktreeDir, { message: 'fix(deps): bump', files: ['package.json'], branch: 'main' }),
+      /checked out at/
+    );
+
+    const { stdout: after } = await execGit(['rev-parse', 'refs/heads/main'], tmpDir);
+    assert.equal(after, before);
+  } finally {
+    if (worktreeDir) await removeWorktree(tmpDir, worktreeDir);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('withWorktree: retains the worktree when requested and when the callback throws', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-keep-worktree-'));
+  const worktreeDir = path.resolve(tmpDir, '.worktrees', 'feature_update');
+  try {
+    await initRepo(tmpDir);
+    await execGit(['branch', 'feature/update'], tmpDir);
+
+    await withWorktree(tmpDir, 'feature/update', async (wtPath) => {
+      fs.writeFileSync(path.join(wtPath, 'applied.txt'), 'remediated');
+    }, { keepWorktree: true });
+    assert.ok(fs.existsSync(path.join(worktreeDir, 'applied.txt')));
+
+    await assert.rejects(() =>
+      withWorktree(tmpDir, 'feature/update', async (wtPath) => {
+        fs.writeFileSync(path.join(wtPath, 'partial.txt'), 'half-applied');
+        throw new Error('remediation blew up');
+      })
+    );
+    assert.ok(fs.existsSync(path.join(worktreeDir, 'partial.txt')));
+  } finally {
+    await removeWorktree(tmpDir, worktreeDir);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

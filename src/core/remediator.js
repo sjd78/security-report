@@ -153,8 +153,8 @@ export function updatePackageJsonFile(worktreeDir, changes = [], options = {}) {
   };
 }
 
-export async function syncLockfile(worktreeDir, options = {}) {
-  const npmArgs = ['install', '--package-lock-only'];
+async function runNpm(worktreeDir, args, options = {}) {
+  const npmArgs = [...args, '--package-lock-only'];
 
   if (options.legacyPeerDeps) {
     npmArgs.push('--legacy-peer-deps');
@@ -168,10 +168,20 @@ export async function syncLockfile(worktreeDir, options = {}) {
     return { success: true, stdout, stderr };
   } catch (err) {
     if (!options.legacyPeerDeps && (err.stderr?.includes('ERESOLVE') || err.stdout?.includes('ERESOLVE'))) {
-      return await syncLockfile(worktreeDir, { ...options, legacyPeerDeps: true });
+      return await runNpm(worktreeDir, args, { ...options, legacyPeerDeps: true });
     }
-    throw new Error(`Failed to update lockfile in ${worktreeDir}: ${err.stderr || err.message}`);
+    throw new Error(`Failed to run "npm ${npmArgs.join(' ')}" in ${worktreeDir}: ${err.stderr || err.message}`);
   }
+}
+
+/** Rebuilds package-lock.json from the current package.json ranges and overrides. */
+export async function syncLockfile(worktreeDir, options = {}) {
+  return await runNpm(worktreeDir, ['install'], options);
+}
+
+/** Re-resolves one package inside the lockfile; see formatLockfileUpdate. */
+export async function updateLockfilePackage(worktreeDir, packageName, options = {}) {
+  return await runNpm(worktreeDir, ['update', packageName], options);
 }
 
 export async function remediateBranch(worktreeDir, branchReport, options = {}) {
@@ -189,34 +199,41 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
     };
   }
 
-  const pendingChanges = [];
   const changesMap = new Map();
+  const lockfileUpdates = [];
 
   for (const vuln of vulnerabilities) {
     const rem = vuln.remediation;
-    if (!rem || !rem.packageJsonChanges) continue;
+    if (!rem) continue;
 
-    for (const chg of rem.packageJsonChanges) {
+    for (const chg of rem.packageJsonChanges || []) {
       const key = `${chg.packageJsonPath || 'root'}:${chg.section || 'dependencies'}:${chg.package}`;
-      if (!changesMap.has(key)) {
+      const existing = changesMap.get(key);
+      if (!existing) {
         changesMap.set(key, chg);
-        pendingChanges.push(chg);
-      } else {
-        const existing = changesMap.get(key);
-        const cleanExisting = semver.clean(existing.to.replace(/^[~^]/, ''));
-        const cleanNew = semver.clean(chg.to.replace(/^[~^]/, ''));
-        if (cleanExisting && cleanNew && semver.gt(cleanNew, cleanExisting)) {
-          changesMap.set(key, chg);
-        }
+        continue;
+      }
+      const cleanExisting = semver.clean(String(existing.to).replace(/^[~^]/, ''));
+      const cleanNew = semver.clean(String(chg.to).replace(/^[~^]/, ''));
+      if (cleanExisting && cleanNew && semver.gt(cleanNew, cleanExisting)) {
+        changesMap.set(key, chg);
       }
     }
+
+    for (const pkgName of rem.lockfileUpdates || []) {
+      if (pkgName && !lockfileUpdates.includes(pkgName)) lockfileUpdates.push(pkgName);
+    }
   }
+
+  // Deduplicated per target; the highest requested version wins.
+  const pendingChanges = Array.from(changesMap.values());
 
   if (options.dryRun) {
     return {
       branch: branchName,
       dryRun: true,
       appliedChanges: pendingChanges,
+      lockfileUpdates,
       resolved: vulnerabilities,
       remaining: [],
       isClean: true,
@@ -226,8 +243,19 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
   // Step 2a: Update package.json files (root and workspaces)
   const { applied, touchedFiles } = updatePackageJsonFile(worktreeDir, pendingChanges, options);
 
-  // Step 2b: Update package-lock.json
+  // Step 2b: Rebuild the lockfile from the updated ranges, then re-resolve every
+  // package whose fix lives inside ranges the parents already permit.
   await syncLockfile(worktreeDir, options);
+
+  const appliedLockfileUpdates = [];
+  for (const pkgName of lockfileUpdates) {
+    try {
+      await updateLockfilePackage(worktreeDir, pkgName, options);
+      appliedLockfileUpdates.push(pkgName);
+    } catch (err) {
+      console.warn(`[Remediator] Warning: lockfile update for ${pkgName} failed: ${err.message}`);
+    }
+  }
 
   // Step 2c: Verify via re-audit
   let postAudit;
@@ -251,6 +279,7 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
     branch: branchName,
     dryRun: false,
     appliedChanges: applied,
+    lockfileUpdates: appliedLockfileUpdates,
     touchedFiles,
     resolved,
     remaining,
