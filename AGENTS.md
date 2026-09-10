@@ -88,10 +88,12 @@ security-report/
 
 ## 4. Key Design Decisions
 
-### A. Repository Isolation & Multi-Branch Worktrees
-- **Problem**: Switching branches in a single working copy invalidates `node_modules`, risks uncommitted changes, and prevents parallel branch analysis.
-- **Solution**: The engine clones targets into `REPOS/<org>/<name>` and creates isolated `git worktree` instances for each branch under `<repo>/.worktrees/<sanitized_branch>`.
-- **Branch Pointer Handling**: Base repositories are detached upon cloning so all branch names remain available for worktrees. Commits created within worktrees update branch references via `git update-ref refs/heads/<branch> <commitHash>`.
+### A. Repository Isolation, Remote Synchronization & Multi-Branch Worktrees
+- **Problem**: Switching branches in a single working copy invalidates `node_modules`, risks uncommitted changes, and prevents parallel branch analysis. Furthermore, stale local caches might not reflect new commits pushed to the remote repository.
+- **Solution**:
+  1. **Remote Fetch on Each Run**: `ensureRepo` executes `git fetch --all --prune --tags` to guarantee all remote branch pointers (`origin/*`) are up to date.
+  2. **Remote HEAD Reset**: `createWorktree` creates worktrees with `git worktree add -B <branch> <worktreeDir> origin/<branch>`, automatically resetting and fast-forwarding the local branch to the latest remote HEAD on every report run.
+  3. **Base Detachment & Branch Commits**: Base repositories are detached so all branch names remain available for worktrees. Commits created within worktrees update branch references via `git update-ref refs/heads/<branch> <commitHash>`.
 
 ### B. Direct vs. Indirect Ancestor Chain Resolution & 4-Tier Remediation Strategy
 - **Problem**: `npm audit` reports hoisted paths (e.g. `node_modules/@xmldom/xmldom`), obscuring the logical parent (e.g. `msw -> @mswjs/interceptors -> @xmldom/xmldom`).

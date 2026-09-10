@@ -99,6 +99,11 @@ export async function ensureRepo(spec, config = {}) {
   const reposDir = config.reposDir || path.resolve(process.cwd(), 'REPOS');
 
   if (parsed.type === 'local') {
+    try {
+      await execGit(['fetch', '--all', '--prune'], parsed.localPath);
+    } catch {
+      // ignore if offline or no remotes
+    }
     return {
       ...parsed,
       repoPath: parsed.localPath,
@@ -176,25 +181,33 @@ export async function createWorktree(repoPath, branch, customPath = null) {
 
   fs.mkdirSync(path.dirname(worktreeDir), { recursive: true });
 
-  // Check if branch exists locally or remotely
+  // Check if origin/<branch> exists remotely
+  let hasRemoteBranch = false;
+  try {
+    const { stdout } = await execGit(['rev-parse', '--verify', `origin/${branch}`], repoPath);
+    hasRemoteBranch = Boolean(stdout.trim());
+  } catch {
+    hasRemoteBranch = false;
+  }
+
+  // Check if branch exists locally
   const { stdout: localBranches } = await execGit(['branch', '--list', branch], repoPath);
   const branchExists = Boolean(localBranches.trim());
 
   try {
-    if (branchExists) {
+    if (hasRemoteBranch) {
+      // Force local branch ref to match the latest fetched remote HEAD (origin/<branch>)
+      await execGit(['worktree', 'add', '-B', branch, worktreeDir, `origin/${branch}`], repoPath);
+    } else if (branchExists) {
       await execGit(['worktree', 'add', worktreeDir, branch], repoPath);
     } else {
-      // Try checkout from origin/<branch> or create branch
-      try {
-        await execGit(['worktree', 'add', '-B', branch, worktreeDir, `origin/${branch}`], repoPath);
-      } catch {
-        await execGit(['worktree', 'add', '-b', branch, worktreeDir], repoPath);
-      }
+      await execGit(['worktree', 'add', '-b', branch, worktreeDir], repoPath);
     }
   } catch (err) {
     // If failed because branch is currently checked out at repo root, use --detach
     if (err.stderr?.includes('already used by worktree') || err.message?.includes('already used by worktree')) {
-      await execGit(['worktree', 'add', '--detach', worktreeDir, branch], repoPath);
+      const startPoint = hasRemoteBranch ? `origin/${branch}` : branch;
+      await execGit(['worktree', 'add', '--detach', worktreeDir, startPoint], repoPath);
     } else {
       throw err;
     }
@@ -247,7 +260,6 @@ export async function stageAndCommit(worktreeDir, { message, files = ['.'], allo
   const { stdout: commitHash } = await execGit(['rev-parse', 'HEAD'], worktreeDir);
   const hash = commitHash.trim();
 
-  // If target branch is specified, ensure its ref is updated
   if (branch) {
     try {
       await execGit(['update-ref', `refs/heads/${branch}`, hash], worktreeDir);

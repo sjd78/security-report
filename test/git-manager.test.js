@@ -87,3 +87,45 @@ test('Git Worktree and commit lifecycle', async () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('createWorktree: resets local branch to latest fetched remote origin/branch HEAD', async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'git-sync-test-'));
+  const remoteDir = path.join(tmpBase, 'remote');
+  const cloneDir = path.join(tmpBase, 'clone');
+
+  try {
+    // 1. Initialize mock remote repo
+    fs.mkdirSync(remoteDir, { recursive: true });
+    await execGit(['init', '-b', 'main'], remoteDir);
+    await execGit(['config', 'user.name', 'Remote Bot'], remoteDir);
+    await execGit(['config', 'user.email', 'bot@example.com'], remoteDir);
+
+    fs.writeFileSync(path.join(remoteDir, 'file.txt'), 'v1');
+    await execGit(['add', '.'], remoteDir);
+    await execGit(['commit', '-m', 'commit 1'], remoteDir);
+
+    // 2. Clone to local cloneDir
+    await execGit(['clone', remoteDir, cloneDir], tmpBase);
+    await execGit(['checkout', '--detach'], cloneDir);
+
+    // 3. Push new commit on remote
+    fs.writeFileSync(path.join(remoteDir, 'file.txt'), 'v2');
+    await execGit(['add', '.'], remoteDir);
+    await execGit(['commit', '-m', 'commit 2'], remoteDir);
+    const { stdout: remoteHead } = await execGit(['rev-parse', 'HEAD'], remoteDir);
+
+    // 4. Fetch in cloneDir
+    await execGit(['fetch', '--all', '--prune'], cloneDir);
+
+    // 5. Create worktree on main
+    await withWorktree(cloneDir, 'main', async (wtPath) => {
+      const content = fs.readFileSync(path.join(wtPath, 'file.txt'), 'utf8');
+      assert.equal(content, 'v2');
+
+      const { stdout: wtHead } = await execGit(['rev-parse', 'HEAD'], wtPath);
+      assert.equal(wtHead.trim(), remoteHead.trim());
+    });
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
