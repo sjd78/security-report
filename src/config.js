@@ -122,6 +122,46 @@ export function loadConfig(options = {}) {
 
   const collectors = parseCollectorSettings(options, fileConfig);
 
+  const rawBaseUrl = options.jiraBaseUrl !== undefined
+    ? options.jiraBaseUrl
+    : (fileConfig.jira?.baseUrl !== undefined ? fileConfig.jira.baseUrl : (process.env.JIRA_BASE_URL || ''));
+
+  const rawApiToken = options.jiraApiToken !== undefined
+    ? options.jiraApiToken
+    : (fileConfig.jira?.apiToken !== undefined ? fileConfig.jira.apiToken : (process.env.JIRA_API_TOKEN || ''));
+
+  const rawEmail = options.jiraEmail !== undefined
+    ? options.jiraEmail
+    : (fileConfig.jira?.email !== undefined ? fileConfig.jira.email : (process.env.JIRA_EMAIL || ''));
+
+  const jira = {
+    baseUrl: String(rawBaseUrl || '').trim(),
+    email: String(rawEmail || '').trim(),
+    apiToken: String(rawApiToken || '').trim(),
+    project: options.jiraProject || process.env.JIRA_PROJECT || fileConfig.jira?.project || 'MTA',
+    jql: options.jiraJql || process.env.JIRA_JQL || fileConfig.jira?.jql || '',
+  };
+
+  // If Jira collector is enabled but configuration is incomplete, disable it and log notice
+  if (collectors.jira) {
+    const missingFields = [];
+    if (!jira.baseUrl) missingFields.push('baseUrl (or JIRA_BASE_URL)');
+    if (!jira.apiToken) missingFields.push('apiToken (or JIRA_API_TOKEN)');
+
+    if (missingFields.length > 0) {
+      collectors.jira = false;
+      if (!options.silent) {
+        console.warn(`⚠️ [Config] Notice: Jira collector is enabled but Jira configuration is incomplete (missing ${missingFields.join(', ')}). Disabling Jira collector.`);
+      }
+    }
+  }
+
+  const rawGhToken = options.githubToken !== undefined
+    ? options.githubToken
+    : (fileConfig.githubToken !== undefined ? fileConfig.githubToken : (process.env.GITHUB_TOKEN || ''));
+
+  const githubToken = String(rawGhToken || '').trim();
+
   return {
     ...options,
     debug: Boolean(options.debug ?? (process.env.SEC_DEBUG === 'true' || fileConfig.debug || false)),
@@ -130,15 +170,9 @@ export function loadConfig(options = {}) {
     reportsDir,
     collectors,
     gitProtocol: options.gitProtocol || process.env.GIT_PROTOCOL || fileConfig.gitProtocol || 'https',
-    githubToken: options.githubToken || process.env.GITHUB_TOKEN || fileConfig.githubToken || '',
+    githubToken,
     githubApiUrl: options.githubApiUrl || process.env.GITHUB_API_URL || fileConfig.githubApiUrl || 'https://api.github.com',
-    jira: {
-      baseUrl: options.jiraBaseUrl || process.env.JIRA_BASE_URL || fileConfig.jira?.baseUrl || '',
-      email: options.jiraEmail || process.env.JIRA_EMAIL || fileConfig.jira?.email || '',
-      apiToken: options.jiraApiToken || process.env.JIRA_API_TOKEN || fileConfig.jira?.apiToken || '',
-      project: options.jiraProject || process.env.JIRA_PROJECT || fileConfig.jira?.project || 'MTA',
-      jql: options.jiraJql || process.env.JIRA_JQL || fileConfig.jira?.jql || '',
-    },
+    jira,
     branchMap: parseBranchMap(rawBranchMap),
     defaultBranches: options.branches || fileConfig.branches || ['main'],
     semverUpdateType: options.semverUpdateType || fileConfig.semverUpdateType || 'minor',

@@ -90,6 +90,8 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
 | `SEC_COLLECTORS` | `--collectors <list>` | Active collectors to run (`npm-audit`, `jira`, `dependabot`) | `npm-audit,jira,dependabot` |
 | `SEC_DEBUG` | `--debug` | Save raw collector outputs to `security-<name>-collection.json` | `false` |
 
+> **Note on Configuration Validation:** If the Jira collector is enabled but its configuration is incomplete (missing `JIRA_BASE_URL` or `JIRA_API_TOKEN`), the tool automatically disables the Jira collector, logs a warning notice, and continues scanning with the remaining active collectors without failing.
+
 ### Example Configuration File (`.security-report.json`)
 
 ```json

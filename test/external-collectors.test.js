@@ -4,7 +4,7 @@ import { parseJiraIssues, createJiraAuthHeader, groupJiraTicketsByBranch } from 
 import { parseDependabotAlerts, groupDependabotAlertsByBranch } from '../src/collectors/dependabot.js';
 import { extractGhsaId, extractCveId } from '../src/collectors/advisories.js';
 import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible, consolidateVulnerabilitiesByPackage, calculateOptimalSafeVersion } from '../src/core/blender.js';
-import { parseBranchMap, parseCollectorSettings } from '../src/config.js';
+import { parseBranchMap, parseCollectorSettings, loadConfig } from '../src/config.js';
 import { lookupPackageInstalledInfo } from '../src/core/dependency-graph.js';
 
 test('createJiraAuthHeader: Basic Auth and Bearer token', () => {
@@ -425,4 +425,30 @@ test('blendVulnerabilitySources: Jira findings assess actual lockfile versions a
   assert.equal(jsYaml.remediation.packageJsonChanges[0].package, 'js-yaml');
   assert.equal(jsYaml.remediation.packageJsonChanges[0].to, '^4.3.2');
   assert.ok(jsYaml.remediation.lockfileActions[0].includes('npm install js-yaml@^4.3.2 --package-lock-only'));
+});
+
+test('loadConfig: disables Jira collector when Jira configuration is incomplete', () => {
+  // Missing baseUrl
+  const confNoBase = loadConfig({
+    collectors: 'jira',
+    jiraBaseUrl: '',
+    jiraApiToken: 'my-token',
+  });
+  assert.equal(confNoBase.collectors.jira, false);
+
+  // Missing apiToken
+  const confNoToken = loadConfig({
+    collectors: 'jira',
+    jiraBaseUrl: 'https://jira.example.com',
+    jiraApiToken: '',
+  });
+  assert.equal(confNoToken.collectors.jira, false);
+
+  // Complete configuration
+  const confComplete = loadConfig({
+    collectors: 'jira',
+    jiraBaseUrl: 'https://jira.example.com',
+    jiraApiToken: 'my-token',
+  });
+  assert.equal(confComplete.collectors.jira, true);
 });

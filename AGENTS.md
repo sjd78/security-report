@@ -104,9 +104,10 @@ security-report/
   3. **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), updates the lockfile directly via `npm install <pkg>@<safeVersion> --package-lock-only` without adding unnecessary `package.json` overrides.
   4. **`package-override`**: Fallback applied if and only if parent ranges strictly forbid the safe version and no direct parent bump is available.
 
-### C. Deterministic JS Clients over Heavy Tooling
+### C. Deterministic JS Clients & Automatic Configuration Validation
 - **Decision**: Uses native Node.js `fetch` and ESM modules for Jira and Dependabot REST communication rather than external runtime dependencies or MCP bridges.
 - **Jira Integration**: Supports Basic Auth (`email` + `apiToken`) and Personal Access Tokens (PAT Bearer auth) against Jira Cloud (v3) and Jira Server/Data Center (v2).
+- **Graceful Degradation**: If the Jira collector is enabled but its configuration is incomplete (missing `baseUrl` or `apiToken`), the tool automatically disables the Jira collector, logs an informative notice, and continues scanning with remaining enabled collectors without crashing.
 - **Dependabot Integration**: Uses GitHub REST API (`/repos/{owner}/{repo}/dependabot/alerts`) with bearer token authentication.
 
 ### D. 3-Step Remediation Pipeline
