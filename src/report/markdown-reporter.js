@@ -35,6 +35,84 @@ export function formatTicketLinks(v) {
   return links.join(', ') || '_None_';
 }
 
+export function formatCompactDependencyPaths(v) {
+  const compactPaths = new Set();
+
+  // 1. Add direct declarations
+  if (v.workspaceDeclarations && v.workspaceDeclarations.length > 0) {
+    for (const decl of v.workspaceDeclarations) {
+      const pkgFile = decl.packageJsonPath || 'package.json';
+      const sec = decl.section || 'dependencies';
+      const range = decl.range ? `@${decl.range}` : '';
+      compactPaths.add(`${pkgFile}/${sec}/${v.packageName}${range}`);
+    }
+  } else if (v.isDirect) {
+    compactPaths.add(`package.json/dependencies/${v.packageName}`);
+  }
+
+  // 2. Parse transitive paths into <project package.json>/<section>/<direct package>/.../<transitive package>
+  const directRootsMap = new Map();
+  for (const root of v.directRoots || []) {
+    directRootsMap.set(root.name, root);
+  }
+
+  for (const pathStr of v.dependencyPaths || []) {
+    // Skip single-node direct declarations handled above
+    if (pathStr.includes(' (dependencies) -> ') || pathStr.includes(' (devDependencies) -> ')) {
+      continue;
+    }
+
+    const segments = pathStr.split(/\s*->\s*/).filter(Boolean);
+    if (segments.length === 0) continue;
+
+    if (segments.length === 1 && segments[0].startsWith(v.packageName)) {
+      if (compactPaths.size === 0) {
+        compactPaths.add(`package.json/dependencies/${segments[0]}`);
+      }
+      continue;
+    }
+
+    let pkgFile = 'package.json';
+    let directRootPkg = null;
+    const targetSegment = segments[segments.length - 1];
+
+    const firstSeg = segments[0];
+    const wsMatch = firstSeg.match(/\(([^/)]+\/package\.json)\)/);
+
+    if (wsMatch) {
+      pkgFile = wsMatch[1];
+      if (segments.length > 1) {
+        directRootPkg = segments[1].split('@')[0];
+      }
+    } else {
+      directRootPkg = firstSeg.split('@')[0];
+    }
+
+    let section = 'dependencies';
+    if (directRootPkg && directRootsMap.has(directRootPkg)) {
+      const rootMeta = directRootsMap.get(directRootPkg);
+      if (rootMeta.section) section = rootMeta.section;
+      if (rootMeta.packageJsonPath && !wsMatch) pkgFile = rootMeta.packageJsonPath;
+    }
+
+    if (directRootPkg) {
+      if (directRootPkg === v.packageName) {
+        compactPaths.add(`${pkgFile}/${section}/${targetSegment}`);
+      } else {
+        compactPaths.add(`${pkgFile}/${section}/${directRootPkg}/.../${targetSegment}`);
+      }
+    } else {
+      compactPaths.add(`${pkgFile}/${section}/.../${targetSegment}`);
+    }
+  }
+
+  if (compactPaths.size === 0) {
+    compactPaths.add(v.packageName);
+  }
+
+  return Array.from(compactPaths);
+}
+
 export function generateMarkdownReport(report) {
   const lines = [];
 
@@ -144,17 +222,17 @@ export function generateMarkdownReport(report) {
         lines.push(``);
       }
 
-      // Dependency Chain
+      // Compact Dependency Path
+      const compactPaths = formatCompactDependencyPaths(v);
       lines.push(`**Dependency Path:**`);
       lines.push(`\`\`\`text`);
-      if (v.dependencyPaths && v.dependencyPaths.length > 0) {
-        for (const p of v.dependencyPaths) {
-          lines.push(p);
-        }
-      } else {
-        lines.push(v.packageName);
+      for (const cp of compactPaths) {
+        lines.push(cp);
       }
       lines.push(`\`\`\``);
+      if (compactPaths.some((p) => p.includes('/.../'))) {
+        lines.push(`> _Note: Compact path summary shown. To inspect full transitive tree, run \`npm ls ${v.packageName}\` or \`npm why ${v.packageName}\`._`);
+      }
       lines.push(``);
 
       // Consolidated Remediation Plan

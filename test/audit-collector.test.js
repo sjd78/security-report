@@ -13,7 +13,7 @@ import {
   tracePathsFromPackageLock,
 } from '../src/core/dependency-graph.js';
 import { generateJsonReport } from '../src/report/json-reporter.js';
-import { generateMarkdownReport } from '../src/report/markdown-reporter.js';
+import { generateMarkdownReport, formatCompactDependencyPaths } from '../src/report/markdown-reporter.js';
 
 test('determineSafeVersion: range parsing', () => {
   assert.equal(determineSafeVersion('< 2.1.4', '2.1.0'), '2.1.4');
@@ -168,4 +168,30 @@ test('generateJsonReport and generateMarkdownReport', () => {
   assert.ok(mdReport.includes('Remote Code Execution'));
   assert.ok(mdReport.includes('CVE-2023-9999'));
   assert.ok(mdReport.includes('package-override'));
+});
+
+test('formatCompactDependencyPaths: formats direct and transitive paths compactly', () => {
+  const vuln = {
+    packageName: 'js-yaml',
+    isDirect: true,
+    workspaceDeclarations: [
+      { packageJsonPath: 'client/package.json', section: 'dependencies', range: '^4.3.0' },
+      { packageJsonPath: 'cypress/package.json', section: 'devDependencies', range: '^4.3.0' },
+    ],
+    directRoots: [
+      { name: 'eslint', section: 'devDependencies', packageJsonPath: 'package.json' },
+    ],
+    dependencyPaths: [
+      '@konveyor-ui/cypress (devDependencies) -> js-yaml@^4.3.0',
+      '@konveyor-ui/client (dependencies) -> js-yaml@^4.3.0',
+      'eslint@9.39.4 -> @eslint/eslintrc@3.3.5 -> js-yaml@3.15.1',
+      '@konveyor-ui/client (client/package.json) -> jest@29.7.0 -> @jest/core@29.7.0 -> js-yaml@3.15.1',
+    ],
+  };
+
+  const compact = formatCompactDependencyPaths(vuln);
+  assert.ok(compact.includes('client/package.json/dependencies/js-yaml@^4.3.0'));
+  assert.ok(compact.includes('cypress/package.json/devDependencies/js-yaml@^4.3.0'));
+  assert.ok(compact.includes('package.json/devDependencies/eslint/.../js-yaml@3.15.1'));
+  assert.ok(compact.includes('client/package.json/dependencies/jest/.../js-yaml@3.15.1'));
 });
