@@ -97,26 +97,26 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
 ```json
 {
   "repo": "konveyor/tackle2-ui",
-  "branches": ["main", "release-0.12", "release-0.11", "release-0.10"],
-  "reposDir": "REPOS",
-  "reportsDir": "reports",
-  "gitProtocol": "https",
+  "branches": ["main", "release-0.10", "release-0.9"],
   "branchMap": {
     "main": ["8.3.x", "8.3", "mta-8.3", "MTA 8.3"],
-    "release-0.12": ["8.3.x", "8.3", "mta-8.3", "MTA 8.3"],
-    "release-0.11": ["8.2.x", "8.2", "mta-8.2", "MTA 8.2"],
-    "release-0.10": ["8.1.x", "8.1", "mta-8.1", "MTA 8.1"]
+    "release-0.11": ["8.3.x", "8.3", "mta-8.3", "MTA 8.3"],
+    "release-0.10": ["8.2.x", "8.2", "mta-8.2", "MTA 8.2"],
+    "release-0.9": ["8.1.x", "8.1", "mta-8.1", "MTA 8.1"]
   },
+
+  "githubToken": "<token, or use `gh auth token`>",
   "jira": {
     "baseUrl": "https://redhat.atlassian.net",
     "project": "MTA",
+    "email": "<name>@redhat.com",
+    "apiToken": "<token>",
     "jql": "project = \"Migration Toolkit for Applications\" and labels = \"security\" and (summary ~ \"mta-ui-rhel8\" or summary ~ \"mta-ui-rhel9\" or summary ~ \"mta-ui-rhel10\") and status != Closed"
   },
-  "collectors": {
-    "npmAudit": true,
-    "jira": true,
-    "dependabot": false
-  },
+
+  "reposDir": "REPOS",
+  "reportsDir": "reports",
+  "collectors": ["npm-audit", "jira", "dependabot"],
   "allowOverrides": true,
   "debug": false
 }
