@@ -21,8 +21,22 @@ export function isVersionCompatible(ticketVersions = [], targetVersions = []) {
   return false;
 }
 
+export function sortVulnerabilities(a, b) {
+  const rank = { critical: 5, high: 4, moderate: 3, medium: 3, low: 2, info: 1, none: 0 };
+  const rankA = rank[a?.severity?.toLowerCase()] ?? 0;
+  const rankB = rank[b?.severity?.toLowerCase()] ?? 0;
+
+  if (rankB !== rankA) {
+    return rankB - rankA;
+  }
+
+  const nameA = String(a?.packageName || '').toLowerCase();
+  const nameB = String(b?.packageName || '').toLowerCase();
+  return nameA.localeCompare(nameB);
+}
+
 export function compareSeverities(a, b) {
-  const rank = { critical: 4, high: 3, moderate: 2, low: 1, info: 0 };
+  const rank = { critical: 5, high: 4, moderate: 3, medium: 3, low: 2, info: 1, none: 0 };
   return (rank[b?.toLowerCase()] || 0) - (rank[a?.toLowerCase()] || 0);
 }
 
@@ -312,9 +326,8 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
       }
     }
   }
-
   const consolidated = Array.from(packageMap.values());
-  consolidated.sort((a, b) => compareSeverities(b.severity, a.severity));
+  consolidated.sort(sortVulnerabilities);
   return consolidated;
 }
 
@@ -539,6 +552,7 @@ export function blendVulnerabilitySources(
 
     // Consolidate packages to a single entry per package
     const consolidatedPackages = consolidateVulnerabilitiesByPackage(rawVulns);
+    consolidatedPackages.sort(sortVulnerabilities);
 
     const summary = {
       critical: consolidatedPackages.filter((v) => v.severity === 'critical').length,

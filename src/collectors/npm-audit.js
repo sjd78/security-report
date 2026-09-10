@@ -10,7 +10,7 @@ import {
   lookupPackageInstalledInfo,
   runNpmLs,
 } from '../core/dependency-graph.js';
-
+import { sortVulnerabilities } from '../core/blender.js';
 const execFileAsync = promisify(execFile);
 
 export async function runNpmAuditRaw(cwd) {
@@ -335,8 +335,7 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
     vulnerabilities.push(vulnRecord);
   }
 
-  const severityRank = { critical: 4, high: 3, moderate: 2, low: 1, info: 0 };
-  vulnerabilities.sort((a, b) => (severityRank[b.severity] || 0) - (severityRank[a.severity] || 0));
+  vulnerabilities.sort(sortVulnerabilities);
 
   const summary = auditJson.metadata?.vulnerabilities || {
     critical: vulnerabilities.filter((v) => v.severity === 'critical').length,

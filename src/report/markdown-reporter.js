@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import { sortVulnerabilities } from '../core/blender.js';
 
 export function formatTicketLinks(v) {
   const links = [];
@@ -65,7 +66,9 @@ export function generateMarkdownReport(report) {
     lines.push(`## 🌿 Branch: \`${b.branch}\``);
     lines.push(``);
 
-    if (!b.vulnerabilities || b.vulnerabilities.length === 0) {
+    const sortedVulns = [...(b.vulnerabilities || [])].sort(sortVulnerabilities);
+
+    if (sortedVulns.length === 0) {
       lines.push(`✅ **No vulnerable packages found on this branch.**`);
       lines.push(``);
       continue;
@@ -76,7 +79,7 @@ export function generateMarkdownReport(report) {
     lines.push(`| Package | Severity | Type | Current Version | Target Fix | CVEs / Jira / Dependabot |`);
     lines.push(`| :--- | :---: | :---: | :--- | :--- | :--- |`);
 
-    for (const v of b.vulnerabilities) {
+    for (const v of sortedVulns) {
       const typeLabel = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct' : 'Indirect (Transitive)'));
       const targetFix = v.targetSafeVersion ? `\`${v.targetSafeVersion}\`` : '_No fix_';
       const links = formatTicketLinks(v);
@@ -89,7 +92,7 @@ export function generateMarkdownReport(report) {
     lines.push(`### Detailed Package Findings & Consolidated Remediation`);
     lines.push(``);
 
-    for (const [idx, v] of b.vulnerabilities.entries()) {
+    for (const [idx, v] of sortedVulns.entries()) {
       lines.push(`#### ${idx + 1}. \`${v.packageName}\` — ${v.severity.toUpperCase()}`);
       lines.push(``);
 
@@ -123,6 +126,7 @@ export function generateMarkdownReport(report) {
         }
       }
       lines.push(``);
+
       // List of individual advisories for this package
       if (v.advisories && v.advisories.length > 0) {
         lines.push(`**Tracked Advisories & CVEs (${v.advisories.length}):**`);
@@ -139,6 +143,7 @@ export function generateMarkdownReport(report) {
         if (v.url) lines.push(`- **Advisory:** ${v.url}`);
         lines.push(``);
       }
+
       // Dependency Chain
       lines.push(`**Dependency Path:**`);
       lines.push(`\`\`\`text`);

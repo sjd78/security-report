@@ -1,8 +1,14 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import { sortVulnerabilities } from '../core/blender.js';
 
 export function generateJsonReport(repository, branchReports, options = {}) {
-  const totalVulns = branchReports.reduce((acc, b) => acc + (b.vulnerabilities?.length || 0), 0);
+  const sortedBranches = (branchReports || []).map((b) => ({
+    ...b,
+    vulnerabilities: [...(b.vulnerabilities || [])].sort(sortVulnerabilities),
+  }));
+
+  const totalVulns = sortedBranches.reduce((acc, b) => acc + (b.vulnerabilities?.length || 0), 0);
   const report = {
     schemaVersion: '1.0.0',
     generatedAt: new Date().toISOString(),
@@ -13,11 +19,11 @@ export function generateJsonReport(repository, branchReports, options = {}) {
       path: repository.repoPath || repository.localPath || '',
     },
     summary: {
-      totalBranches: branchReports.length,
+      totalBranches: sortedBranches.length,
       totalVulnerabilities: totalVulns,
-      branchesWithVulnerabilities: branchReports.filter((b) => (b.vulnerabilities?.length || 0) > 0).length,
+      branchesWithVulnerabilities: sortedBranches.filter((b) => (b.vulnerabilities?.length || 0) > 0).length,
     },
-    branches: branchReports,
+    branches: sortedBranches,
   };
 
   return report;

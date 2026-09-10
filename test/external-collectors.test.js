@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { parseJiraIssues, createJiraAuthHeader, groupJiraTicketsByBranch } from '../src/collectors/jira.js';
 import { parseDependabotAlerts, groupDependabotAlertsByBranch } from '../src/collectors/dependabot.js';
 import { extractGhsaId, extractCveId } from '../src/collectors/advisories.js';
-import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible, consolidateVulnerabilitiesByPackage, calculateOptimalSafeVersion } from '../src/core/blender.js';
+import { blendVulnerabilitySources, matchJiraTicket, matchDependabotAlert, isVersionCompatible, consolidateVulnerabilitiesByPackage, calculateOptimalSafeVersion, sortVulnerabilities } from '../src/core/blender.js';
 import { parseBranchMap, parseCollectorSettings, loadConfig } from '../src/config.js';
 import { lookupPackageInstalledInfo } from '../src/core/dependency-graph.js';
 
@@ -451,4 +451,21 @@ test('loadConfig: disables Jira collector when Jira configuration is incomplete'
     jiraApiToken: 'my-token',
   });
   assert.equal(confComplete.collectors.jira, true);
+});
+
+test('sortVulnerabilities: sorts by severity descending and package name ascending', () => {
+  const items = [
+    { packageName: 'zebra', severity: 'low' },
+    { packageName: 'qs', severity: 'high' },
+    { packageName: 'axios', severity: 'high' },
+    { packageName: 'beta', severity: 'critical' },
+    { packageName: 'alpha', severity: 'critical' },
+  ];
+
+  items.sort(sortVulnerabilities);
+  assert.equal(items[0].packageName, 'alpha');
+  assert.equal(items[1].packageName, 'beta');
+  assert.equal(items[2].packageName, 'axios');
+  assert.equal(items[3].packageName, 'qs');
+  assert.equal(items[4].packageName, 'zebra');
 });
