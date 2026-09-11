@@ -106,6 +106,77 @@ export function calculateOptimalSafeVersion(installedVersion, advisories = []) {
   return selectBestRemediationVersion(installedVersion, candidateVersions);
 }
 
+export function isVulnerabilityResolved(v) {
+  if (!v) return false;
+
+  const rawVersions = Array.isArray(v.installedVersions) && v.installedVersions.length > 0
+    ? v.installedVersions
+    : String(v.currentVersion || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+  const cleanVersions = rawVersions
+    .map((ver) => semver.clean(ver.replace(/^[~^]/, '')))
+    .filter((ver) => semver.valid(ver));
+
+  if (cleanVersions.length === 0) return false;
+
+  const patchedSet = new Set();
+  if (Array.isArray(v.targetSafeVersions)) {
+    for (const p of v.targetSafeVersions) if (p) patchedSet.add(p);
+  }
+  if (Array.isArray(v.patchedVersions)) {
+    for (const p of v.patchedVersions) if (p) patchedSet.add(p);
+  }
+  if (Array.isArray(v.advisories)) {
+    for (const adv of v.advisories) {
+      if (Array.isArray(adv.patchedVersions)) {
+        for (const p of adv.patchedVersions) if (p) patchedSet.add(p);
+      }
+      if (Array.isArray(adv.targetSafeVersions)) {
+        for (const p of adv.targetSafeVersions) if (p) patchedSet.add(p);
+      }
+      if (adv.targetSafeVersion) patchedSet.add(adv.targetSafeVersion);
+    }
+  }
+  if (v.targetSafeVersion) patchedSet.add(v.targetSafeVersion);
+
+  const candidateVersions = Array.from(patchedSet)
+    .map((ver) => semver.clean(String(ver).replace(/^[~^]/, '')))
+    .filter((ver) => semver.valid(ver));
+
+  if (candidateVersions.length === 0) return false;
+
+  for (const installed of cleanVersions) {
+    const installedMajor = semver.major(installed);
+
+    const sameMajorFixes = candidateVersions.filter((c) => semver.major(c) === installedMajor);
+    if (sameMajorFixes.length > 0) {
+      sameMajorFixes.sort(semver.compare);
+      const minFix = sameMajorFixes[0];
+      if (semver.lt(installed, minFix)) {
+        return false;
+      }
+    } else {
+      candidateVersions.sort(semver.compare);
+      const lowestFix = candidateVersions[0];
+      if (semver.lt(installed, lowestFix)) {
+        return false;
+      }
+    }
+
+    if (v.vulnerableVersionRange && typeof v.vulnerableVersionRange === 'string') {
+      try {
+        if (semver.satisfies(installed, v.vulnerableVersionRange)) {
+          return false;
+        }
+      } catch {
+        // ignore invalid range format
+      }
+    }
+  }
+
+  return true;
+}
+
 export function matchJiraTicket(vuln, jiraTickets, branchName = null, branchMap = {}) {
   if (!jiraTickets || jiraTickets.length === 0) return null;
 
@@ -452,6 +523,17 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         }
       }
     }
+
+    // Determine if vulnerability is resolved in repository
+    const resolved = isVulnerabilityResolved(pkg);
+    pkg.status = resolved ? 'resolved' : 'open';
+    pkg.resolved = resolved;
+
+    if (resolved && pkg.remediation) {
+      pkg.remediation.packageJsonChanges = [];
+      pkg.remediation.lockfileUpdates = [];
+      pkg.remediation.note = `Already resolved in repository (installed version \`${pkg.currentVersion}\` satisfies target fix).`;
+    }
   }
   const consolidated = Array.from(packageMap.values());
   consolidated.sort(sortVulnerabilities);
@@ -687,6 +769,8 @@ export function blendVulnerabilitySources(
       moderate: consolidatedPackages.filter((v) => v.severity === 'moderate').length,
       low: consolidatedPackages.filter((v) => v.severity === 'low').length,
       total: consolidatedPackages.length,
+      open: consolidatedPackages.filter((v) => v.status !== 'resolved').length,
+      resolved: consolidatedPackages.filter((v) => v.status === 'resolved').length,
     };
 
     enrichedBranchReports.push({

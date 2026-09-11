@@ -1,7 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import semver from 'semver';
-import { sortVulnerabilities } from '../core/blender.js';
+import { sortVulnerabilities, isVulnerabilityResolved } from '../core/blender.js';
 import { formatLockfileUpdate } from '../collectors/npm-audit.js';
 import { extractGhsaId } from '../collectors/advisories.js';
 
@@ -43,7 +43,12 @@ export function formatCves(v) {
   return cves.map((c) => (c.startsWith('`') ? c : `\`${c}\``)).join('<br>');
 }
 
-export function formatTargetFix(v) {
+export function formatStatus(v) {
+  const resolved = v.status === 'resolved' || isVulnerabilityResolved(v);
+  return resolved ? '✅ Resolved' : '⚠️ Open';
+}
+
+export function formatTargetFix(v, joiner = '<br>') {
   const versions = [];
   const seen = new Set();
 
@@ -88,7 +93,7 @@ export function formatTargetFix(v) {
     return a.localeCompare(b);
   });
 
-  return versions.map((ver) => (ver.startsWith('`') ? ver : `\`${ver}\``)).join('<br>');
+  return versions.map((ver) => (ver.startsWith('`') ? ver : `\`${ver}\``)).join(joiner);
 }
 
 export function formatSources(v) {
@@ -146,6 +151,7 @@ export function formatSources(v) {
       }
     }
   }
+
   // 2. Jira ticket(s)
   if (v.sources?.jiraTickets && v.sources.jiraTickets.length > 0) {
     for (const jt of v.sources.jiraTickets) {
@@ -176,6 +182,7 @@ export function formatSources(v) {
 
   return sources.join('<br>');
 }
+
 export function formatTicketLinks(v) {
   const links = [];
 
@@ -209,19 +216,21 @@ export function formatTicketLinks(v) {
   return links.join(', ') || '_None_';
 }
 
-export function formatCompactDependencyPaths(v) {
+export function formatCompactDependencyPaths(v, includeDirect = true) {
   const compactPaths = new Set();
 
   // 1. Add direct declarations
-  if (v.workspaceDeclarations && v.workspaceDeclarations.length > 0) {
-    for (const decl of v.workspaceDeclarations) {
-      const pkgFile = decl.packageJsonPath || 'package.json';
-      const sec = decl.section || 'dependencies';
-      const range = decl.range ? `@${decl.range}` : '';
-      compactPaths.add(`${pkgFile}/${sec}/${v.packageName}${range}`);
+  if (includeDirect) {
+    if (v.workspaceDeclarations && v.workspaceDeclarations.length > 0) {
+      for (const decl of v.workspaceDeclarations) {
+        const pkgFile = decl.packageJsonPath || 'package.json';
+        const sec = decl.section || 'dependencies';
+        const range = decl.range ? `@${decl.range}` : '';
+        compactPaths.add(`${pkgFile}/${sec}/${v.packageName}${range}`);
+      }
+    } else if (v.isDirect) {
+      compactPaths.add(`package.json/dependencies/${v.packageName}`);
     }
-  } else if (v.isDirect) {
-    compactPaths.add(`package.json/dependencies/${v.packageName}`);
   }
 
   // 2. Parse transitive paths into <project package.json>/<section>/<direct package>/.../<transitive package>
@@ -280,7 +289,7 @@ export function formatCompactDependencyPaths(v) {
     }
   }
 
-  if (compactPaths.size === 0) {
+  if (compactPaths.size === 0 && includeDirect) {
     compactPaths.add(v.packageName);
   }
 
@@ -328,16 +337,17 @@ export function generateMarkdownReport(report) {
 
     lines.push(`### Package Vulnerability Overview`);
     lines.push(``);
-    lines.push(`| Package | Severity | Type | Current Version | Target Fix | CVEs | Sources |`);
-    lines.push(`| :--- | :---: | :---: | :--- | :--- | :--- | :--- |`);
+    lines.push(`| Package | Status | Severity | Type | Current Version | Target Fix | CVEs | Sources |`);
+    lines.push(`| :--- | :---: | :---: | :---: | :--- | :--- | :--- | :--- |`);
 
     for (const v of sortedVulns) {
       const typeLabel = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct' : 'Indirect (Transitive)'));
+      const statusBadge = formatStatus(v);
       const targetFix = formatTargetFix(v);
       const cves = formatCves(v);
       const sources = formatSources(v);
       lines.push(
-        `| **\`${v.packageName}\`** | **${v.severity.toUpperCase()}** | ${typeLabel} | \`${v.currentVersion}\` | ${targetFix} | ${cves} | ${sources} |`
+        `| **\`${v.packageName}\`** | ${statusBadge} | **${v.severity.toUpperCase()}** | ${typeLabel} | \`${v.currentVersion}\` | ${targetFix} | ${cves} | ${sources} |`
       );
     }
     lines.push(``);
@@ -346,8 +356,16 @@ export function generateMarkdownReport(report) {
     lines.push(``);
 
     for (const [idx, v] of sortedVulns.entries()) {
-      lines.push(`#### ${idx + 1}. \`${v.packageName}\` — ${v.severity.toUpperCase()}`);
+      const isResolved = v.status === 'resolved' || isVulnerabilityResolved(v);
+      const statusBadge = isResolved ? '✅ Resolved' : '⚠️ Open';
+      lines.push(`#### \`${v.packageName}\` — ${v.severity.toUpperCase()} (${statusBadge})`);
       lines.push(``);
+      const statusNote = isResolved
+        ? `✅ Resolved (installed version \`${v.currentVersion}\` satisfies target fix)`
+        : `⚠️ Open (installed version \`${v.currentVersion}\` is vulnerable)`;
+      lines.push(`- **Status:** ${statusNote}`);
+      lines.push(`- **Current Version:** \`${v.currentVersion}\``);
+      lines.push(`- **Target Fix Version:** \`${formatTargetFix(v, ' | ')}\``);
 
       if (v.cves && v.cves.length > 0) {
         lines.push(`- **CVE Identifiers (${v.cves.length}):** ${v.cves.map((c) => `\`${c}\``).join(', ')}`);
@@ -369,50 +387,44 @@ export function generateMarkdownReport(report) {
         lines.push(`- **Dependabot Alert:** [#${v.sources.dependabot.alertNumber}](${v.sources.dependabot.url})`);
       }
 
+      // List of individual advisories for this package
+      const advisories = (v.advisories && v.advisories.length > 0) ? v.advisories : [{ title: v.title, url: v.url }];
+      lines.push(`- **Tracked Advisories & CVEs (${advisories.length}):**`);
+      for (const adv of advisories) {
+        lines.push("  - " + [
+          adv.url ? `[Advisory](${adv.url}) -` : '',
+          adv.sources?.jira?.ticketKey ? `[Jira ${adv.sources.jira.ticketKey}](${adv.sources.jira.url}) -` : '',
+          adv.cve ? `\`${adv.cve}\`` : '_(no CVE)_',
+          adv.title || 'Security finding',
+        ].filter(Boolean).join(' '));
+      }
+      lines.push(``);
+
       const depTypeStr = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct Dependency' : 'Indirect (Transitive)'));
       lines.push(`- **Dependency Type:** ${depTypeStr}`);
       if (v.workspaceDeclarations && v.workspaceDeclarations.length > 0) {
-        lines.push(`- **Direct Package Declarations (${v.workspaceDeclarations.length}):**`);
+        lines.push(`- **Direct Dependencies (${v.workspaceDeclarations.length}):**`);
         for (const decl of v.workspaceDeclarations) {
-          const wsLabel = decl.isRoot ? '`package.json`' : `\`${decl.packageJsonPath}\` (${decl.workspace})`;
+          const wsLabel = decl.isRoot ? '`package.json`' : `\`${decl.packageJsonPath}\``;
           lines.push(`  - ${wsLabel} [${decl.section}: \`${decl.range}\`]`);
         }
       }
       lines.push(``);
 
-      // List of individual advisories for this package
-      if (v.advisories && v.advisories.length > 0) {
-        lines.push(`**Tracked Advisories & CVEs (${v.advisories.length}):**`);
-        for (const adv of v.advisories) {
-          const advTitle = adv.title || 'Security finding';
-          const advCve = adv.cve ? `\`${adv.cve}\` — ` : '';
-          const advLink = adv.url ? `([Advisory](${adv.url}))` : '';
-          const advJira = adv.sources?.jira?.ticketKey ? `([Jira ${adv.sources.jira.ticketKey}](${adv.sources.jira.url}))` : '';
-          const fixesList = Array.isArray(adv.patchedVersions) && adv.patchedVersions.length > 0
-            ? adv.patchedVersions
-            : (adv.targetSafeVersion ? [adv.targetSafeVersion] : []);
-          const fixesStr = fixesList.length > 0 ? ` [Fixes: ${fixesList.map((f) => `\`${f}\``).join(', ')}]` : '';
-          lines.push(`- ${advCve}${advTitle} ${advLink} ${advJira}${fixesStr}`);
+      // Compact Transitive Dependency Path
+      const compactPaths = formatCompactDependencyPaths(v, false);
+      if (compactPaths.length > 0) {
+        lines.push(`- **Transitive Dependency Path:**`);
+        lines.push("  \`\`\`text");
+        for (const cp of compactPaths) {
+          lines.push("  " + cp);
+        }
+        lines.push("  \`\`\`");
+        if (compactPaths.some((p) => p.includes('/.../'))) {
+          lines.push(`  > _Note: Compact path summary shown. To inspect full transitive tree, run \`npm ls ${v.packageName}\` or \`npm why ${v.packageName}\`._`);
         }
         lines.push(``);
-      } else if (v.title) {
-        lines.push(`- **Title:** ${v.title}`);
-        if (v.url) lines.push(`- **Advisory:** ${v.url}`);
-        lines.push(``);
       }
-
-      // Compact Dependency Path
-      const compactPaths = formatCompactDependencyPaths(v);
-      lines.push(`**Dependency Path:**`);
-      lines.push(`\`\`\`text`);
-      for (const cp of compactPaths) {
-        lines.push(cp);
-      }
-      lines.push(`\`\`\``);
-      if (compactPaths.some((p) => p.includes('/.../'))) {
-        lines.push(`> _Note: Compact path summary shown. To inspect full transitive tree, run \`npm ls ${v.packageName}\` or \`npm why ${v.packageName}\`._`);
-      }
-      lines.push(``);
 
       // Consolidated Remediation Plan
       const rem = v.remediation || {};

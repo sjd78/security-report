@@ -9,7 +9,7 @@ import {
   parseAuditVulnerabilities,
   resolveAuditAdvisories,
 } from '../src/collectors/npm-audit.js';
-import { selectBestRemediationVersion } from '../src/core/blender.js';
+import { selectBestRemediationVersion, isVulnerabilityResolved } from '../src/core/blender.js';
 import {
   extractDependencyChains,
   findDirectRoots,
@@ -17,7 +17,7 @@ import {
   tracePathsFromPackageLock,
 } from '../src/core/dependency-graph.js';
 import { generateJsonReport } from '../src/report/json-reporter.js';
-import { generateMarkdownReport, formatCompactDependencyPaths, formatCves, formatSources, formatTargetFix } from '../src/report/markdown-reporter.js';
+import { generateMarkdownReport, formatCompactDependencyPaths, formatCves, formatSources, formatTargetFix, formatStatus } from '../src/report/markdown-reporter.js';
 
 test('determineSafeVersion: range parsing', () => {
   assert.equal(determineSafeVersion('< 2.1.4', '2.1.0'), '2.1.4');
@@ -173,8 +173,8 @@ test('generateJsonReport and generateMarkdownReport', () => {
   assert.ok(mdReport.includes('CVE-2023-9999'));
   assert.ok(mdReport.includes('package-override'));
   assert.ok(mdReport.includes('npm update vuln-lib --package-lock-only'));
-  assert.ok(mdReport.includes('| Package | Severity | Type | Current Version | Target Fix | CVEs | Sources |'));
-  assert.ok(mdReport.includes('| **`vuln-lib`** | **CRITICAL** | Indirect (Transitive) | `1.0.0` | `1.1.0` | `CVE-2023-9999` | [npm audit](https://github.com/advisories/GHSA-xxxx) |'));
+  assert.ok(mdReport.includes('| Package | Status | Severity | Type | Current Version | Target Fix | CVEs | Sources |'));
+  assert.ok(mdReport.includes('| **`vuln-lib`** | ⚠️ Open | **CRITICAL** | Indirect (Transitive) | `1.0.0` | `1.1.0` | `CVE-2023-9999` | [npm audit](https://github.com/advisories/GHSA-xxxx) |'));
 });
 
 test('generateMarkdownReport: table renders multiple CVEs and multiple sources with <br>', () => {
@@ -206,7 +206,7 @@ test('generateMarkdownReport: table renders multiple CVEs and multiple sources w
   const mdReport = generateMarkdownReport(jsonReport);
   assert.ok(
     mdReport.includes(
-      '| **`multi-vuln-pkg`** | **HIGH** | Indirect (Transitive) | `2.0.0` | `2.1.0` | `CVE-2023-1111`<br>`CVE-2023-2222` | npm audit<br>[MTA-5000](https://jira/MTA-5000)<br>[#99](https://github/alert/99) |'
+      '| **`multi-vuln-pkg`** | ⚠️ Open | **HIGH** | Indirect (Transitive) | `2.0.0` | `2.1.0` | `CVE-2023-1111`<br>`CVE-2023-2222` | npm audit<br>[MTA-5000](https://jira/MTA-5000)<br>[#99](https://github/alert/99) |'
     )
   );
 });
@@ -538,7 +538,7 @@ test('resolveAuditAdvisories: enriches npm audit vulnerability with CVE, target 
   const md = generateMarkdownReport({
     branches: [{ branch: 'main', summary: { total: 1 }, vulnerabilities: vulns }],
   });
-  assert.ok(md.includes('| **`demo-pkg`** | **HIGH** | Indirect (Transitive) | `1.0.0` | `1.2.0` | `CVE-2024-99999` | [npm audit](https://github.com/advisories/GHSA-test-1234) |'));
+  assert.ok(md.includes('| **`demo-pkg`** | ⚠️ Open | **HIGH** | Indirect (Transitive) | `1.0.0` | `1.2.0` | `CVE-2024-99999` | [npm audit](https://github.com/advisories/GHSA-test-1234) |'));
 });
 
 test('parseAuditVulnerabilities: automatically resolves and enriches CVE and target fix via options.advisoryCache', async () => {
@@ -586,7 +586,7 @@ test('parseAuditVulnerabilities: automatically resolves and enriches CVE and tar
   const md = generateMarkdownReport({
     branches: [result],
   });
-  assert.ok(md.includes('| **`cookie`** | **LOW** | Direct | `0.4.0` | `0.7.0` | `CVE-2024-47764` | [npm audit](https://github.com/advisories/GHSA-pxg6-pf52-xh8x) |'));
+  assert.ok(md.includes('| **`cookie`** | ⚠️ Open | **LOW** | Direct | `0.4.0` | `0.7.0` | `CVE-2024-47764` | [npm audit](https://github.com/advisories/GHSA-pxg6-pf52-xh8x) |'));
 });
 
 test('determinePatchedVersions: extracts all patched versions across major version lines from semver ranges', () => {
@@ -644,7 +644,58 @@ test('generateMarkdownReport: lists all major version line fixes under Target Fi
 
   assert.ok(
     md.includes(
-      '| **`fast-uri`** | **HIGH** | Direct | `2.4.2` | `2.4.5`<br>`3.1.6`<br>`4.1.3` | `CVE-2026-75931` | [npm audit](https://github.com/advisories/GHSA-5jgf-p345-68v8) |'
+      '| **`fast-uri`** | ⚠️ Open | **HIGH** | Direct | `2.4.2` | `2.4.5`<br>`3.1.6`<br>`4.1.3` | `CVE-2026-75931` | [npm audit](https://github.com/advisories/GHSA-5jgf-p345-68v8) |'
     )
   );
+});
+
+test('isVulnerabilityResolved: checks currentVersion >= target fix across major lines', () => {
+  const patched = ['2.4.5', '3.1.6', '4.1.3'];
+  assert.equal(isVulnerabilityResolved({ currentVersion: '2.4.5', patchedVersions: patched }), true);
+  assert.equal(isVulnerabilityResolved({ currentVersion: '2.4.2', patchedVersions: patched }), false);
+  assert.equal(isVulnerabilityResolved({ currentVersion: '3.1.6', patchedVersions: patched }), true);
+  assert.equal(isVulnerabilityResolved({ currentVersion: '3.1.3', patchedVersions: patched }), false);
+  assert.equal(isVulnerabilityResolved({ currentVersion: '4.1.3', patchedVersions: patched }), true);
+  assert.equal(isVulnerabilityResolved({ currentVersion: '4.0.0', patchedVersions: patched }), false);
+  assert.equal(isVulnerabilityResolved({ currentVersion: '1.0.0', targetSafeVersion: '1.1.0' }), false);
+  assert.equal(isVulnerabilityResolved({ currentVersion: '1.1.0', targetSafeVersion: '1.1.0' }), true);
+  assert.equal(isVulnerabilityResolved({ currentVersion: 'unknown', targetSafeVersion: '1.1.0' }), false);
+});
+
+test('formatStatus: returns ✅ Resolved or ⚠️ Open', () => {
+  assert.equal(formatStatus({ status: 'resolved' }), '✅ Resolved');
+  assert.equal(formatStatus({ status: 'open' }), '⚠️ Open');
+  assert.equal(formatStatus({ currentVersion: '2.4.5', targetSafeVersion: '2.4.5' }), '✅ Resolved');
+  assert.equal(formatStatus({ currentVersion: '2.4.2', targetSafeVersion: '2.4.5' }), '⚠️ Open');
+});
+
+test('generateMarkdownReport: marks logged vulnerability as resolved when currentVersion >= target fix', () => {
+  const resolvedVuln = {
+    packageName: 'fast-uri',
+    severity: 'high',
+    currentVersion: '2.4.5',
+    targetSafeVersion: '2.4.5',
+    patchedVersions: ['2.4.5', '3.1.6', '4.1.3'],
+    cve: 'CVE-2026-75931',
+    status: 'resolved',
+    sources: {
+      jira: { ticketKey: 'MTA-9999', url: 'https://jira/MTA-9999' },
+    },
+    isDirect: true,
+  };
+
+  const md = generateMarkdownReport({
+    branches: [{ branch: 'main', summary: { total: 1, open: 0, resolved: 1 }, vulnerabilities: [resolvedVuln] }],
+  });
+
+  // Table displays ✅ Resolved
+  assert.ok(
+    md.includes(
+      '| **`fast-uri`** | ✅ Resolved | **HIGH** | Direct | `2.4.5` | `2.4.5`<br>`3.1.6`<br>`4.1.3` | `CVE-2026-75931` | [MTA-9999](https://jira/MTA-9999) |'
+    )
+  );
+
+  // Detailed finding includes (✅ Resolved) and status note
+  assert.ok(md.includes('#### `fast-uri` — HIGH (✅ Resolved)'));
+  assert.ok(md.includes('- **Status:** ✅ Resolved (installed version `2.4.5` satisfies target fix)'));
 });
