@@ -10,7 +10,7 @@ import {
   lookupPackageInstalledInfo,
   runNpmLs,
 } from '../core/dependency-graph.js';
-import { sortVulnerabilities, pickHighestSafeVersion } from '../core/blender.js';
+import { sortVulnerabilities, pickHighestSafeVersion, selectBestRemediationVersion } from '../core/blender.js';
 import { extractGhsaId, extractCveId, fetchAdvisoryDetails } from './advisories.js';
 const execFileAsync = promisify(execFile);
 
@@ -39,24 +39,49 @@ export function extractCveFromText(text) {
   return match ? match[0].toUpperCase() : null;
 }
 
-export function determineSafeVersion(vulnerableRange, currentVersion, fixAvailable) {
+export function determinePatchedVersions(vulnerableRange, fixAvailable = null) {
+  const versions = [];
+  const seen = new Set();
+  const add = (v) => {
+    if (!v || typeof v !== 'string') return;
+    const clean = semver.clean(v) || v.trim();
+    if (clean && semver.valid(clean) && !seen.has(clean)) {
+      seen.add(clean);
+      versions.push(clean);
+    }
+  };
+
   if (fixAvailable && typeof fixAvailable === 'object' && fixAvailable.version) {
-    return fixAvailable.version;
+    add(fixAvailable.version);
   }
 
-  // Attempt to parse minimum non-vulnerable version from range (e.g. "< 2.1.4" -> "2.1.4")
-  if (vulnerableRange) {
-    const match = vulnerableRange.match(/<=\s*([0-9]+\.[0-9]+\.[0-9]+[^ ]*)/);
-    if (match && semver.valid(match[1])) {
-      return semver.inc(match[1], 'patch') || match[1];
-    }
-    const matchLt = vulnerableRange.match(/<\s*([0-9]+\.[0-9]+\.[0-9]+[^ ]*)/);
-    if (matchLt && semver.valid(matchLt[1])) {
-      return matchLt[1];
+  if (vulnerableRange && typeof vulnerableRange === 'string') {
+    const matches = Array.from(vulnerableRange.matchAll(/(?:<=|<)\s*([0-9]+\.[0-9]+\.[0-9]+[a-zA-Z0-9_.-]*)/g));
+    for (const m of matches) {
+      if (m[1] && semver.valid(m[1])) {
+        if (m[0].trim().startsWith('<=')) {
+          add(semver.inc(m[1], 'patch') || m[1]);
+        } else {
+          add(m[1]);
+        }
+      }
     }
   }
 
-  return null;
+  versions.sort((a, b) => {
+    const vA = semver.valid(a);
+    const vB = semver.valid(b);
+    if (vA && vB) return semver.compare(vA, vB);
+    return a.localeCompare(b);
+  });
+
+  return versions;
+}
+
+export function determineSafeVersion(vulnerableRange, currentVersion, fixAvailable) {
+  const allPatched = determinePatchedVersions(vulnerableRange, fixAvailable);
+  if (allPatched.length === 0) return null;
+  return selectBestRemediationVersion(currentVersion, allPatched);
 }
 
 export function canBeResolvedInLockfile(safeVersion, chains = []) {
@@ -277,11 +302,33 @@ export async function resolveAuditAdvisories(vulnerabilities = [], options = {})
             if (!v.cve) v.cve = details.cve;
           }
 
-          // 2. Populate targetSafeVersion
-          if (details.targetSafeVersion) {
-            v.targetSafeVersion = v.targetSafeVersion
-              ? pickHighestSafeVersion(v.targetSafeVersion, details.targetSafeVersion)
-              : details.targetSafeVersion;
+          // 2. Populate patched versions and targetSafeVersion
+          if (Array.isArray(details.patchedVersions) && details.patchedVersions.length > 0) {
+            v.patchedVersions = v.patchedVersions || [];
+            for (const pv of details.patchedVersions) {
+              if (pv && !v.patchedVersions.includes(pv)) v.patchedVersions.push(pv);
+            }
+            v.patchedVersions.sort((a, b) => {
+              const vA = semver.valid(a);
+              const vB = semver.valid(b);
+              if (vA && vB) return semver.compare(vA, vB);
+              return a.localeCompare(b);
+            });
+            v.targetSafeVersions = [...v.patchedVersions];
+            v.targetSafeVersion = selectBestRemediationVersion(v.currentVersion, v.patchedVersions);
+          } else if (details.targetSafeVersion) {
+            v.patchedVersions = v.patchedVersions || [];
+            if (!v.patchedVersions.includes(details.targetSafeVersion)) {
+              v.patchedVersions.push(details.targetSafeVersion);
+              v.patchedVersions.sort((a, b) => {
+                const vA = semver.valid(a);
+                const vB = semver.valid(b);
+                if (vA && vB) return semver.compare(vA, vB);
+                return a.localeCompare(b);
+              });
+            }
+            v.targetSafeVersions = [...v.patchedVersions];
+            v.targetSafeVersion = selectBestRemediationVersion(v.currentVersion, v.patchedVersions);
           }
 
           // 3. Ensure advisory url is present
@@ -304,6 +351,10 @@ export async function resolveAuditAdvisories(vulnerabilities = [], options = {})
             );
             if (matchedAdv) {
               if (details.cve && !matchedAdv.cve) matchedAdv.cve = details.cve;
+              if (Array.isArray(details.patchedVersions) && details.patchedVersions.length > 0) {
+                matchedAdv.patchedVersions = [...details.patchedVersions];
+                matchedAdv.targetSafeVersions = [...details.patchedVersions];
+              }
               if (details.targetSafeVersion && !matchedAdv.targetSafeVersion) matchedAdv.targetSafeVersion = details.targetSafeVersion;
               if (details.url && !matchedAdv.url) matchedAdv.url = details.url;
             }
@@ -419,8 +470,8 @@ export async function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npm
       ? pkgInfo.currentVersion
       : (chains[0]?.slice(-1)[0]?.version || vulnData.range || 'unknown');
 
+    const patchedVersions = determinePatchedVersions(vulnData.range, vulnData.fixAvailable);
     const targetSafeVersion = determineSafeVersion(vulnData.range, currentVersion, vulnData.fixAvailable);
-
     const vulnRecord = {
       id: advisoryId,
       cve,
@@ -438,6 +489,8 @@ export async function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npm
       vulnerableVersionRange: vulnData.range || null,
       currentVersion,
       targetSafeVersion,
+      patchedVersions: [...patchedVersions],
+      targetSafeVersions: [...patchedVersions],
       fixAvailable: vulnData.fixAvailable || false,
       dependencyPaths,
       dependencyChains: chains,

@@ -2,12 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   determineSafeVersion,
+  determinePatchedVersions,
   buildRemediationSuggestion,
   extractCveFromText,
   canBeResolvedInLockfile,
   parseAuditVulnerabilities,
   resolveAuditAdvisories,
 } from '../src/collectors/npm-audit.js';
+import { selectBestRemediationVersion } from '../src/core/blender.js';
 import {
   extractDependencyChains,
   findDirectRoots,
@@ -15,7 +17,7 @@ import {
   tracePathsFromPackageLock,
 } from '../src/core/dependency-graph.js';
 import { generateJsonReport } from '../src/report/json-reporter.js';
-import { generateMarkdownReport, formatCompactDependencyPaths, formatCves, formatSources } from '../src/report/markdown-reporter.js';
+import { generateMarkdownReport, formatCompactDependencyPaths, formatCves, formatSources, formatTargetFix } from '../src/report/markdown-reporter.js';
 
 test('determineSafeVersion: range parsing', () => {
   assert.equal(determineSafeVersion('< 2.1.4', '2.1.0'), '2.1.4');
@@ -585,4 +587,64 @@ test('parseAuditVulnerabilities: automatically resolves and enriches CVE and tar
     branches: [result],
   });
   assert.ok(md.includes('| **`cookie`** | **LOW** | Direct | `0.4.0` | `0.7.0` | `CVE-2024-47764` | [npm audit](https://github.com/advisories/GHSA-pxg6-pf52-xh8x) |'));
+});
+
+test('determinePatchedVersions: extracts all patched versions across major version lines from semver ranges', () => {
+  const versions = determinePatchedVersions('<2.4.5 || >=3.0.0 <3.1.6 || >=4.0.0 <4.1.3');
+  assert.deepEqual(versions, ['2.4.5', '3.1.6', '4.1.3']);
+});
+
+test('selectBestRemediationVersion: selects safe in-major fix or minimal breaking upgrade', () => {
+  const candidates = ['2.4.5', '3.1.6', '4.1.3'];
+  assert.equal(selectBestRemediationVersion('2.4.2', candidates), '2.4.5');
+  assert.equal(selectBestRemediationVersion('3.1.3', candidates), '3.1.6');
+  assert.equal(selectBestRemediationVersion('4.0.1', candidates), '4.1.3');
+  assert.equal(selectBestRemediationVersion('1.0.0', candidates), '2.4.5');
+  assert.equal(selectBestRemediationVersion('unknown', candidates), '4.1.3');
+});
+
+test('formatTargetFix: formats single version, multiple versions with <br>, and none', () => {
+  assert.equal(formatTargetFix({ targetSafeVersion: '2.1.4' }), '`2.1.4`');
+  assert.equal(
+    formatTargetFix({
+      patchedVersions: ['2.4.5', '3.1.6', '4.1.3'],
+    }),
+    '`2.4.5`<br>`3.1.6`<br>`4.1.3`'
+  );
+  assert.equal(
+    formatTargetFix({
+      advisories: [
+        { patchedVersions: ['2.4.5', '3.1.6'] },
+        { targetSafeVersion: '4.1.3' },
+      ],
+    }),
+    '`2.4.5`<br>`3.1.6`<br>`4.1.3`'
+  );
+  assert.equal(formatTargetFix({}), '_No fix_');
+});
+
+test('generateMarkdownReport: lists all major version line fixes under Target Fix for multi-line advisories like fast-uri', () => {
+  const vuln = {
+    packageName: 'fast-uri',
+    severity: 'high',
+    currentVersion: '2.4.2',
+    targetSafeVersion: '2.4.5',
+    patchedVersions: ['2.4.5', '3.1.6', '4.1.3'],
+    cve: 'CVE-2026-75931',
+    url: 'https://github.com/advisories/GHSA-5jgf-p345-68v8',
+    sources: {
+      npmAudit: { url: 'https://github.com/advisories/GHSA-5jgf-p345-68v8' },
+    },
+    isDirect: true,
+  };
+
+  const md = generateMarkdownReport({
+    branches: [{ branch: 'main', summary: { total: 1 }, vulnerabilities: [vuln] }],
+  });
+
+  assert.ok(
+    md.includes(
+      '| **`fast-uri`** | **HIGH** | Direct | `2.4.2` | `2.4.5`<br>`3.1.6`<br>`4.1.3` | `CVE-2026-75931` | [npm audit](https://github.com/advisories/GHSA-5jgf-p345-68v8) |'
+    )
+  );
 });

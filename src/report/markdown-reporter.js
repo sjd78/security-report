@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import semver from 'semver';
 import { sortVulnerabilities } from '../core/blender.js';
 import { formatLockfileUpdate } from '../collectors/npm-audit.js';
 import { extractGhsaId } from '../collectors/advisories.js';
@@ -40,6 +41,54 @@ export function formatCves(v) {
   }
 
   return cves.map((c) => (c.startsWith('`') ? c : `\`${c}\``)).join('<br>');
+}
+
+export function formatTargetFix(v) {
+  const versions = [];
+  const seen = new Set();
+
+  const addVer = (ver) => {
+    if (!ver || typeof ver !== 'string') return;
+    const trimmed = ver.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      versions.push(trimmed);
+    }
+  };
+
+  if (Array.isArray(v.targetSafeVersions)) {
+    for (const ver of v.targetSafeVersions) addVer(ver);
+  }
+  if (Array.isArray(v.patchedVersions)) {
+    for (const ver of v.patchedVersions) addVer(ver);
+  }
+  if (Array.isArray(v.advisories)) {
+    for (const adv of v.advisories) {
+      if (Array.isArray(adv.patchedVersions)) {
+        for (const ver of adv.patchedVersions) addVer(ver);
+      }
+      if (Array.isArray(adv.targetSafeVersions)) {
+        for (const ver of adv.targetSafeVersions) addVer(ver);
+      }
+      if (adv.targetSafeVersion) addVer(adv.targetSafeVersion);
+    }
+  }
+  if (v.targetSafeVersion) addVer(v.targetSafeVersion);
+
+  if (versions.length === 0) {
+    return '_No fix_';
+  }
+
+  versions.sort((a, b) => {
+    const cleanA = semver.clean(a) || a;
+    const cleanB = semver.clean(b) || b;
+    const vA = semver.valid(cleanA);
+    const vB = semver.valid(cleanB);
+    if (vA && vB) return semver.compare(vA, vB);
+    return a.localeCompare(b);
+  });
+
+  return versions.map((ver) => (ver.startsWith('`') ? ver : `\`${ver}\``)).join('<br>');
 }
 
 export function formatSources(v) {
@@ -284,7 +333,7 @@ export function generateMarkdownReport(report) {
 
     for (const v of sortedVulns) {
       const typeLabel = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct' : 'Indirect (Transitive)'));
-      const targetFix = v.targetSafeVersion ? `\`${v.targetSafeVersion}\`` : '_No fix_';
+      const targetFix = formatTargetFix(v);
       const cves = formatCves(v);
       const sources = formatSources(v);
       lines.push(
@@ -339,7 +388,11 @@ export function generateMarkdownReport(report) {
           const advCve = adv.cve ? `\`${adv.cve}\` — ` : '';
           const advLink = adv.url ? `([Advisory](${adv.url}))` : '';
           const advJira = adv.sources?.jira?.ticketKey ? `([Jira ${adv.sources.jira.ticketKey}](${adv.sources.jira.url}))` : '';
-          lines.push(`- ${advCve}${advTitle} ${advLink} ${advJira}`);
+          const fixesList = Array.isArray(adv.patchedVersions) && adv.patchedVersions.length > 0
+            ? adv.patchedVersions
+            : (adv.targetSafeVersion ? [adv.targetSafeVersion] : []);
+          const fixesStr = fixesList.length > 0 ? ` [Fixes: ${fixesList.map((f) => `\`${f}\``).join(', ')}]` : '';
+          lines.push(`- ${advCve}${advTitle} ${advLink} ${advJira}${fixesStr}`);
         }
         lines.push(``);
       } else if (v.title) {

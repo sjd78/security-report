@@ -50,24 +50,60 @@ export function pickHighestSafeVersion(verA, verB) {
   }
   return verA || verB;
 }
+export function selectBestRemediationVersion(installedVersion, candidateVersions = []) {
+  if (!candidateVersions || candidateVersions.length === 0) return null;
+
+  const validCandidates = candidateVersions
+    .map((v) => semver.clean(String(v).replace(/^[~^]/, '')))
+    .filter(Boolean);
+
+  if (validCandidates.length === 0) return candidateVersions[0];
+
+  validCandidates.sort(semver.compare);
+
+  const cleanInstalled = semver.clean(String(installedVersion || '').replace(/^[~^]/, '').split(',')[0].trim());
+  if (cleanInstalled && semver.valid(cleanInstalled)) {
+    const installedMajor = semver.major(cleanInstalled);
+
+    // 1. Try to find highest candidate in the same major version line (non-breaking fix)
+    const sameMajorCandidates = validCandidates.filter((v) => semver.major(v) === installedMajor && semver.gte(v, cleanInstalled));
+    if (sameMajorCandidates.length > 0) {
+      return sameMajorCandidates[sameMajorCandidates.length - 1];
+    }
+
+    // 2. If no same-major fix available: find lowest safe version > installedVersion
+    const higherCandidates = validCandidates.filter((v) => semver.gt(v, cleanInstalled));
+    if (higherCandidates.length > 0) {
+      return higherCandidates[0];
+    }
+  }
+
+  // Fallback to highest available safe version
+  return validCandidates[validCandidates.length - 1];
+}
 
 export function calculateOptimalSafeVersion(installedVersion, advisories = []) {
   const candidateVersions = [];
 
   for (const adv of advisories) {
-    if (adv.targetSafeVersion) {
+    if (Array.isArray(adv.patchedVersions)) {
+      for (const pv of adv.patchedVersions) {
+        if (pv && !candidateVersions.includes(pv)) candidateVersions.push(pv);
+      }
+    }
+    if (Array.isArray(adv.targetSafeVersions)) {
+      for (const pv of adv.targetSafeVersions) {
+        if (pv && !candidateVersions.includes(pv)) candidateVersions.push(pv);
+      }
+    }
+    if (adv.targetSafeVersion && !candidateVersions.includes(adv.targetSafeVersion)) {
       candidateVersions.push(adv.targetSafeVersion);
     }
   }
 
   if (candidateVersions.length === 0) return null;
 
-  let highest = candidateVersions[0];
-  for (const candidate of candidateVersions) {
-    highest = pickHighestSafeVersion(highest, candidate);
-  }
-
-  return highest;
+  return selectBestRemediationVersion(installedVersion, candidateVersions);
 }
 
 export function matchJiraTicket(vuln, jiraTickets, branchName = null, branchMap = {}) {
@@ -147,6 +183,12 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         dependencyType: v.dependencyType || (v.isDirect ? 'Direct' : 'Indirect (Transitive)'),
         currentVersion: v.currentVersion || 'unknown',
         targetSafeVersion: v.targetSafeVersion || null,
+        patchedVersions: Array.isArray(v.patchedVersions) && v.patchedVersions.length > 0
+          ? [...v.patchedVersions]
+          : (Array.isArray(v.targetSafeVersions) ? [...v.targetSafeVersions] : (v.targetSafeVersion ? [v.targetSafeVersion] : [])),
+        targetSafeVersions: Array.isArray(v.targetSafeVersions) && v.targetSafeVersions.length > 0
+          ? [...v.targetSafeVersions]
+          : (Array.isArray(v.patchedVersions) ? [...v.patchedVersions] : (v.targetSafeVersion ? [v.targetSafeVersion] : [])),
         vulnerableVersionRange: v.vulnerableVersionRange || null,
         id: v.id,
         cve: v.cve || cves[0] || null,
@@ -220,6 +262,21 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
           if (!existing.cves.includes(c)) existing.cves.push(c);
         }
       }
+
+      // Collect patched versions
+      const existingPatched = existing.patchedVersions || existing.targetSafeVersions || [];
+      const newPatched = v.patchedVersions || v.targetSafeVersions || (v.targetSafeVersion ? [v.targetSafeVersion] : []);
+      for (const p of newPatched) {
+        if (p && !existingPatched.includes(p)) existingPatched.push(p);
+      }
+      existingPatched.sort((a, b) => {
+        const vA = semver.valid(a);
+        const vB = semver.valid(b);
+        if (vA && vB) return semver.compare(vA, vB);
+        return a.localeCompare(b);
+      });
+      existing.patchedVersions = existingPatched;
+      existing.targetSafeVersions = existingPatched;
 
       // 5. Merge workspace declarations
       existing.workspaceDeclarations = existing.workspaceDeclarations || [];
@@ -335,6 +392,28 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
 
   // Optimize target safe versions across all advisories for each package
   for (const pkg of packageMap.values()) {
+    // Consolidate all patched versions across all advisories
+    const allPatched = pkg.patchedVersions || [];
+    for (const adv of pkg.advisories || []) {
+      if (Array.isArray(adv.patchedVersions)) {
+        for (const pv of adv.patchedVersions) if (pv && !allPatched.includes(pv)) allPatched.push(pv);
+      }
+      if (Array.isArray(adv.targetSafeVersions)) {
+        for (const pv of adv.targetSafeVersions) if (pv && !allPatched.includes(pv)) allPatched.push(pv);
+      }
+      if (adv.targetSafeVersion && !allPatched.includes(adv.targetSafeVersion)) {
+        allPatched.push(adv.targetSafeVersion);
+      }
+    }
+    allPatched.sort((a, b) => {
+      const vA = semver.valid(a);
+      const vB = semver.valid(b);
+      if (vA && vB) return semver.compare(vA, vB);
+      return a.localeCompare(b);
+    });
+    pkg.patchedVersions = allPatched;
+    pkg.targetSafeVersions = allPatched;
+
     const optimalSafeVersion = calculateOptimalSafeVersion(pkg.currentVersion, pkg.advisories);
     if (optimalSafeVersion) {
       pkg.targetSafeVersion = optimalSafeVersion;
