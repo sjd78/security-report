@@ -98,7 +98,10 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
         }
 
         const audit = config.collectors.npmAudit
-          ? await collectNpmAudit(worktreeDir, branch)
+          ? await collectNpmAudit(worktreeDir, branch, {
+              githubToken: config.githubToken,
+              githubApiUrl: config.githubApiUrl,
+            })
           : { summary: { critical: 0, high: 0, moderate: 0, low: 0, total: 0 }, vulnerabilities: [] };
 
         return {

@@ -154,18 +154,20 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         title: v.title || `${v.packageName} vulnerability`,
         url: v.url || null,
         workspaceDeclarations: [...(v.workspaceDeclarations || [])],
-        advisories: [
-          {
-            id: v.id,
-            cve: v.cve || null,
-            title: v.title,
-            severity: v.severity,
-            url: v.url,
-            vulnerableVersionRange: v.vulnerableVersionRange,
-            targetSafeVersion: v.targetSafeVersion,
-            sources: v.sources,
-          },
-        ],
+        advisories: Array.isArray(v.advisories) && v.advisories.length > 0
+          ? [...v.advisories]
+          : [
+              {
+                id: v.id,
+                cve: v.cve || null,
+                title: v.title,
+                severity: v.severity,
+                url: v.url,
+                vulnerableVersionRange: v.vulnerableVersionRange,
+                targetSafeVersion: v.targetSafeVersion,
+                sources: v.sources,
+              },
+            ],
         dependencyPaths: [...(v.dependencyPaths || [])],
         directRoots: [...(v.directRoots || [])],
         sources: {
@@ -173,7 +175,11 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
           dependabotAlerts: v.sources?.dependabot ? [v.sources.dependabot] : (v.sources?.dependabotAlerts ? [...v.sources.dependabotAlerts] : []),
           jira: v.sources?.jira || null,
           dependabot: v.sources?.dependabot || null,
-          npmAudit: v.sources?.npmAudit || null,
+          npmAudit: v.sources?.npmAudit ? {
+            ...v.sources.npmAudit,
+            urls: v.sources.npmAudit.urls || (v.sources.npmAudit.url ? [v.sources.npmAudit.url] : []),
+            advisories: Array.isArray(v.sources.npmAudit.advisories) ? [...v.sources.npmAudit.advisories] : [],
+          } : null,
         },
         remediation: v.remediation ? { ...v.remediation } : null,
       });
@@ -223,17 +229,25 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         }
       }
 
-      // 6. Add advisory entry
-      existing.advisories.push({
-        id: v.id,
-        cve: v.cve || null,
-        title: v.title,
-        severity: v.severity,
-        url: v.url,
-        vulnerableVersionRange: v.vulnerableVersionRange,
-        targetSafeVersion: v.targetSafeVersion,
-        sources: v.sources,
-      });
+      // 6. Add advisory entry / entries
+      if (Array.isArray(v.advisories) && v.advisories.length > 0) {
+        for (const adv of v.advisories) {
+          if (!existing.advisories.some((ea) => (ea.id && ea.id === adv.id) || (ea.url && ea.url === adv.url))) {
+            existing.advisories.push(adv);
+          }
+        }
+      } else {
+        existing.advisories.push({
+          id: v.id,
+          cve: v.cve || null,
+          title: v.title,
+          severity: v.severity,
+          url: v.url,
+          vulnerableVersionRange: v.vulnerableVersionRange,
+          targetSafeVersion: v.targetSafeVersion,
+          sources: v.sources,
+        });
+      }
 
       // 7. Merge dependency paths
       for (const p of v.dependencyPaths || []) {
@@ -279,8 +293,33 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         }
       }
 
-      if (v.sources?.npmAudit && !existing.sources.npmAudit) {
-        existing.sources.npmAudit = v.sources.npmAudit;
+      if (v.sources?.npmAudit) {
+        if (!existing.sources.npmAudit) {
+          existing.sources.npmAudit = {
+            ...v.sources.npmAudit,
+            urls: v.sources.npmAudit.urls || (v.sources.npmAudit.url ? [v.sources.npmAudit.url] : []),
+            advisories: Array.isArray(v.sources.npmAudit.advisories) ? [...v.sources.npmAudit.advisories] : [],
+          };
+        } else {
+          const existingUrls = existing.sources.npmAudit.urls || (existing.sources.npmAudit.url ? [existing.sources.npmAudit.url] : []);
+          const newUrls = v.sources.npmAudit.urls || (v.sources.npmAudit.url ? [v.sources.npmAudit.url] : []);
+          for (const u of newUrls) {
+            if (u && !existingUrls.includes(u)) existingUrls.push(u);
+          }
+          existing.sources.npmAudit.urls = existingUrls;
+          if (!existing.sources.npmAudit.url && v.sources.npmAudit.url) {
+            existing.sources.npmAudit.url = v.sources.npmAudit.url;
+          }
+
+          if (Array.isArray(v.sources.npmAudit.advisories)) {
+            existing.sources.npmAudit.advisories = existing.sources.npmAudit.advisories || [];
+            for (const adv of v.sources.npmAudit.advisories) {
+              if (!existing.sources.npmAudit.advisories.some((ea) => (ea.advisoryId && ea.advisoryId === adv.advisoryId) || (ea.url && ea.url === adv.url))) {
+                existing.sources.npmAudit.advisories.push(adv);
+              }
+            }
+          }
+        }
       }
 
       // 11. Merge remediation plan

@@ -2,7 +2,7 @@ import semver from 'semver';
 
 export function extractGhsaId(text) {
   if (!text) return null;
-  const match = text.match(/GHSA-[2-9a-km-z]{4}-[2-9a-km-z]{4}-[2-9a-km-z]{4}/i) || text.match(/GHSA-[a-zA-Z0-9_-]{10,20}/i);
+  const match = text.match(/GHSA-[2-9a-km-z]{4}-[2-9a-km-z]{4}-[2-9a-km-z]{4}/i) || text.match(/GHSA-[a-zA-Z0-9_-]{4,25}/i);
   return match ? match[0].toUpperCase() : null;
 }
 

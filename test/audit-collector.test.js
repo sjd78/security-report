@@ -6,6 +6,7 @@ import {
   extractCveFromText,
   canBeResolvedInLockfile,
   parseAuditVulnerabilities,
+  resolveAuditAdvisories,
 } from '../src/collectors/npm-audit.js';
 import {
   extractDependencyChains,
@@ -171,7 +172,7 @@ test('generateJsonReport and generateMarkdownReport', () => {
   assert.ok(mdReport.includes('package-override'));
   assert.ok(mdReport.includes('npm update vuln-lib --package-lock-only'));
   assert.ok(mdReport.includes('| Package | Severity | Type | Current Version | Target Fix | CVEs | Sources |'));
-  assert.ok(mdReport.includes('| **`vuln-lib`** | **CRITICAL** | Indirect (Transitive) | `1.0.0` | `1.1.0` | `CVE-2023-9999` | npm audit |'));
+  assert.ok(mdReport.includes('| **`vuln-lib`** | **CRITICAL** | Indirect (Transitive) | `1.0.0` | `1.1.0` | `CVE-2023-9999` | [npm audit](https://github.com/advisories/GHSA-xxxx) |'));
 });
 
 test('generateMarkdownReport: table renders multiple CVEs and multiple sources with <br>', () => {
@@ -237,6 +238,24 @@ test('formatSources: formats npm audit, jira link, dependabot link, and multiple
   assert.equal(
     formatSources({ sources: { npmAudit: { advisoryId: '123' } } }),
     'npm audit'
+  );
+
+  // Standalone npm audit with GitHub advisory URL
+  assert.equal(
+    formatSources({ sources: { npmAudit: { advisoryId: 'GHSA-xxxx', url: 'https://github.com/advisories/GHSA-xxxx' } } }),
+    '[npm audit](https://github.com/advisories/GHSA-xxxx)'
+  );
+
+  // Standalone npm audit with multiple GitHub advisory URLs
+  assert.equal(
+    formatSources({
+      sources: {
+        npmAudit: {
+          urls: ['https://github.com/advisories/GHSA-1111', 'https://github.com/advisories/GHSA-2222'],
+        },
+      },
+    }),
+    '[npm audit (GHSA-1111)](https://github.com/advisories/GHSA-1111)<br>[npm audit (GHSA-2222)](https://github.com/advisories/GHSA-2222)'
   );
 
   // Default fallback to npm audit when no sources defined
@@ -318,7 +337,7 @@ test('formatCompactDependencyPaths: formats direct and transitive paths compactl
   assert.ok(compact.includes('client/package.json/dependencies/jest/.../js-yaml@3.15.1'));
 });
 
-test('parseAuditVulnerabilities: ignores intermediate packages and only includes packages with advisories', () => {
+test('parseAuditVulnerabilities: ignores intermediate packages and only includes packages with advisories', async () => {
   const auditJson = {
     vulnerabilities: {
       cookie: {
@@ -417,7 +436,7 @@ test('parseAuditVulnerabilities: ignores intermediate packages and only includes
     },
   };
 
-  const result = parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, null, null, 'main');
+  const result = await parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, null, null, 'main');
 
   // Exactly 2 vulnerabilities: cookie and other-direct-vuln (intermediate-lib and root-lib skipped)
   assert.equal(result.vulnerabilities.length, 2);
@@ -444,7 +463,7 @@ test('parseAuditVulnerabilities: ignores intermediate packages and only includes
   assert.equal(cookieVuln.directRoots[0].name, 'root-lib');
 });
 
-test('parseAuditVulnerabilities: retains package if it has both its own advisory and intermediate references in via', () => {
+test('parseAuditVulnerabilities: retains package if it has both its own advisory and intermediate references in via', async () => {
   const auditJson = {
     vulnerabilities: {
       'hybrid-lib': {
@@ -466,7 +485,104 @@ test('parseAuditVulnerabilities: retains package if it has both its own advisory
     },
   };
 
-  const result = parseAuditVulnerabilities(auditJson, { dependencies: { 'hybrid-lib': '^1.0.0' } }, { packages: { '': {} } });
+  const result = await parseAuditVulnerabilities(auditJson, { dependencies: { 'hybrid-lib': '^1.0.0' } }, { packages: { '': {} } });
   assert.equal(result.vulnerabilities.length, 1);
   assert.equal(result.vulnerabilities[0].packageName, 'hybrid-lib');
+});
+
+test('resolveAuditAdvisories: enriches npm audit vulnerability with CVE, target fix, and advisory URL', async () => {
+  const vulns = [
+    {
+      id: 'GHSA-test-1234',
+      packageName: 'demo-pkg',
+      severity: 'high',
+      currentVersion: '1.0.0',
+      targetSafeVersion: null,
+      cve: null,
+      cves: [],
+      url: 'https://github.com/advisories/GHSA-test-1234',
+      sources: {
+        npmAudit: {
+          advisoryId: 'GHSA-test-1234',
+          url: 'https://github.com/advisories/GHSA-test-1234',
+        },
+      },
+      remediation: {
+        strategy: 'bump-direct',
+        targetVersion: null,
+        packageJsonChanges: [{ package: 'demo-pkg', from: '^1.0.0', to: null }],
+      },
+    },
+  ];
+
+  const advisoryCache = new Map();
+  advisoryCache.set('GHSA-TEST-1234', Promise.resolve({
+    id: 'GHSA-test-1234',
+    ghsaId: 'GHSA-TEST-1234',
+    cve: 'CVE-2024-99999',
+    targetSafeVersion: '1.2.0',
+    url: 'https://github.com/advisories/GHSA-test-1234',
+  }));
+
+  await resolveAuditAdvisories(vulns, { advisoryCache });
+
+  assert.equal(vulns[0].cve, 'CVE-2024-99999');
+  assert.deepEqual(vulns[0].cves, ['CVE-2024-99999']);
+  assert.equal(vulns[0].targetSafeVersion, '1.2.0');
+  assert.equal(vulns[0].remediation.targetVersion, '1.2.0');
+  assert.equal(vulns[0].remediation.packageJsonChanges[0].to, '^1.2.0');
+
+  // Verify in Markdown report
+  const md = generateMarkdownReport({
+    branches: [{ branch: 'main', summary: { total: 1 }, vulnerabilities: vulns }],
+  });
+  assert.ok(md.includes('| **`demo-pkg`** | **HIGH** | Indirect (Transitive) | `1.0.0` | `1.2.0` | `CVE-2024-99999` | [npm audit](https://github.com/advisories/GHSA-test-1234) |'));
+});
+
+test('parseAuditVulnerabilities: automatically resolves and enriches CVE and target fix via options.advisoryCache', async () => {
+  const auditJson = {
+    vulnerabilities: {
+      cookie: {
+        name: 'cookie',
+        severity: 'low',
+        isDirect: true,
+        via: [
+          {
+            source: 1103907,
+            name: 'cookie',
+            title: 'cookie vulnerability',
+            url: 'https://github.com/advisories/GHSA-pxg6-pf52-xh8x',
+            severity: 'low',
+            range: '<0.7.0',
+          },
+        ],
+        range: '<0.7.0',
+        fixAvailable: false,
+      },
+    },
+  };
+
+  const advisoryCache = new Map();
+  advisoryCache.set('GHSA-PXG6-PF52-XH8X', Promise.resolve({
+    id: 'GHSA-pxg6-pf52-xh8x',
+    ghsaId: 'GHSA-PXG6-PF52-XH8X',
+    cve: 'CVE-2024-47764',
+    targetSafeVersion: '0.7.0',
+    url: 'https://github.com/advisories/GHSA-pxg6-pf52-xh8x',
+  }));
+
+  const pkgJson = { dependencies: { cookie: '0.4.0' } };
+  const pkgLock = { packages: { '': {}, 'node_modules/cookie': { version: '0.4.0' } } };
+
+  const result = await parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, null, null, 'main', { advisoryCache });
+  assert.equal(result.vulnerabilities.length, 1);
+  const cookie = result.vulnerabilities[0];
+  assert.equal(cookie.cve, 'CVE-2024-47764');
+  assert.equal(cookie.targetSafeVersion, '0.7.0');
+  assert.equal(cookie.sources.npmAudit.url, 'https://github.com/advisories/GHSA-pxg6-pf52-xh8x');
+
+  const md = generateMarkdownReport({
+    branches: [result],
+  });
+  assert.ok(md.includes('| **`cookie`** | **LOW** | Direct | `0.4.0` | `0.7.0` | `CVE-2024-47764` | [npm audit](https://github.com/advisories/GHSA-pxg6-pf52-xh8x) |'));
 });

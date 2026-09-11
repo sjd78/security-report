@@ -10,7 +10,8 @@ import {
   lookupPackageInstalledInfo,
   runNpmLs,
 } from '../core/dependency-graph.js';
-import { sortVulnerabilities } from '../core/blender.js';
+import { sortVulnerabilities, pickHighestSafeVersion } from '../core/blender.js';
+import { extractGhsaId, extractCveId, fetchAdvisoryDetails } from './advisories.js';
 const execFileAsync = promisify(execFile);
 
 export async function runNpmAuditRaw(cwd) {
@@ -236,7 +237,99 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
   };
 }
 
-export function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData = null, worktreeDir = null, branchName = 'main') {
+export async function resolveAuditAdvisories(vulnerabilities = [], options = {}) {
+  const { githubToken, githubApiUrl, advisoryCache = new Map() } = options;
+
+  await Promise.all(
+    vulnerabilities.map(async (v) => {
+      const lookupRefs = new Set();
+      if (v.sources?.npmAudit?.url) lookupRefs.add(v.sources.npmAudit.url);
+      if (Array.isArray(v.sources?.npmAudit?.urls)) {
+        for (const u of v.sources.npmAudit.urls) if (u) lookupRefs.add(u);
+      }
+      if (Array.isArray(v.advisories)) {
+        for (const adv of v.advisories) {
+          if (adv.url) lookupRefs.add(adv.url);
+          if (adv.ghsaId) lookupRefs.add(adv.ghsaId);
+          if (adv.id) lookupRefs.add(adv.id);
+        }
+      }
+      if (v.url) lookupRefs.add(v.url);
+      if (v.id) lookupRefs.add(v.id);
+
+      for (const ref of lookupRefs) {
+        const ghsaId = extractGhsaId(ref);
+        const cveId = extractCveId(ref);
+        const lookup = ghsaId || cveId;
+        if (!lookup) continue;
+
+        if (!advisoryCache.has(lookup)) {
+          const advPromise = fetchAdvisoryDetails(lookup, { githubToken, githubApiUrl });
+          advisoryCache.set(lookup, advPromise);
+        }
+
+        const details = await advisoryCache.get(lookup);
+        if (details) {
+          // 1. Populate CVE(s)
+          if (details.cve) {
+            if (!v.cves) v.cves = [];
+            if (!v.cves.includes(details.cve)) v.cves.push(details.cve);
+            if (!v.cve) v.cve = details.cve;
+          }
+
+          // 2. Populate targetSafeVersion
+          if (details.targetSafeVersion) {
+            v.targetSafeVersion = v.targetSafeVersion
+              ? pickHighestSafeVersion(v.targetSafeVersion, details.targetSafeVersion)
+              : details.targetSafeVersion;
+          }
+
+          // 3. Ensure advisory url is present
+          if (details.url) {
+            if (!v.url) v.url = details.url;
+            if (v.sources?.npmAudit) {
+              if (!v.sources.npmAudit.url) v.sources.npmAudit.url = details.url;
+              if (Array.isArray(v.sources.npmAudit.urls) && !v.sources.npmAudit.urls.includes(details.url)) {
+                v.sources.npmAudit.urls.push(details.url);
+              }
+            }
+          }
+
+          // 4. Update matching advisory in v.advisories
+          if (Array.isArray(v.advisories)) {
+            const matchedAdv = v.advisories.find(
+              (a) => (a.ghsaId && a.ghsaId === ghsaId) ||
+                     (a.id && (a.id === ghsaId || a.id === cveId)) ||
+                     (a.url && (extractGhsaId(a.url) === ghsaId || extractCveId(a.url) === cveId))
+            );
+            if (matchedAdv) {
+              if (details.cve && !matchedAdv.cve) matchedAdv.cve = details.cve;
+              if (details.targetSafeVersion && !matchedAdv.targetSafeVersion) matchedAdv.targetSafeVersion = details.targetSafeVersion;
+              if (details.url && !matchedAdv.url) matchedAdv.url = details.url;
+            }
+          }
+        }
+      }
+
+      // Synchronize remediation target version if safe version was resolved
+      if (v.targetSafeVersion && v.remediation) {
+        v.remediation.targetVersion = v.targetSafeVersion;
+        if (v.remediation.packageJsonChanges && v.remediation.packageJsonChanges.length > 0) {
+          for (const chg of v.remediation.packageJsonChanges) {
+            if (chg.package === v.packageName) {
+              const prefix = chg.from?.startsWith('~') ? '~' : chg.from?.startsWith('^') ? '^' : '';
+              chg.to = `${prefix}${v.targetSafeVersion}`;
+            }
+          }
+        }
+      }
+    })
+  );
+
+  return vulnerabilities;
+}
+
+export async function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData = null, worktreeDir = null, branchName = 'main', options = {}) {
   const directDeps = getDirectDependencies(pkgJson, worktreeDir);
   const vulnerabilities = [];
   const rawVulns = auditJson?.vulnerabilities || {};
@@ -262,13 +355,17 @@ export function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData
     let cwe = [];
     let cvss = null;
     const viaAdvisories = [];
-
     const cves = [];
+    const urls = [];
+
     for (const item of rawVias) {
       if (typeof item === 'object' && item !== null) {
         viaAdvisories.push(item);
         if (!advisoryId && item.source) advisoryId = String(item.source);
-        if (!url && item.url) url = item.url;
+        if (item.url) {
+          if (!url) url = item.url;
+          if (!urls.includes(item.url)) urls.push(item.url);
+        }
         if (!title || title === `${vulnData.name || pkgName} vulnerability`) title = item.title || title;
         if (item.cwe && Array.isArray(item.cwe)) cwe = item.cwe;
         if (item.cvss) cvss = item.cvss;
@@ -284,6 +381,29 @@ export function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData
     if (!advisoryId) {
       advisoryId = `AUDIT-${pkgName}-${vulnData.severity || 'vuln'}`;
     }
+
+    const parsedAdvisories = viaAdvisories.map((a) => {
+      const advGhsa = extractGhsaId(a.url) || extractGhsaId(String(a.source)) || extractGhsaId(a.title);
+      const advCve = extractCveId(a.url) || extractCveId(a.title) || extractCveFromText(a.url) || extractCveFromText(a.title) || (a.cve ? a.cve : null);
+      const advUrl = a.url || (advGhsa ? `https://github.com/advisories/${advGhsa}` : null);
+      return {
+        id: advGhsa || (a.source ? String(a.source) : advisoryId),
+        ghsaId: advGhsa,
+        cve: advCve,
+        title: a.title || title,
+        severity: a.severity || vulnData.severity || 'moderate',
+        url: advUrl,
+        vulnerableVersionRange: a.range || vulnData.range || null,
+        targetSafeVersion: null,
+        sources: {
+          npmAudit: {
+            advisoryId: String(a.source || advisoryId),
+            url: advUrl,
+            severity: a.severity || vulnData.severity,
+          },
+        },
+      };
+    });
 
     const chains = pkgInfo.chains.length > 0
       ? pkgInfo.chains
@@ -322,10 +442,13 @@ export function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData
       dependencyPaths,
       dependencyChains: chains,
       directRoots,
+      advisories: parsedAdvisories,
       sources: {
         npmAudit: {
           advisoryId,
           url,
+          urls,
+          advisories: parsedAdvisories,
           severity: vulnData.severity,
         },
       },
@@ -341,6 +464,9 @@ export function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData
     );
     vulnerabilities.push(vulnRecord);
   }
+
+  // Resolve advisory details (CVE, targetSafeVersion, GitHub Advisory URL) via GitHub / OSV
+  await resolveAuditAdvisories(vulnerabilities, options);
 
   vulnerabilities.sort(sortVulnerabilities);
 
@@ -359,7 +485,7 @@ export function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData
   };
 }
 
-export async function collectNpmAudit(worktreeDir, branchName = 'main') {
+export async function collectNpmAudit(worktreeDir, branchName = 'main', options = {}) {
   const [auditJson, npmLsData] = await Promise.all([
     runNpmAuditRaw(worktreeDir),
     runNpmLs(worktreeDir),
@@ -368,5 +494,5 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
   const pkgJson = readPackageJson(worktreeDir);
   const pkgLock = readPackageLock(worktreeDir);
 
-  return parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData, worktreeDir, branchName);
+  return parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData, worktreeDir, branchName, options);
 }

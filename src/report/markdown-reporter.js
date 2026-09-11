@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { sortVulnerabilities } from '../core/blender.js';
 import { formatLockfileUpdate } from '../collectors/npm-audit.js';
+import { extractGhsaId } from '../collectors/advisories.js';
 
 export function formatCves(v) {
   const cves = [];
@@ -64,9 +65,38 @@ export function formatSources(v) {
   );
 
   if (hasExplicitNpmAudit || (!hasOtherSources && (!v.sources || Object.keys(v.sources).length === 0))) {
-    addSource('npm audit');
-  }
+    const advisoryUrls = new Set();
+    if (v.sources?.npmAudit?.url) advisoryUrls.add(v.sources.npmAudit.url);
+    if (Array.isArray(v.sources?.npmAudit?.urls)) {
+      for (const u of v.sources.npmAudit.urls) if (u) advisoryUrls.add(u);
+    }
+    if (Array.isArray(v.sources?.npmAudit?.advisories)) {
+      for (const a of v.sources.npmAudit.advisories) if (a?.url) advisoryUrls.add(a.url);
+    }
+    if (Array.isArray(v.advisories)) {
+      for (const a of v.advisories) {
+        if (a?.url && (a.url.includes('github.com/advisories') || a.sources?.npmAudit)) {
+          advisoryUrls.add(a.url);
+        }
+      }
+    }
+    if (v.url && v.url.includes('github.com/advisories')) {
+      advisoryUrls.add(v.url);
+    }
 
+    const urlList = Array.from(advisoryUrls);
+    if (urlList.length === 0) {
+      addSource('npm audit');
+    } else if (urlList.length === 1) {
+      addSource(`[npm audit](${urlList[0]})`);
+    } else {
+      for (const u of urlList) {
+        const ghsa = extractGhsaId(u);
+        const label = ghsa ? `npm audit (${ghsa})` : 'npm audit';
+        addSource(`[${label}](${u})`);
+      }
+    }
+  }
   // 2. Jira ticket(s)
   if (v.sources?.jiraTickets && v.sources.jiraTickets.length > 0) {
     for (const jt of v.sources.jiraTickets) {
