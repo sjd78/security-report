@@ -11,8 +11,8 @@ Managing security vulnerabilities across large Node.js repositories is often fra
 `security-report` streamlines this into an automated 3-step pipeline:
 
 1. **Step 1: Aggregate & Analyze**
-   - Clones target repositories (GitHub `org/repo` format, URLs, or local folders) into an isolated `REPOS/` directory.
-   - Spins up detached `git worktree` instances per target branch to prevent workspace contamination.
+   - Resolves the target repository: `org/repo` shorthand and Git URLs are cloned into an isolated `REPOS/<org>/<name>` cache; a local path is used **in place** (nothing is copied into `REPOS/`).
+   - Detaches the base repository's `HEAD` — including local targets — so every branch name is free, then creates one `git worktree` per target branch, reset to the latest fetched `origin/<branch>` when that remote branch exists (otherwise the existing local branch is used, or a new one is created).
    - Runs `npm audit` and parses the full `npm ls` ancestor hierarchy to trace direct vs. indirect (transitive) dependency chains across root and **npm workspaces** (nested `package.json` files).
    - Cross-references findings with Jira CVE tickets (resolving attached GitHub Security Advisory links to extract affected ranges and patched versions) and GitHub Dependabot alerts.
    - Consolidates multiple CVEs and advisories per package to calculate the optimal safe version that resolves all flaws.
@@ -25,9 +25,10 @@ Managing security vulnerabilities across large Node.js repositories is often fra
    - **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), updates the lockfile directly without introducing unnecessary `package.json` overrides.
    - **`package-override`**: Fallback applied only when parent ranges strictly forbid the safe version and no direct parent update exists.
    - Performs atomic lockfile synchronization (`npm install --package-lock-only`, then `npm update <pkg> --package-lock-only` for each package that must move within existing ranges) and post-remediation audit verification.
+   - Without `--commit`, the branch worktree is **kept** and its path printed — it holds the only copy of the applied fix. A failed remediation also keeps its worktree for inspection.
 3. **Step 3: Structured Commit Generation & Publishing**
    - Generates conventional commit messages linking CVE IDs, GHSA identifiers, advisory URLs, Jira tickets, Dependabot alert numbers, and the exact dependency path.
-   - Stages and commits changes directly on the target branch worktrees with optional remote push.
+   - Stages the touched `package.json` files (root and workspaces) plus `package-lock.json`, commits on the target branch, and optionally pushes. The commit is guaranteed to advance `refs/heads/<branch>`; if the branch is held by another worktree the run aborts instead of stranding the commit.
 
 ---
 
@@ -71,7 +72,9 @@ sec-remediate fix facebook/react --branches main --commit --push
 
 ## 3. Configuration Variables
 
-Configuration can be provided via environment variables, CLI options, or a `.security-report.json` file in the working directory.
+Configuration is read from CLI options, environment variables, and a `.security-report.json` (or `security-report.config.json`) file in the working directory.
+
+Precedence is **CLI option > environment variable > config file**, except for `githubToken`, `jira.baseUrl`, `jira.email` and `jira.apiToken`, where an explicit config-file value takes precedence over the environment variable.
 
 | Variable | CLI Flag | Description | Default |
 | :--- | :--- | :--- | :--- |
@@ -89,6 +92,8 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
 | `JIRA_JQL` | `--jira-jql <query>` | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
 | `SEC_COLLECTORS` | `--collectors <list>` | Active collectors to run (`npm-audit`, `jira`, `dependabot`) | `npm-audit,jira,dependabot` |
 | `SEC_DEBUG` | `--debug` | Save raw collector outputs to `security-<name>-collection.json` | `false` |
+
+> **Note on Credentials:** `.security-report.json` holds API tokens and is listed in `.gitignore` — keep it untracked. The GitHub token is never written into a clone URL or `.git/config`: it is passed per git invocation via `GIT_CONFIG_*` and stripped from any git error message. Library callers can bypass config-file discovery entirely with `loadConfig({ noConfigFile: true })`; the test suite relies on this to stay hermetic.
 
 > **Note on Configuration Validation:** If the Jira collector is enabled but its configuration is incomplete (missing `JIRA_BASE_URL` or `JIRA_API_TOKEN`), the tool automatically disables the Jira collector, logs a warning notice, and continues scanning with the remaining active collectors without failing.
 
@@ -126,9 +131,9 @@ Configuration can be provided via environment variables, CLI options, or a `.sec
 
 ## 4. CLI Commands Reference
 
-### `sec-remediate scan [repo]` (or `sec-remediate report [repo]`)
+### `sec-remediate scan [repo]` (alias: `sec-remediate report [repo]`)
 
-Scans target repository across branches, blends vulnerability sources, and produces intermediate reports. If `[repo]` is omitted, the `repo` value from `.security-report.json` is used.
+Scans the target repository across branches, blends vulnerability sources, and produces the intermediate reports. If `[repo]` is omitted, the `repo` value from the config file (or `SEC_REPO`) is used. `report` is a true alias and accepts every option below.
 
 ```bash
 sec-remediate scan [repo] [options]
@@ -145,16 +150,18 @@ sec-remediate scan [repo] [options]
 - `--jira-api-token <token>`: Jira API token.
 - `--jira-project <project>`: Jira Project Key (default: `MTA`).
 - `--jira-jql <query>`: Custom JQL query for Jira ticket retrieval.
+- `--branch-map <mapping>`: Upstream branch to downstream version mapping (e.g. `main=8.3,release-0.11=8.2`).
 - `--collectors <list>`: Comma-separated list of collectors to enable (e.g. `jira` or `npm-audit,jira`).
 - `--no-npm-audit`: Disable npm audit collector.
 - `--no-jira`: Disable Jira collector.
 - `--no-dependabot`: Disable GitHub Dependabot collector.
 - `--debug`: Save intermediate collector outputs to `security-<name>-collection.json`.
+
 ---
 
 ### `sec-remediate fix [repo]` (or `sec-remediate remediate [repo]`)
 
-Applies remediations (`package.json` updates + lockfile updates), verifies resolution, and optionally creates Git commits. If `[repo]` is omitted, the `repo` value from `.security-report.json` is used.
+Runs a scan, then applies remediations (`package.json` updates, lockfile synchronization), verifies the result with a second `npm audit`, and optionally creates Git commits. If `[repo]` is omitted, the `repo` value from the config file (or `SEC_REPO`) is used.
 
 ```bash
 sec-remediate fix [repo] [options]
@@ -163,11 +170,13 @@ sec-remediate fix [repo] [options]
 **Options:**
 - `-b, --branches <branches>`: Comma-separated list of branches to remediate.
 - `--all-branches`: Remediate all branches found in the repository.
-- `--dry-run`: Preview changes and generated commit messages without writing to disk.
+- `--dry-run`: Print the changes and the generated commit message without touching `package.json` or the lockfile. The scan reports in `--reports-dir` are still written.
 - `--commit`: Create Git commits on the target branches with motivating links.
-- `--push`: Push created commits to the remote repository.
-- `--no-overrides`: Do not insert npm `overrides` into `package.json`.
-- All connection options (`--github-token`, `--jira-*`, `--repos-dir`, `--reports-dir`).
+- `--push`: Push created commits to the remote repository. Requires `--commit`; on its own it has no effect.
+- `--no-overrides`: Do not insert npm `overrides` into `package.json`; findings that only have an override strategy are left unremediated.
+- All connection and path options from `scan` (`--github-token`, `--jira-*`, `--branch-map`, `--repos-dir`, `--reports-dir`, `--collectors`, `--no-*`, `--debug`).
+
+Without `--commit` and without `--dry-run` the changes are applied and the worktree is retained; the path is printed so the result can be reviewed and committed by hand.
 
 ---
 
@@ -176,21 +185,21 @@ sec-remediate fix [repo] [options]
 When running with `--commit`, the engine creates structured commit messages:
 
 ```text
-fix(deps): remediate 2 vulnerabilities on branch main
+fix(deps): remediate 2 vulnerable packages on branch main
 
 Automated security remediation applied based on aggregated audit findings.
 
-### Resolved Vulnerabilities:
+### Resolved Packages & Security Advisories:
 - [HIGH] tough-cookie (2.5.0 -> 4.1.3) (CVE-2023-26136)
   - Title: Prototype Pollution in tough-cookie
   - Advisory: https://github.com/advisories/GHSA-72xf-g2v4-qvf3
-  - Jira: SEC-1042 (https://company.atlassian.net/browse/SEC-1042)
+  - Jira: MTA-7680 (https://issues.example.com/browse/MTA-7680)
   - Dependabot: #42 (https://github.com/org/repo/security/dependabot/42)
-  - Chain: request-lib@1.2.0 -> sub-dep@0.4.1 -> tough-cookie@2.5.0
+  - Chain: package.json/dependencies/request-lib/.../tough-cookie@2.5.0
 - [CRITICAL] lodash (4.17.15 -> 4.17.21) (CVE-2021-23337)
   - Title: Command Injection in lodash
   - Advisory: https://github.com/advisories/GHSA-35jh-r3h4-6jhm
-  - Chain: lodash@4.17.15
+  - Chain: package.json/dependencies/lodash@4.17.15
 
 ### Changes Applied:
 - Updated lodash ^4.17.15 -> ^4.17.21 in dependencies
@@ -208,4 +217,6 @@ Verification: Post-remediation npm audit scan reported 0 remaining vulnerabiliti
 npm test
 ```
 
-Runs the complete unit and integration test suite using Node.js native `node:test` runner.
+Runs the complete unit and integration suite on Node's native `node:test` runner (no external test framework). `git` and `npm` must be on `PATH`; the integration test creates throwaway repositories under the system temp directory.
+
+The suite is hermetic: every test that touches `loadConfig` passes `noConfigFile: true`, so a `.security-report.json` in the working directory is never read and no credential ever leaves the machine during a test run.

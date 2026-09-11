@@ -19,14 +19,14 @@ This project unifies all three sources across multiple Git branches in a single 
 ```mermaid
 flowchart TD
     subgraph RepoManager [Git & Worktree Manager]
-        Spec[Target Spec: org/name or URL] --> Clone[Clone / Sync to REPOS/org/name]
+        Spec[Target Spec: org/name, URL, or local path] --> Clone[Clone to REPOS/org/name, or use local path in place]
         Clone --> WT1[Branch Worktree: main]
         Clone --> WT2[Branch Worktree: release/1.0]
     end
 
     subgraph Collectors [Vulnerability Collectors]
         WT1 & WT2 --> Audit[npm audit + dependency chain tracer]
-        Jira[Jira REST Client v2/v3] --> Blend[Vulnerability Blender]
+        Jira[Jira Cloud REST Client v3] --> Blend[Vulnerability Blender]
         GH[GitHub Dependabot REST Client] --> Blend
         Audit --> Blend
     end
@@ -38,7 +38,7 @@ flowchart TD
 
     subgraph RemediationEngine [Step 2: Remediation Engine]
         JSONReport --> PkgUpdater[package.json Semver & Override Updater]
-        PkgUpdater --> LockUpdater[npm install --package-lock-only]
+        PkgUpdater --> LockUpdater[npm install --package-lock-only, then npm update per lockfileUpdates entry]
         LockUpdater --> Verify[Post-remediation npm audit verification]
     end
 
@@ -56,32 +56,35 @@ flowchart TD
 ```
 security-report/
 ├── package.json               # Node.js ESM configuration & dependencies (commander, semver)
-├── agent.md                   # System design rationale and architecture documentation
+├── README.md                  # User-facing usage, configuration, and CLI reference
+├── AGENTS.md                  # System design rationale and architecture documentation
+├── .gitignore                 # Excludes REPOS/, reports/, .worktrees/ and .security-report.json
 ├── bin/
 │   └── sec-remediate.js       # CLI executable entrypoint (chmod +x)
 ├── src/
 │   ├── index.js               # Core library orchestrator (scanRepository, remediateRepository)
-│   ├── cli.js                 # Commander CLI definitions (scan, fix, report)
+│   ├── cli.js                 # Commander CLI definitions (scan/report, fix/remediate)
 │   ├── config.js              # Configuration loader (env vars, config files, CLI options)
 │   ├── core/
-│   │   ├── git-manager.js     # Repository cloning to REPOS/, worktree lifecycle & commit management
+│   │   ├── git-manager.js     # Clone/fetch, credential-free auth, worktree lifecycle & branch commits
 │   │   ├── dependency-graph.js# Ancestor chain resolution (direct vs. transitive hierarchy)
 │   │   ├── blender.js         # Tri-source blending (npm audit + Jira CVEs + Dependabot alerts)
 │   │   ├── remediator.js      # package.json and package-lock.json update & verification engine
 │   │   └── commit-generator.js# Formats commit messages with CVE, Jira, Dependabot & chain metadata
 │   ├── collectors/
-│   │   ├── npm-audit.js       # Executes npm audit --json and extracts findings
-│   │   ├── jira.js            # Pure JS deterministic Atlassian Jira REST client
-│   │   └── dependabot.js      # Pure JS GitHub Dependabot Alerts REST client
+│   │   ├── npm-audit.js       # npm audit --json, findings extraction & remediation strategy builder
+│   │   ├── jira.js            # Pure JS deterministic Atlassian Jira Cloud REST client
+│   │   ├── dependabot.js      # Pure JS GitHub Dependabot Alerts REST client
+│   │   └── advisories.js      # GHSA/CVE resolution via GitHub Advisory API with OSV fallback
 │   └── report/
 │       ├── json-reporter.js   # Intermediate JSON report generator
 │       └── markdown-reporter.js # Human-readable Markdown summary generator
 └── test/
-    ├── git-manager.test.js    # Unit tests for repo spec parsing and worktrees
-    ├── audit-collector.test.js# Unit tests for audit parsing, chain tracing & reporting
-    ├── remediator.test.js     # Unit tests for package.json modification and indentation preservation
-    ├── external-collectors.test.js # Unit tests for Jira/Dependabot parsing and blending
-    └── integration.test.js    # End-to-end multi-branch scan, report, and remediation test
+    ├── git-manager.test.js    # Repo spec parsing, credential redaction, worktree & branch-commit behaviour
+    ├── audit-collector.test.js# Audit parsing, chain tracing, remediation strategies & reporting
+    ├── remediator.test.js     # package.json modification, change de-duplication and overrides handling
+    ├── external-collectors.test.js # Jira/Dependabot parsing, blending and configuration loading
+    └── integration.test.js    # End-to-end multi-branch scan, report, and commit creation
 ```
 
 ---
@@ -96,18 +99,21 @@ security-report/
   3. **Base Detachment & Branch Commits**: Base repositories — including repositories targeted by a local path — are detached (`git checkout --detach`, logged when it happens) so all branch names remain available for worktrees and no commit can land on a detached worktree HEAD. Worktree commits therefore advance `refs/heads/<branch>` directly; when they cannot (branch held by another worktree), `stageAndCommit` performs a compare-and-swap `git update-ref refs/heads/<branch> <new> <old>` or aborts with the holding worktree's path rather than stranding the commit.
   4. **Worktree Retention**: `withWorktree` removes the worktree only after the callback succeeds. `sec-remediate fix` without `--commit` keeps it and prints its path, because it is the only copy of the applied fix; a failed callback keeps it too.
 
-### B. Direct vs. Indirect Ancestor Chain Resolution & 4-Tier Remediation Strategy
+### B. Direct vs. Indirect Ancestor Chain Resolution & 5-Tier Remediation Strategy
 - **Problem**: `npm audit` reports hoisted paths (e.g. `node_modules/@xmldom/xmldom`), obscuring the logical parent (e.g. `msw -> @mswjs/interceptors -> @xmldom/xmldom`).
-- **Solution**: `src/core/dependency-graph.js` combines `npm ls --all --json` traversal and reverse graph backtracking over `package-lock.json` packages to reconstruct the complete logical ancestry tree down to root `package.json` dependencies.
-- **4-Tier Remediation Strategy**:
+- **Solution**: `src/core/dependency-graph.js` combines `npm ls --all --json` traversal and reverse graph backtracking over `package-lock.json` packages to reconstruct the complete logical ancestry tree down to root `package.json` dependencies. Strategy selection itself lives in `buildRemediationSuggestion` (`src/collectors/npm-audit.js`), with per-package consolidation in `src/core/blender.js`.
+- **5-Tier Remediation Strategy** (first match wins):
   1. **`bump-direct`**: Directly updates `package.json` if the package is declared in `dependencies`/`devDependencies`.
-  2. **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an updated version available that pulls in the safe dependency, updates the direct parent in `package.json`.
-  3. **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), re-resolves the package inside the lockfile via `npm update <pkg> --package-lock-only` without adding unnecessary `package.json` overrides. `npm install <pkg>@<version>` is deliberately not used: it would also add the transitive package to the root `package.json`.
-  4. **`package-override`**: Fallback applied if and only if parent ranges strictly forbid the safe version and no direct parent bump is available.
+  2. **`bump-direct-and-lockfile`**: Same as above when the package is *also* pulled in transitively (`Direct & Indirect`); the package.json bump is paired with a lockfile re-resolution for the remaining instances. See section H.
+  3. **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an updated version available that pulls in the safe dependency, updates the direct parent in `package.json`.
+  4. **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), re-resolves the package inside the lockfile via `npm update <pkg> --package-lock-only` without adding unnecessary `package.json` overrides. `npm install <pkg>@<version>` is deliberately not used: it would also add the transitive package to the root `package.json`.
+  5. **`package-override`**: Fallback applied if and only if parent ranges strictly forbid the safe version and no direct parent bump is available.
+
+Every strategy carries `packageJsonChanges` (file-scoped semver edits) and `lockfileUpdates` (package names to re-resolve). `remediateBranch` de-duplicates both across findings — for a package targeted by several advisories, the highest requested version wins.
 
 ### C. Deterministic JS Clients & Automatic Configuration Validation
 - **Decision**: Uses native Node.js `fetch` and ESM modules for Jira and Dependabot REST communication rather than external runtime dependencies or MCP bridges.
-- **Jira Integration**: Supports Basic Auth (`email` + `apiToken`) and Personal Access Tokens (PAT Bearer auth) against Jira Cloud (v3) and Jira Server/Data Center (v2).
+- **Jira Integration**: Targets Jira Cloud's `/rest/api/3` endpoints only (a `POST /search/jql` fallback covers the removal of the GET form); Jira Server / Data Center `/rest/api/2` is **not** supported. Authenticates with Basic Auth (`email` + `apiToken`) or a Personal Access Token (Bearer).
 - **Graceful Degradation**: If the Jira collector is enabled but its configuration is incomplete (missing `baseUrl` or `apiToken`), the tool automatically disables the Jira collector, logs an informative notice, and continues scanning with remaining enabled collectors without crashing.
 - **Dependabot Integration**: Uses GitHub REST API (`/repos/{owner}/{repo}/dependabot/alerts`) with bearer token authentication.
 - **Credential Handling**: `GITHUB_TOKEN` is never embedded in a clone URL. `parseRepoSpec` always produces a credential-free remote; `gitAuthEnv` passes `Authorization: Basic <base64(x-access-token:TOKEN)>` per invocation through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`, so the token reaches neither `argv` (visible via `ps`) nor `.git/config`. Every `execGit` failure message is passed through `redactCredentials` before it is thrown or logged.
@@ -161,6 +167,8 @@ security-report/
 
 ## 5. Configuration & Environment Variables
 
+Sources are merged as **CLI option > environment variable > config file** (`.security-report.json`, else `security-report.config.json`, discovered in the working directory). The four credential fields — `githubToken`, `jira.baseUrl`, `jira.email`, `jira.apiToken` — invert the last two: an explicit config-file value wins over the environment. Library callers pass `noConfigFile: true` to skip file discovery entirely.
+
 | Variable | CLI Flag / Field | Description | Default |
 | :--- | :--- | :--- | :--- |
 | `SEC_REPO` | `repo` / `[repo]` | Target repository specifier (`org/repo`, URL, or local path) | `null` |
@@ -169,6 +177,7 @@ security-report/
 | `SEC_BRANCH_MAP` | `--branch-map` | Upstream branch to downstream version translation table | Built-in MTA map |
 | `GITHUB_TOKEN` | `--github-token` | GitHub API Token for Dependabot and private clones | `""` |
 | `GITHUB_API_URL` | — | Base URL for GitHub API (Enterprise support) | `https://api.github.com` |
+| `GIT_PROTOCOL` | `gitProtocol` (field) | Clone protocol for `org/repo` shorthand (`https` or `ssh`) | `https` |
 | `JIRA_BASE_URL` | `--jira-base-url` | Atlassian Jira instance URL | `""` |
 | `JIRA_EMAIL` | `--jira-email` | Jira user email (for Basic Auth) | `""` |
 | `JIRA_API_TOKEN` | `--jira-api-token` | Jira API Token or PAT | `""` |
@@ -176,6 +185,7 @@ security-report/
 | `JIRA_JQL` | `--jira-jql` | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
 | `SEC_COLLECTORS` | `--collectors` | Comma-separated active collectors (`npm-audit`, `jira`, `dependabot`) | `npm-audit,jira,dependabot` |
 | `SEC_DEBUG` | `--debug` | Save raw collector outputs to `security-<name>-collection.json` | `false` |
+| — | `allowOverrides` (field) / `--no-overrides` | Allow writing npm `overrides` into the root `package.json` | `true` |
 
 ---
 
@@ -194,7 +204,8 @@ sec-remediate scan --collectors npm-audit
 # 4. Run with specific disabled collectors
 sec-remediate scan --no-dependabot
 
-# 5. Dry-run remediation: preview changes and commit message without disk edits
+# 5. Dry-run remediation: preview package.json/lockfile changes and the commit message
+#    (reports are still written to --reports-dir)
 sec-remediate fix --dry-run
 
 # 6. Apply remediation and create Git commits on each branch (Step 2 & Step 3)
@@ -202,15 +213,21 @@ sec-remediate fix --commit
 
 # 7. Apply remediation, commit, and push to remote
 sec-remediate fix --commit --push
+
+# 8. Apply remediation without committing: the branch worktree is retained for review
+sec-remediate fix
 ```
 
 ---
 
 ## 7. Testing & Verification Strategy
 
-The test suite runs via native `node --test` with zero external test runners:
-- `test/git-manager.test.js`: Validates URL parsing, local directory handling, and worktree creation/cleanup.
-- `test/audit-collector.test.js`: Validates safe version determination, CVE extraction, ancestor chain reconstruction, and report generation.
-- `test/remediator.test.js`: Validates indentation preservation, direct updates, and `overrides` additions.
-- `test/external-collectors.test.js`: Validates Jira issue parsing, Dependabot alert parsing, and source blending.
-- `test/integration.test.js`: Simulates a multi-branch repository lifecycle (scan, report, remediation, and commit creation).
+The test suite runs via native `node --test` with zero external test runners and zero network access — every test that reaches `loadConfig` passes `noConfigFile: true`, so a developer's `.security-report.json` credentials are never read or transmitted. `git` and `npm` must be available on `PATH`.
+
+- `test/git-manager.test.js`: Repo spec parsing, absence of credentials in clone URLs, `execGit` error redaction, worktree creation/retention, and that worktree commits advance `refs/heads/<branch>` (and abort when the branch is held elsewhere).
+- `test/audit-collector.test.js`: Safe version determination, CVE extraction, ancestor chain reconstruction, remediation strategy construction, and JSON/Markdown report generation.
+- `test/remediator.test.js`: Indentation detection, direct and workspace `package.json` updates, `overrides` handling including `allowOverrides: false`, and change de-duplication (highest version wins).
+- `test/external-collectors.test.js`: Jira issue parsing, Dependabot alert parsing, branch grouping, blending, and configuration loading (collector auto-disable, `--no-overrides`, config-file isolation).
+- `test/integration.test.js`: End-to-end multi-branch scan and report generation on a throwaway repository, followed by a dry-run remediation and a real commit whose branch ref is asserted.
+
+Behaviour that the suite deliberately does not cover — live `npm install`/`npm update` execution and network collectors — is verified manually against a scratch repository before release.

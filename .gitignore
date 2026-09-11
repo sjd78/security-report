@@ -1,5 +1,6 @@
 node_modules/
 REPOS/
+report-*
 reports/
 .worktrees/
 *.log
