@@ -236,30 +236,28 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
   };
 }
 
-export async function collectNpmAudit(worktreeDir, branchName = 'main') {
-  const [auditJson, npmLsData] = await Promise.all([
-    runNpmAuditRaw(worktreeDir),
-    runNpmLs(worktreeDir),
-  ]);
-
-  const pkgJson = readPackageJson(worktreeDir);
-  const pkgLock = readPackageLock(worktreeDir);
+export function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData = null, worktreeDir = null, branchName = 'main') {
   const directDeps = getDirectDependencies(pkgJson, worktreeDir);
-
   const vulnerabilities = [];
-  const rawVulns = auditJson.vulnerabilities || {};
+  const rawVulns = auditJson?.vulnerabilities || {};
 
   for (const [pkgName, vulnData] of Object.entries(rawVulns)) {
+    const rawVias = Array.isArray(vulnData.via) ? vulnData.via : [];
+
+    // Filter out purely intermediate packages in dependency chains (they only contain string references to vulnerable packages)
+    const hasAdvisory = rawVias.some((item) => typeof item === 'object' && item !== null);
+    if (rawVias.length > 0 && !hasAdvisory) {
+      continue;
+    }
+
     const pkgInfo = lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData, worktreeDir);
     const isDirect = pkgInfo.isDirect || Boolean(vulnData.isDirect);
     const isIndirect = pkgInfo.isIndirect || !isDirect;
     const dependencyType = pkgInfo.dependencyType !== 'Unknown' ? pkgInfo.dependencyType : (isDirect ? 'Direct' : 'Indirect (Transitive)');
 
-    const rawVias = vulnData.via || [];
-
     let advisoryId = null;
     let cve = null;
-    let title = `${vulnData.name} vulnerability`;
+    let title = `${vulnData.name || pkgName} vulnerability`;
     let url = null;
     let cwe = [];
     let cvss = null;
@@ -271,7 +269,7 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
         viaAdvisories.push(item);
         if (!advisoryId && item.source) advisoryId = String(item.source);
         if (!url && item.url) url = item.url;
-        if (!title || title === `${vulnData.name} vulnerability`) title = item.title || title;
+        if (!title || title === `${vulnData.name || pkgName} vulnerability`) title = item.title || title;
         if (item.cwe && Array.isArray(item.cwe)) cwe = item.cwe;
         if (item.cvss) cvss = item.cvss;
 
@@ -346,7 +344,7 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
 
   vulnerabilities.sort(sortVulnerabilities);
 
-  const summary = auditJson.metadata?.vulnerabilities || {
+  const summary = {
     critical: vulnerabilities.filter((v) => v.severity === 'critical').length,
     high: vulnerabilities.filter((v) => v.severity === 'high').length,
     moderate: vulnerabilities.filter((v) => v.severity === 'moderate').length,
@@ -359,4 +357,16 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
     summary,
     vulnerabilities,
   };
+}
+
+export async function collectNpmAudit(worktreeDir, branchName = 'main') {
+  const [auditJson, npmLsData] = await Promise.all([
+    runNpmAuditRaw(worktreeDir),
+    runNpmLs(worktreeDir),
+  ]);
+
+  const pkgJson = readPackageJson(worktreeDir);
+  const pkgLock = readPackageLock(worktreeDir);
+
+  return parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npmLsData, worktreeDir, branchName);
 }

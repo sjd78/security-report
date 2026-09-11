@@ -5,6 +5,7 @@ import {
   buildRemediationSuggestion,
   extractCveFromText,
   canBeResolvedInLockfile,
+  parseAuditVulnerabilities,
 } from '../src/collectors/npm-audit.js';
 import {
   extractDependencyChains,
@@ -315,4 +316,157 @@ test('formatCompactDependencyPaths: formats direct and transitive paths compactl
   assert.ok(compact.includes('cypress/package.json/devDependencies/js-yaml@^4.3.0'));
   assert.ok(compact.includes('package.json/devDependencies/eslint/.../js-yaml@3.15.1'));
   assert.ok(compact.includes('client/package.json/dependencies/jest/.../js-yaml@3.15.1'));
+});
+
+test('parseAuditVulnerabilities: ignores intermediate packages and only includes packages with advisories', () => {
+  const auditJson = {
+    vulnerabilities: {
+      cookie: {
+        name: 'cookie',
+        severity: 'low',
+        isDirect: false,
+        via: [
+          {
+            source: 1095000,
+            name: 'cookie',
+            dependency: 'cookie',
+            title: 'Cookie vulnerability',
+            url: 'https://github.com/advisories/GHSA-cookie',
+            severity: 'low',
+            cve: 'CVE-2024-1234',
+            range: '< 0.5.0',
+          },
+        ],
+        range: '< 0.5.0',
+        nodes: ['node_modules/intermediate-lib/node_modules/cookie'],
+        fixAvailable: false,
+      },
+      'intermediate-lib': {
+        name: 'intermediate-lib',
+        severity: 'low',
+        isDirect: false,
+        via: ['cookie'],
+        range: '>=1.0.0',
+        nodes: ['node_modules/intermediate-lib'],
+        fixAvailable: false,
+      },
+      'root-lib': {
+        name: 'root-lib',
+        severity: 'low',
+        isDirect: true,
+        via: ['intermediate-lib'],
+        range: '>=1.0.0',
+        nodes: ['node_modules/root-lib'],
+        fixAvailable: false,
+      },
+      'other-direct-vuln': {
+        name: 'other-direct-vuln',
+        severity: 'high',
+        isDirect: true,
+        via: [
+          {
+            source: 1096000,
+            name: 'other-direct-vuln',
+            dependency: 'other-direct-vuln',
+            title: 'Other direct flaw',
+            url: 'https://github.com/advisories/GHSA-other',
+            severity: 'high',
+            range: '< 2.1.0',
+          },
+        ],
+        range: '< 2.1.0',
+        nodes: ['node_modules/other-direct-vuln'],
+        fixAvailable: true,
+      },
+    },
+  };
+
+  const pkgJson = {
+    dependencies: {
+      'root-lib': '^1.0.0',
+      'other-direct-vuln': '^2.0.0',
+    },
+  };
+
+  const pkgLock = {
+    packages: {
+      '': {
+        dependencies: {
+          'root-lib': '^1.0.0',
+          'other-direct-vuln': '^2.0.0',
+        },
+      },
+      'node_modules/root-lib': {
+        version: '1.0.0',
+        dependencies: {
+          'intermediate-lib': '^1.0.0',
+        },
+      },
+      'node_modules/intermediate-lib': {
+        version: '1.0.0',
+        dependencies: {
+          cookie: '^0.4.0',
+        },
+      },
+      'node_modules/cookie': {
+        version: '0.4.0',
+      },
+      'node_modules/other-direct-vuln': {
+        version: '2.0.0',
+      },
+    },
+  };
+
+  const result = parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, null, null, 'main');
+
+  // Exactly 2 vulnerabilities: cookie and other-direct-vuln (intermediate-lib and root-lib skipped)
+  assert.equal(result.vulnerabilities.length, 2);
+  const pkgNames = result.vulnerabilities.map((v) => v.packageName);
+  assert.ok(pkgNames.includes('cookie'));
+  assert.ok(pkgNames.includes('other-direct-vuln'));
+  assert.ok(!pkgNames.includes('intermediate-lib'));
+  assert.ok(!pkgNames.includes('root-lib'));
+
+  // Summary reflects only the real vulnerabilities
+  assert.equal(result.summary.total, 2);
+  assert.equal(result.summary.high, 1);
+  assert.equal(result.summary.low, 1);
+
+  // The leaf vulnerability retains its ancestor chain through the intermediate packages
+  const cookieVuln = result.vulnerabilities.find((v) => v.packageName === 'cookie');
+  assert.ok(cookieVuln);
+  assert.equal(cookieVuln.cve, 'CVE-2024-1234');
+  assert.ok(cookieVuln.dependencyPaths.length > 0);
+  assert.ok(cookieVuln.dependencyPaths[0].includes('root-lib'));
+  assert.ok(cookieVuln.dependencyPaths[0].includes('intermediate-lib'));
+  assert.ok(cookieVuln.dependencyPaths[0].includes('cookie'));
+  assert.equal(cookieVuln.directRoots.length, 1);
+  assert.equal(cookieVuln.directRoots[0].name, 'root-lib');
+});
+
+test('parseAuditVulnerabilities: retains package if it has both its own advisory and intermediate references in via', () => {
+  const auditJson = {
+    vulnerabilities: {
+      'hybrid-lib': {
+        name: 'hybrid-lib',
+        severity: 'moderate',
+        isDirect: true,
+        via: [
+          {
+            source: 999999,
+            name: 'hybrid-lib',
+            dependency: 'hybrid-lib',
+            title: 'Hybrid vulnerability',
+            url: 'https://github.com/advisories/GHSA-hybrid',
+            severity: 'moderate',
+          },
+          'child-lib',
+        ],
+      },
+    },
+  };
+
+  const result = parseAuditVulnerabilities(auditJson, { dependencies: { 'hybrid-lib': '^1.0.0' } }, { packages: { '': {} } });
+  assert.equal(result.vulnerabilities.length, 1);
+  assert.equal(result.vulnerabilities[0].packageName, 'hybrid-lib');
 });
