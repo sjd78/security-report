@@ -177,7 +177,6 @@ export function loadConfig(options = {}) {
     jira,
     branchMap: parseBranchMap(rawBranchMap),
     defaultBranches: options.branches || fileConfig.branches || ['main'],
-    semverUpdateType: options.semverUpdateType || fileConfig.semverUpdateType || 'minor',
     // `--no-overrides` reaches us as options.overrides === false (commander negation).
     allowOverrides: options.overrides === false
       ? false

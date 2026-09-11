@@ -169,8 +169,8 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         dependencyPaths: [...(v.dependencyPaths || [])],
         directRoots: [...(v.directRoots || [])],
         sources: {
-          jiraTickets: v.sources?.jira ? [v.sources.jira] : [],
-          dependabotAlerts: v.sources?.dependabot ? [v.sources.dependabot] : [],
+          jiraTickets: v.sources?.jira ? [v.sources.jira] : (v.sources?.jiraTickets ? [...v.sources.jiraTickets] : []),
+          dependabotAlerts: v.sources?.dependabot ? [v.sources.dependabot] : (v.sources?.dependabotAlerts ? [...v.sources.dependabotAlerts] : []),
           jira: v.sources?.jira || null,
           dependabot: v.sources?.dependabot || null,
           npmAudit: v.sources?.npmAudit || null,
@@ -256,6 +256,13 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         }
         if (!existing.sources.jira) existing.sources.jira = v.sources.jira;
       }
+      if (v.sources?.jiraTickets) {
+        for (const t of v.sources.jiraTickets) {
+          if (!existing.sources.jiraTickets.some((et) => et.ticketKey === t.ticketKey)) {
+            existing.sources.jiraTickets.push(t);
+          }
+        }
+      }
 
       // 10. Merge Dependabot alerts
       if (v.sources?.dependabot) {
@@ -263,6 +270,17 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
           existing.sources.dependabotAlerts.push(v.sources.dependabot);
         }
         if (!existing.sources.dependabot) existing.sources.dependabot = v.sources.dependabot;
+      }
+      if (v.sources?.dependabotAlerts) {
+        for (const a of v.sources.dependabotAlerts) {
+          if (!existing.sources.dependabotAlerts.some((ea) => ea.alertNumber === a.alertNumber)) {
+            existing.sources.dependabotAlerts.push(a);
+          }
+        }
+      }
+
+      if (v.sources?.npmAudit && !existing.sources.npmAudit) {
+        existing.sources.npmAudit = v.sources.npmAudit;
       }
 
       // 11. Merge remediation plan

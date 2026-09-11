@@ -3,6 +3,100 @@ import fs from 'node:fs';
 import { sortVulnerabilities } from '../core/blender.js';
 import { formatLockfileUpdate } from '../collectors/npm-audit.js';
 
+export function formatCves(v) {
+  const cves = [];
+  const seen = new Set();
+
+  const addCve = (c) => {
+    if (!c || typeof c !== 'string') return;
+    const trimmed = c.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      cves.push(trimmed);
+    }
+  };
+
+  if (Array.isArray(v.cves)) {
+    for (const c of v.cves) addCve(c);
+  }
+  if (v.cve) addCve(v.cve);
+
+  if (Array.isArray(v.advisories)) {
+    for (const adv of v.advisories) {
+      if (adv.cve) addCve(adv.cve);
+      if (Array.isArray(adv.cves)) {
+        for (const c of adv.cves) addCve(c);
+      }
+    }
+  }
+
+  if (cves.length === 0 && v.id && typeof v.id === 'string' && v.id.startsWith('CVE-')) {
+    addCve(v.id);
+  }
+
+  if (cves.length === 0) {
+    return '_None_';
+  }
+
+  return cves.map((c) => (c.startsWith('`') ? c : `\`${c}\``)).join('<br>');
+}
+
+export function formatSources(v) {
+  const sources = [];
+  const seen = new Set();
+
+  const addSource = (s) => {
+    if (!s || typeof s !== 'string') return;
+    const trimmed = s.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      sources.push(trimmed);
+    }
+  };
+
+  // 1. npm audit
+  const hasExplicitNpmAudit = Boolean(v.sources?.npmAudit) || (Array.isArray(v.advisories) && v.advisories.some((a) => Boolean(a.sources?.npmAudit)));
+  const hasOtherSources = Boolean(
+    v.sources?.jira ||
+    v.sources?.dependabot ||
+    (v.sources?.jiraTickets && v.sources.jiraTickets.length > 0) ||
+    (v.sources?.dependabotAlerts && v.sources.dependabotAlerts.length > 0)
+  );
+
+  if (hasExplicitNpmAudit || (!hasOtherSources && (!v.sources || Object.keys(v.sources).length === 0))) {
+    addSource('npm audit');
+  }
+
+  // 2. Jira ticket(s)
+  if (v.sources?.jiraTickets && v.sources.jiraTickets.length > 0) {
+    for (const jt of v.sources.jiraTickets) {
+      if (jt?.ticketKey) {
+        addSource(jt.url ? `[${jt.ticketKey}](${jt.url})` : jt.ticketKey);
+      }
+    }
+  } else if (v.sources?.jira?.ticketKey) {
+    const jt = v.sources.jira;
+    addSource(jt.url ? `[${jt.ticketKey}](${jt.url})` : jt.ticketKey);
+  }
+
+  // 3. GitHub Dependabot alert(s)
+  if (v.sources?.dependabotAlerts && v.sources.dependabotAlerts.length > 0) {
+    for (const da of v.sources.dependabotAlerts) {
+      if (da?.alertNumber) {
+        addSource(da.url ? `[#${da.alertNumber}](${da.url})` : `#${da.alertNumber}`);
+      }
+    }
+  } else if (v.sources?.dependabot?.alertNumber) {
+    const da = v.sources.dependabot;
+    addSource(da.url ? `[#${da.alertNumber}](${da.url})` : `#${da.alertNumber}`);
+  }
+
+  if (sources.length === 0) {
+    return '_None_';
+  }
+
+  return sources.join('<br>');
+}
 export function formatTicketLinks(v) {
   const links = [];
 
@@ -155,15 +249,16 @@ export function generateMarkdownReport(report) {
 
     lines.push(`### Package Vulnerability Overview`);
     lines.push(``);
-    lines.push(`| Package | Severity | Type | Current Version | Target Fix | CVEs / Jira / Dependabot |`);
-    lines.push(`| :--- | :---: | :---: | :--- | :--- | :--- |`);
+    lines.push(`| Package | Severity | Type | Current Version | Target Fix | CVEs | Sources |`);
+    lines.push(`| :--- | :---: | :---: | :--- | :--- | :--- | :--- |`);
 
     for (const v of sortedVulns) {
       const typeLabel = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct' : 'Indirect (Transitive)'));
       const targetFix = v.targetSafeVersion ? `\`${v.targetSafeVersion}\`` : '_No fix_';
-      const links = formatTicketLinks(v);
+      const cves = formatCves(v);
+      const sources = formatSources(v);
       lines.push(
-        `| **\`${v.packageName}\`** | **${v.severity.toUpperCase()}** | ${typeLabel} | \`${v.currentVersion}\` | ${targetFix} | ${links} |`
+        `| **\`${v.packageName}\`** | **${v.severity.toUpperCase()}** | ${typeLabel} | \`${v.currentVersion}\` | ${targetFix} | ${cves} | ${sources} |`
       );
     }
     lines.push(``);

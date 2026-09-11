@@ -13,7 +13,7 @@ import {
   tracePathsFromPackageLock,
 } from '../src/core/dependency-graph.js';
 import { generateJsonReport } from '../src/report/json-reporter.js';
-import { generateMarkdownReport, formatCompactDependencyPaths } from '../src/report/markdown-reporter.js';
+import { generateMarkdownReport, formatCompactDependencyPaths, formatCves, formatSources } from '../src/report/markdown-reporter.js';
 
 test('determineSafeVersion: range parsing', () => {
   assert.equal(determineSafeVersion('< 2.1.4', '2.1.0'), '2.1.4');
@@ -169,6 +169,126 @@ test('generateJsonReport and generateMarkdownReport', () => {
   assert.ok(mdReport.includes('CVE-2023-9999'));
   assert.ok(mdReport.includes('package-override'));
   assert.ok(mdReport.includes('npm update vuln-lib --package-lock-only'));
+  assert.ok(mdReport.includes('| Package | Severity | Type | Current Version | Target Fix | CVEs | Sources |'));
+  assert.ok(mdReport.includes('| **`vuln-lib`** | **CRITICAL** | Indirect (Transitive) | `1.0.0` | `1.1.0` | `CVE-2023-9999` | npm audit |'));
+});
+
+test('generateMarkdownReport: table renders multiple CVEs and multiple sources with <br>', () => {
+  const repo = { name: 'demo-repo', org: 'acme' };
+  const branchReports = [
+    {
+      branch: 'main',
+      summary: { critical: 0, high: 1, moderate: 0, low: 0, total: 1 },
+      vulnerabilities: [
+        {
+          id: 'GHSA-multi',
+          cves: ['CVE-2023-1111', 'CVE-2023-2222'],
+          packageName: 'multi-vuln-pkg',
+          severity: 'high',
+          title: 'Multiple Flaws',
+          currentVersion: '2.0.0',
+          targetSafeVersion: '2.1.0',
+          sources: {
+            npmAudit: { advisoryId: '123' },
+            jira: { ticketKey: 'MTA-5000', url: 'https://jira/MTA-5000' },
+            dependabot: { alertNumber: 99, url: 'https://github/alert/99' },
+          },
+        },
+      ],
+    },
+  ];
+
+  const jsonReport = generateJsonReport(repo, branchReports);
+  const mdReport = generateMarkdownReport(jsonReport);
+  assert.ok(
+    mdReport.includes(
+      '| **`multi-vuln-pkg`** | **HIGH** | Indirect (Transitive) | `2.0.0` | `2.1.0` | `CVE-2023-1111`<br>`CVE-2023-2222` | npm audit<br>[MTA-5000](https://jira/MTA-5000)<br>[#99](https://github/alert/99) |'
+    )
+  );
+});
+
+test('formatCves: formats single, multiple with <br>, none, and deduplicates', () => {
+  assert.equal(formatCves({ cve: 'CVE-2023-1111' }), '`CVE-2023-1111`');
+  assert.equal(
+    formatCves({ cves: ['CVE-2023-1111', 'CVE-2023-2222'] }),
+    '`CVE-2023-1111`<br>`CVE-2023-2222`'
+  );
+  assert.equal(
+    formatCves({ cve: 'CVE-2023-1111', cves: ['CVE-2023-1111', 'CVE-2023-2222'] }),
+    '`CVE-2023-1111`<br>`CVE-2023-2222`'
+  );
+  assert.equal(formatCves({}), '_None_');
+  assert.equal(formatCves({ id: 'GHSA-xxxx' }), '_None_');
+  assert.equal(formatCves({ id: 'CVE-2024-5555' }), '`CVE-2024-5555`');
+  assert.equal(
+    formatCves({
+      advisories: [
+        { cve: 'CVE-2023-1001' },
+        { cves: ['CVE-2023-1002', 'CVE-2023-1001'] },
+      ],
+    }),
+    '`CVE-2023-1001`<br>`CVE-2023-1002`'
+  );
+});
+
+test('formatSources: formats npm audit, jira link, dependabot link, and multiple sources', () => {
+  // Standalone npm audit
+  assert.equal(
+    formatSources({ sources: { npmAudit: { advisoryId: '123' } } }),
+    'npm audit'
+  );
+
+  // Default fallback to npm audit when no sources defined
+  assert.equal(formatSources({ id: 'GHSA-1234' }), 'npm audit');
+
+  // Standalone Jira ticket
+  assert.equal(
+    formatSources({
+      sources: {
+        jira: { ticketKey: 'MTA-7680', url: 'https://issues.redhat.com/browse/MTA-7680' },
+      },
+    }),
+    '[MTA-7680](https://issues.redhat.com/browse/MTA-7680)'
+  );
+
+  // Standalone Dependabot alert
+  assert.equal(
+    formatSources({
+      sources: {
+        dependabot: { alertNumber: 42, url: 'https://github.com/org/repo/security/dependabot/42' },
+      },
+    }),
+    '[#42](https://github.com/org/repo/security/dependabot/42)'
+  );
+
+  // Multiple sources: npm audit, Jira, and Dependabot
+  assert.equal(
+    formatSources({
+      sources: {
+        npmAudit: { advisoryId: '123' },
+        jira: { ticketKey: 'MTA-7680', url: 'https://issues.redhat.com/browse/MTA-7680' },
+        dependabot: { alertNumber: 42, url: 'https://github.com/org/repo/security/dependabot/42' },
+      },
+    }),
+    'npm audit<br>[MTA-7680](https://issues.redhat.com/browse/MTA-7680)<br>[#42](https://github.com/org/repo/security/dependabot/42)'
+  );
+
+  // Multiple Jira tickets and Dependabot alerts
+  assert.equal(
+    formatSources({
+      sources: {
+        jiraTickets: [
+          { ticketKey: 'MTA-1', url: 'https://issues/MTA-1' },
+          { ticketKey: 'MTA-2', url: 'https://issues/MTA-2' },
+        ],
+        dependabotAlerts: [
+          { alertNumber: 10, url: 'https://github/10' },
+          { alertNumber: 11, url: 'https://github/11' },
+        ],
+      },
+    }),
+    '[MTA-1](https://issues/MTA-1)<br>[MTA-2](https://issues/MTA-2)<br>[#10](https://github/10)<br>[#11](https://github/11)'
+  );
 });
 
 test('formatCompactDependencyPaths: formats direct and transitive paths compactly', () => {

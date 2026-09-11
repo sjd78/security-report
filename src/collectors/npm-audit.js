@@ -265,6 +265,7 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
     let cvss = null;
     const viaAdvisories = [];
 
+    const cves = [];
     for (const item of rawVias) {
       if (typeof item === 'object' && item !== null) {
         viaAdvisories.push(item);
@@ -275,7 +276,10 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
         if (item.cvss) cvss = item.cvss;
 
         const foundCve = extractCveFromText(item.url) || extractCveFromText(item.title) || (item.cve ? item.cve : null);
-        if (foundCve && !cve) cve = foundCve;
+        if (foundCve) {
+          if (!cve) cve = foundCve;
+          if (!cves.includes(foundCve)) cves.push(foundCve);
+        }
       }
     }
 
@@ -302,6 +306,7 @@ export async function collectNpmAudit(worktreeDir, branchName = 'main') {
     const vulnRecord = {
       id: advisoryId,
       cve,
+      cves,
       packageName: pkgName,
       severity: vulnData.severity || 'moderate',
       title,
