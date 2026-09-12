@@ -13,17 +13,20 @@ Managing security vulnerabilities across large Node.js repositories is often fra
 1. **Step 1: Aggregate & Analyze**
    - Resolves the target repository: `org/repo` shorthand and Git URLs are cloned into an isolated `REPOS/<org>/<name>` cache; a local path is used **in place** (nothing is copied into `REPOS/`).
    - Detaches the base repository's `HEAD` — including local targets — so every branch name is free, then creates one `git worktree` per target branch, reset to the latest fetched `origin/<branch>` when that remote branch exists (otherwise the existing local branch is used, or a new one is created).
-   - Runs `npm audit` and parses the full `npm ls` ancestor hierarchy to trace direct vs. indirect (transitive) dependency chains across root and **npm workspaces** (nested `package.json` files).
-   - Cross-references findings with Jira CVE tickets (resolving attached GitHub Security Advisory links to extract affected ranges and patched versions) and GitHub Dependabot alerts.
-   - Consolidates multiple CVEs and advisories per package to calculate the optimal safe version that resolves all flaws.
-   - Outputs machine-readable JSON (`reports/security-report.json`) and human-readable Markdown (`reports/security-report.md`).
-
+   - Runs `npm audit` with **intermediate package filtering**: dependency carriers lacking direct advisories in `via` are ignored as top-level findings and preserved in ancestor chains.
+   - Cross-references findings with Jira CVE tickets and GitHub Dependabot alerts, querying GitHub Advisory API and OSV to resolve CVE identifiers and **all active major version line fixes** (e.g. `2.4.5`, `3.1.6`, `4.1.3`).
+   - Compares installed versions against target fixes to track **`Status` (`✅ Resolved` vs `⚠️ Open`)**, identifying flaws that remain logged in Jira or Dependabot but are already solved in code.
+   - Consolidates multiple CVEs and advisories per package to calculate the optimal safe version that resolves all flaws (prioritizing safe in-major updates when installed version is known).
+   - Outputs machine-readable JSON (`reports/security-report.json`) and human-readable Markdown (`reports/security-report.md`) featuring:
+     - **Package Overview Table**: `Package`, `Status` (`✅ Resolved` / `⚠️ Open`), `Severity`, `Type`, `Current Version`, `Target Fix` (all major line fixes separated by `<br>`), `CVEs` (separated by `<br>`), and `Sources` (linked advisories, Jira tickets, Dependabot alerts separated by `<br>`).
+     - **Detailed Package Findings**: Unnumbered findings with status badges, explicit current and target fix versions, individual advisory links, and strictly partitioned **Direct Dependencies** and **Transitive Dependency Paths** in compact code blocks (`<pkgFile>/<section>/...`).
 2. **Step 2: Automated Remediation (5-Tier Preference Hierarchy)**
    - **`bump-direct-and-lockfile`**: For dual dependencies (`Direct & Indirect`, e.g. `js-yaml`), bumps the direct `package.json` semver constraint AND issues lockfile updates to synchronize all transitive instances.
    - **`bump-direct`**: Directly updates `package.json` semver constraints for direct dependencies (preserving formatting and `^`/`~` prefixes).
    - **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an update available that patches the transitive dependency, bumps the direct parent in `package.json`.
    - **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), updates the lockfile directly without introducing unnecessary `package.json` overrides.
    - **`package-override`**: Fallback applied only when parent ranges strictly forbid the safe version and no direct parent update exists.
+   - Packages already resolved in the repository skip redundant edits and lockfile changes.
    - Performs atomic lockfile synchronization (`npm install --package-lock-only`, then `npm update <pkg> --package-lock-only` for each package that must move within existing ranges) and post-remediation audit verification.
    - Without `--commit`, the branch worktree is **kept** and its path printed — it holds the only copy of the applied fix. A failed remediation also keeps its worktree for inspection.
 3. **Step 3: Structured Commit Generation & Publishing**
@@ -180,7 +183,55 @@ Without `--commit` and without `--dry-run` the changes are applied and the workt
 
 ---
 
-## 5. Sample Commit Message
+## 5. Sample Report Format
+
+### Package Vulnerability Overview Table
+
+| Package | Status | Severity | Type | Current Version | Target Fix | CVEs | Sources |
+| :--- | :---: | :---: | :---: | :--- | :--- | :--- | :--- |
+| **`fast-uri`** | ⚠️ Open | **HIGH** | Direct | `2.4.2` | `2.4.5`<br>`3.1.6`<br>`4.1.3` | `CVE-2026-75931` | [npm audit](https://github.com/advisories/GHSA-5jgf-p345-68v8) |
+| **`qs`** | ✅ Resolved | **HIGH** | Direct | `6.16.0` | `6.16.0` | `CVE-2026-82417` | [MTA-7680](https://issues.example.com/browse/MTA-7680)<br>[#42](https://github.com/org/repo/security/dependabot/42) |
+
+### Detailed Package Finding
+
+```markdown
+#### `js-yaml` — HIGH (⚠️ Open)
+
+- **Status:** ⚠️ Open (installed version `3.15.1, 4.3.0` is vulnerable)
+- **Current Version:** `3.15.1, 4.3.0`
+- **Target Fix Version:** `4.3.2`
+- **CVE Identifiers (1):** `CVE-2026-82418`
+- **Jira Ticket:** [MTA-7685](https://issues.example.com/browse/MTA-7685)
+- **Tracked Advisories & CVEs (1):**
+  - [Advisory](https://github.com/advisories/GHSA-xxxx) - [Jira MTA-7685](https://issues.example.com/browse/MTA-7685) - `CVE-2026-82418` js-yaml prototype pollution
+- **Dependency Type:** Direct & Indirect
+- **Direct Dependencies:**
+  ```text
+  client/package.json/dependencies/js-yaml@^4.3.0
+  cypress/package.json/devDependencies/js-yaml@^4.3.0
+  ```
+- **Transitive Dependency Path:**
+  ```text
+  package.json/devDependencies/eslint/.../js-yaml@3.15.1
+  client/package.json/dependencies/jest/.../js-yaml@3.15.1
+  ```
+> _Note: Compact path summary shown. To inspect full transitive tree, run `npm ls js-yaml` or `npm why js-yaml`._
+
+**Consolidated Remediation Plan (bump-direct-and-lockfile):**
+> _Note: Package is both a direct dependency and required transitively. Resolution updates package.json semver and synchronizes lockfile for all instances._
+
+1. Update `package.json` file(s):
+   - Bump `js-yaml` from `^4.3.0` to `^4.3.2` in `dependencies` (`client/package.json`)
+   - Bump `js-yaml` from `^4.3.0` to `^4.3.2` in `devDependencies` (`cypress/package.json`)
+2. Synchronize lockfile:
+   ```bash
+   npm update js-yaml --package-lock-only
+   ```
+```
+
+---
+
+## 6. Sample Commit Message
 
 When running with `--commit`, the engine creates structured commit messages:
 
@@ -211,7 +262,7 @@ Verification: Post-remediation npm audit scan reported 0 remaining vulnerabiliti
 
 ---
 
-## 6. Running Tests
+## 7. Running Tests
 
 ```bash
 npm test

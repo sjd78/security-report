@@ -100,8 +100,8 @@ security-report/
   4. **Worktree Retention**: `withWorktree` removes the worktree only after the callback succeeds. `sec-remediate fix` without `--commit` keeps it and prints its path, because it is the only copy of the applied fix; a failed callback keeps it too.
 
 ### B. Direct vs. Indirect Ancestor Chain Resolution & 5-Tier Remediation Strategy
-- **Problem**: `npm audit` reports hoisted paths (e.g. `node_modules/@xmldom/xmldom`), obscuring the logical parent (e.g. `msw -> @mswjs/interceptors -> @xmldom/xmldom`).
-- **Solution**: `src/core/dependency-graph.js` combines `npm ls --all --json` traversal and reverse graph backtracking over `package-lock.json` packages to reconstruct the complete logical ancestry tree down to root `package.json` dependencies. Strategy selection itself lives in `buildRemediationSuggestion` (`src/collectors/npm-audit.js`), with per-package consolidation in `src/core/blender.js`.
+- **Problem**: `npm audit` reports hoisted paths (e.g. `node_modules/@xmldom/xmldom`), obscuring the logical parent (e.g. `msw -> @mswjs/interceptors -> @xmldom/xmldom`). Furthermore, `npm audit --json` returns every intermediate carrier package as a vulnerability record, inflating vulnerability counts.
+- **Solution**: `src/collectors/npm-audit.js` ignores pure intermediate packages whose `via` contains only string references and no direct advisory objects. `src/core/dependency-graph.js` combines `npm ls --all --json` traversal and reverse graph backtracking over `package-lock.json` packages to reconstruct the complete logical ancestry tree down to root `package.json` dependencies. Strategy selection itself lives in `buildRemediationSuggestion` (`src/collectors/npm-audit.js`), with per-package consolidation in `src/core/blender.js`.
 - **5-Tier Remediation Strategy** (first match wins):
   1. **`bump-direct`**: Directly updates `package.json` if the package is declared in `dependencies`/`devDependencies`.
   2. **`bump-direct-and-lockfile`**: Same as above when the package is *also* pulled in transitively (`Direct & Indirect`); the package.json bump is paired with a lockfile re-resolution for the remaining instances. See section H.
@@ -142,13 +142,13 @@ Every strategy carries `packageJsonChanges` (file-scoped semver edits) and `lock
   - `security-npm-audit-collection.json`: Contains the raw branch audit results.
 - **Benefit**: All debug JSONs and intermediate data structures have a consistent, branch-scoped representation, enabling inspection and deterministic blender correlation.
 
-### G. Jira Remote Link Advisory Resolution & Optimal Safe Version Calculation
-- **Problem**: Jira CVE tickets describe downstream flaws and include web links (`remotelink`) to GitHub Security Advisories, but don't natively list upstream npm package fix versions.
+### G. Advisory Resolution (Jira & npm audit) & Optimal Safe Version Calculation
+- **Problem**: Jira CVE tickets and npm audit findings point to GitHub Security Advisories or CVE identifiers, but do not natively provide all upstream npm package fix versions or direct links.
 - **Solution**:
-  1. `src/collectors/jira.js` queries `/rest/api/3/issue/{key}/remotelink` to extract attached GHSA and CVE URLs.
-  2. `src/collectors/advisories.js` fetches the advisory data from GitHub Advisory API (and OSV API), resolving `vulnerableVersionRange` and `first_patched_version` (e.g. `qs` $\rightarrow$ `6.16.0`, `js-yaml` $\rightarrow$ `4.3.2`).
+  1. `src/collectors/jira.js` queries `/rest/api/3/issue/{key}/remotelink` to extract attached GHSA and CVE URLs; `src/collectors/npm-audit.js` extracts GHSA/CVE identifiers from `via` advisory objects.
+  2. `src/collectors/advisories.js` (`fetchAdvisoryDetails`) queries GitHub Advisory API (and OSV API fallback), resolving CVE IDs, `vulnerableVersionRange`, and `first_patched_version` across all affected releases.
   3. `src/core/blender.js` calculates the **optimal target safe version** that satisfies all combined advisories for that package on the target branch.
-
+  4. `src/report/markdown-reporter.js` links npm audit sources directly to the resolved GitHub Security Advisories.
 
 ### H. Upstream Lockfile Assessment for Jira Findings & Dual Direct/Indirect Resolution
 - **Problem**: Jira tickets track downstream flaws, but the tool needs to know what is actually installed in the target branch's `package-lock.json`. Furthermore, packages like `js-yaml` may be both directly declared in `package.json` and pulled in transitively by tools like `eslint`.
@@ -164,6 +164,31 @@ Every strategy carries `packageJsonChanges` (file-scoped semver edits) and `lock
   1. `src/core/dependency-graph.js` (`findWorkspacePackageJsons`, `getDirectDependencies`) discovers all nested workspace packages.
   2. Dependency checks aggregate direct dependencies across root and all workspaces, tracking the exact declaring workspace and file path.
   3. Remediation (`updatePackageJsonFile`) updates the specific workspace `package.json` file where the dependency is declared.
+
+
+### J. Multi-Line Patched Version Extraction & In-Major Remediation
+- **Problem**: Flaws in popular packages (e.g. `fast-uri`, `semver`) are frequently patched across multiple active major version lines (e.g. `2.4.5`, `3.1.6`, `4.1.3`). Grabbing only the first or lowest patched version either leaves the package vulnerable on newer lines or forces an unnecessary breaking upgrade across major versions.
+- **Solution**:
+  1. `src/collectors/advisories.js` (`fetchAdvisoryDetails`) collects all `first_patched_version` entries from GitHub Advisories and `fixed` events from OSV across the npm ecosystem.
+  2. `src/collectors/npm-audit.js` (`determinePatchedVersions`) parses multiple patch boundaries from compound semver ranges (e.g. `<2.4.5 || >=3.0.0 <3.1.6 || >=4.0.0 <4.1.3`).
+  3. `src/core/blender.js` (`selectBestRemediationVersion`) prioritizes safe, non-breaking in-major patch updates when the current installed version is known (e.g. installed `2.4.2` selects `2.4.5`; installed `3.1.3` selects `3.1.6`), or selects the minimal breaking jump.
+  4. `src/report/markdown-reporter.js` (`formatTargetFix`) displays all available major version line fixes in the `Target Fix` column separated by `<br>`.
+
+### K. Upstream Resolution Tracking & Open vs. Resolved Status
+- **Problem**: Downstream Jira compliance tickets or Dependabot alerts often remain open/active even after an upstream repository has already applied the fix in its lockfile. Continuing to flag them as active defects or attempting code modifications causes confusion and redundant diffs.
+- **Solution**:
+  1. `src/core/blender.js` (`isVulnerabilityResolved`) compares all installed versions against target fixes across major version lines and validates against `vulnerableVersionRange`.
+  2. Packages satisfying target fixes are marked `pkg.status = 'resolved'`, clearing pending remediation edits/lockfile updates and recording an informational note.
+  3. `src/report/markdown-reporter.js` displays a dedicated `Status` column with `✅ Resolved` vs `⚠️ Open` in the overview table, and adds status badges/notes in the detailed package findings.
+
+### L. Partitioned Dependency Path Reporting in Markdown
+- **Problem**: Conflating direct dependencies and transitive paths leads to duplicate output or confusing traces in the detailed findings section.
+- **Solution**:
+  1. `src/report/markdown-reporter.js` splits paths into `formatDirectDependencyPaths` and `formatTransitiveDependencyPaths`.
+  2. Direct dependencies strictly pull from workspace/root declarations and are excluded from transitive output.
+  3. Both sections render in compact code blocks (`<pkgFile>/<section>/...`) for consistency and readability.
+
+---
 
 ## 5. Configuration & Environment Variables
 
