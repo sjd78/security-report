@@ -216,51 +216,47 @@ export function formatTicketLinks(v) {
   return links.join(', ') || '_None_';
 }
 
-export function formatCompactDependencyPaths(v, includeDirect = true) {
-  const compactPaths = new Set();
+export function formatDirectDependencyPaths(v) {
+  const directPaths = new Set();
 
-  // 1. Add direct declarations
-  if (includeDirect) {
-    if (v.workspaceDeclarations && v.workspaceDeclarations.length > 0) {
-      for (const decl of v.workspaceDeclarations) {
-        const pkgFile = decl.packageJsonPath || 'package.json';
-        const sec = decl.section || 'dependencies';
-        const range = decl.range ? `@${decl.range}` : '';
-        compactPaths.add(`${pkgFile}/${sec}/${v.packageName}${range}`);
-      }
-    } else if (v.isDirect) {
-      compactPaths.add(`package.json/dependencies/${v.packageName}`);
+  if (v.workspaceDeclarations && v.workspaceDeclarations.length > 0) {
+    for (const decl of v.workspaceDeclarations) {
+      const pkgFile = decl.packageJsonPath || 'package.json';
+      const sec = decl.section || 'dependencies';
+      const range = decl.range ? `@${decl.range}` : '';
+      directPaths.add(`${pkgFile}/${sec}/${v.packageName}${range}`);
     }
+  } else if (v.isDirect) {
+    const pkgFile = 'package.json';
+    const sec = v.section || 'dependencies';
+    const range = v.range ? `@${v.range}` : '';
+    directPaths.add(`${pkgFile}/${sec}/${v.packageName}${range}`);
   }
 
-  // 2. Parse transitive paths into <project package.json>/<section>/<direct package>/.../<transitive package>
+  return Array.from(directPaths);
+}
+
+export function formatTransitiveDependencyPaths(v) {
+  const transitivePaths = new Set();
   const directRootsMap = new Map();
   for (const root of v.directRoots || []) {
     directRootsMap.set(root.name, root);
   }
 
   for (const pathStr of v.dependencyPaths || []) {
-    // Skip single-node direct declarations handled above
     if (pathStr.includes(' (dependencies) -> ') || pathStr.includes(' (devDependencies) -> ')) {
       continue;
     }
 
     const segments = pathStr.split(/\s*->\s*/).filter(Boolean);
-    if (segments.length === 0) continue;
+    if (segments.length <= 1) continue;
 
-    if (segments.length === 1 && segments[0].startsWith(v.packageName)) {
-      if (compactPaths.size === 0) {
-        compactPaths.add(`package.json/dependencies/${segments[0]}`);
-      }
-      continue;
-    }
+    const firstSeg = segments[0];
+    const wsMatch = firstSeg.match(/\(([^/)]+\/package\.json)\)/);
 
     let pkgFile = 'package.json';
     let directRootPkg = null;
     const targetSegment = segments[segments.length - 1];
-
-    const firstSeg = segments[0];
-    const wsMatch = firstSeg.match(/\(([^/)]+\/package\.json)\)/);
 
     if (wsMatch) {
       pkgFile = wsMatch[1];
@@ -271,29 +267,36 @@ export function formatCompactDependencyPaths(v, includeDirect = true) {
       directRootPkg = firstSeg.split('@')[0];
     }
 
+    // Direct dependencies are strictly excluded from transitive paths
+    if (!directRootPkg || directRootPkg === v.packageName) {
+      continue;
+    }
+
     let section = 'dependencies';
-    if (directRootPkg && directRootsMap.has(directRootPkg)) {
+    if (directRootsMap.has(directRootPkg)) {
       const rootMeta = directRootsMap.get(directRootPkg);
       if (rootMeta.section) section = rootMeta.section;
       if (rootMeta.packageJsonPath && !wsMatch) pkgFile = rootMeta.packageJsonPath;
     }
 
-    if (directRootPkg) {
-      if (directRootPkg === v.packageName) {
-        compactPaths.add(`${pkgFile}/${section}/${targetSegment}`);
-      } else {
-        compactPaths.add(`${pkgFile}/${section}/${directRootPkg}/.../${targetSegment}`);
-      }
-    } else {
-      compactPaths.add(`${pkgFile}/${section}/.../${targetSegment}`);
-    }
+    transitivePaths.add(`${pkgFile}/${section}/${directRootPkg}/.../${targetSegment}`);
   }
 
-  if (compactPaths.size === 0 && includeDirect) {
-    compactPaths.add(v.packageName);
-  }
+  return Array.from(transitivePaths);
+}
 
-  return Array.from(compactPaths);
+export function formatCompactDependencyPaths(v, includeDirect = true) {
+  if (!includeDirect) {
+    return formatTransitiveDependencyPaths(v);
+  }
+  const all = new Set([
+    ...formatDirectDependencyPaths(v),
+    ...formatTransitiveDependencyPaths(v),
+  ]);
+  if (all.size === 0) {
+    all.add(v.packageName);
+  }
+  return Array.from(all);
 }
 
 export function generateMarkdownReport(report) {
@@ -347,7 +350,7 @@ export function generateMarkdownReport(report) {
       const cves = formatCves(v);
       const sources = formatSources(v);
       lines.push(
-        `| **\`${v.packageName}\`** | ${statusBadge} | **${v.severity.toUpperCase()}** | ${typeLabel} | \`${v.currentVersion}\` | ${targetFix} | ${cves} | ${sources} |`
+        `| **\`${v.packageName}\`** | ${statusBadge} | **${(v.severity || 'moderate').toUpperCase()}** | ${typeLabel} | \`${v.currentVersion}\` | ${targetFix} | ${cves} | ${sources} |`
       );
     }
     lines.push(``);
@@ -358,7 +361,7 @@ export function generateMarkdownReport(report) {
     for (const [idx, v] of sortedVulns.entries()) {
       const isResolved = v.status === 'resolved' || isVulnerabilityResolved(v);
       const statusBadge = isResolved ? '✅ Resolved' : '⚠️ Open';
-      lines.push(`#### \`${v.packageName}\` — ${v.severity.toUpperCase()} (${statusBadge})`);
+      lines.push(`#### \`${v.packageName}\` — ${(v.severity || 'moderate').toUpperCase()} (${statusBadge})`);
       lines.push(``);
       const statusNote = isResolved
         ? `✅ Resolved (installed version \`${v.currentVersion}\` satisfies target fix)`
@@ -402,29 +405,31 @@ export function generateMarkdownReport(report) {
 
       const depTypeStr = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct Dependency' : 'Indirect (Transitive)'));
       lines.push(`- **Dependency Type:** ${depTypeStr}`);
-      if (v.workspaceDeclarations && v.workspaceDeclarations.length > 0) {
-        lines.push(`- **Direct Dependencies (${v.workspaceDeclarations.length}):**`);
-        for (const decl of v.workspaceDeclarations) {
-          const wsLabel = decl.isRoot ? '`package.json`' : `\`${decl.packageJsonPath}\``;
-          lines.push(`  - ${wsLabel} [${decl.section}: \`${decl.range}\`]`);
+      // Direct Dependencies
+      const directPaths = formatDirectDependencyPaths(v);
+      if (directPaths.length > 0) {
+        lines.push(`- **Direct Dependencies:**`);
+        lines.push("  ```text");
+        for (const dp of directPaths) {
+          lines.push("  " + dp);
+        }
+        lines.push("  ```");
+      }
+
+      // Transitive Dependency Paths
+      const transitivePaths = formatTransitiveDependencyPaths(v);
+      if (transitivePaths.length > 0) {
+        lines.push(`- **Transitive Dependency Path:**`);
+        lines.push("  ```text");
+        for (const cp of transitivePaths) {
+          lines.push("  " + cp);
+        }
+        lines.push("  ```");
+        if (transitivePaths.some((p) => p.includes('/.../'))) {
+          lines.push(`  > _Note: Compact path summary shown. To inspect full transitive tree, run \`npm ls ${v.packageName}\` or \`npm why ${v.packageName}\`._`);
         }
       }
       lines.push(``);
-
-      // Compact Transitive Dependency Path
-      const compactPaths = formatCompactDependencyPaths(v, false);
-      if (compactPaths.length > 0) {
-        lines.push(`- **Transitive Dependency Path:**`);
-        lines.push("  \`\`\`text");
-        for (const cp of compactPaths) {
-          lines.push("  " + cp);
-        }
-        lines.push("  \`\`\`");
-        if (compactPaths.some((p) => p.includes('/.../'))) {
-          lines.push(`  > _Note: Compact path summary shown. To inspect full transitive tree, run \`npm ls ${v.packageName}\` or \`npm why ${v.packageName}\`._`);
-        }
-        lines.push(``);
-      }
 
       // Consolidated Remediation Plan
       const rem = v.remediation || {};

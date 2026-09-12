@@ -17,7 +17,7 @@ import {
   tracePathsFromPackageLock,
 } from '../src/core/dependency-graph.js';
 import { generateJsonReport } from '../src/report/json-reporter.js';
-import { generateMarkdownReport, formatCompactDependencyPaths, formatCves, formatSources, formatTargetFix, formatStatus } from '../src/report/markdown-reporter.js';
+import { generateMarkdownReport, formatCompactDependencyPaths, formatDirectDependencyPaths, formatTransitiveDependencyPaths, formatCves, formatSources, formatTargetFix, formatStatus } from '../src/report/markdown-reporter.js';
 
 test('determineSafeVersion: range parsing', () => {
   assert.equal(determineSafeVersion('< 2.1.4', '2.1.0'), '2.1.4');
@@ -337,6 +337,52 @@ test('formatCompactDependencyPaths: formats direct and transitive paths compactl
   assert.ok(compact.includes('cypress/package.json/devDependencies/js-yaml@^4.3.0'));
   assert.ok(compact.includes('package.json/devDependencies/eslint/.../js-yaml@3.15.1'));
   assert.ok(compact.includes('client/package.json/dependencies/jest/.../js-yaml@3.15.1'));
+});
+
+test('formatDirectDependencyPaths and formatTransitiveDependencyPaths: partition direct and transitive paths in compact format', () => {
+  const vuln = {
+    packageName: 'js-yaml',
+    severity: 'high',
+    currentVersion: '3.15.1',
+    targetSafeVersion: '4.3.2',
+    isDirect: true,
+    workspaceDeclarations: [
+      { packageJsonPath: 'client/package.json', section: 'dependencies', range: '^4.3.0' },
+      { packageJsonPath: 'cypress/package.json', section: 'devDependencies', range: '^4.3.0' },
+    ],
+    directRoots: [
+      { name: 'eslint', section: 'devDependencies', packageJsonPath: 'package.json' },
+    ],
+    dependencyPaths: [
+      '@konveyor-ui/cypress (devDependencies) -> js-yaml@^4.3.0',
+      '@konveyor-ui/client (dependencies) -> js-yaml@^4.3.0',
+      'eslint@9.39.4 -> @eslint/eslintrc@3.3.5 -> js-yaml@3.15.1',
+      '@konveyor-ui/client (client/package.json) -> jest@29.7.0 -> @jest/core@29.7.0 -> js-yaml@3.15.1',
+    ],
+  };
+
+  const direct = formatDirectDependencyPaths(vuln);
+  assert.equal(direct.length, 2);
+  assert.ok(direct.includes('client/package.json/dependencies/js-yaml@^4.3.0'));
+  assert.ok(direct.includes('cypress/package.json/devDependencies/js-yaml@^4.3.0'));
+  // Ensure no transitive paths in direct
+  assert.ok(!direct.some((p) => p.includes('/.../')));
+
+  const transitive = formatTransitiveDependencyPaths(vuln);
+  assert.equal(transitive.length, 2);
+  assert.ok(transitive.includes('package.json/devDependencies/eslint/.../js-yaml@3.15.1'));
+  assert.ok(transitive.includes('client/package.json/dependencies/jest/.../js-yaml@3.15.1'));
+  // Ensure no direct paths in transitive
+  assert.ok(!transitive.some((p) => p.includes('^4.3.0')));
+  assert.ok(!transitive.includes('client/package.json/dependencies/js-yaml@^4.3.0'));
+  assert.ok(!transitive.includes('cypress/package.json/devDependencies/js-yaml@^4.3.0'));
+
+  // Test in Markdown report output: both sections rendered with ```text code blocks
+  const md = generateMarkdownReport({
+    branches: [{ branch: 'main', summary: { total: 1 }, vulnerabilities: [vuln] }],
+  });
+  assert.ok(md.includes('- **Direct Dependencies:**\n  ```text\n  client/package.json/dependencies/js-yaml@^4.3.0\n  cypress/package.json/devDependencies/js-yaml@^4.3.0\n  ```'));
+  assert.ok(md.includes('- **Transitive Dependency Path:**\n  ```text\n  package.json/devDependencies/eslint/.../js-yaml@3.15.1\n  client/package.json/dependencies/jest/.../js-yaml@3.15.1\n  ```'));
 });
 
 test('parseAuditVulnerabilities: ignores intermediate packages and only includes packages with advisories', async () => {
