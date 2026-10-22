@@ -512,11 +512,11 @@ export function findDirectRoots(chains, directDeps) {
 }
 
 function getIncomingEdges(node) {
-  const edges = Array.from(node.edgesIn || []);
+  const edges = Array.from(node.edgesIn || []).filter((e) => e.type !== 'peer');
   if (node.isWorkspace && node.linksIn) {
     for (const link of node.linksIn) {
       for (const edge of link.edgesIn || []) {
-        if (!edge.from.isProjectRoot) {
+        if (!edge.from.isProjectRoot && edge.type !== 'peer') {
           edges.push(edge);
         }
       }
@@ -537,7 +537,124 @@ function getNodeLabel(node) {
   return `${pkgName}@${node.version || 'unknown'}`;
 }
 
-export function traceArboristChains(node, visited = new Set()) {
+export function getArboristLogicalChains(tree, targetName) {
+  if (!tree) return [];
+  const chains = [];
+  const seenNodes = new Set();
+  const queue = [];
+
+  // 1. Direct dependencies of root project
+  for (const edge of tree.edgesOut.values()) {
+    if (edge.type === 'peer' || !edge.to) continue;
+    if (edge.to.isWorkspace) continue;
+    const directRootName = edge.to.packageName || edge.to.name;
+    const step = {
+      name: directRootName,
+      version: edge.to.version,
+      requiredRange: edge.spec,
+      type: edge.type,
+      location: edge.to.location,
+      packageJsonPath: 'package.json',
+      workspace: null,
+      isRoot: true,
+      specifier: `${directRootName}@${edge.to.version}`,
+    };
+    const rootAnchor = {
+      name: '[root]',
+      version: tree.version,
+      location: '',
+      isWorkspace: false,
+      isRoot: true,
+      packageJsonPath: 'package.json',
+      specifier: '[root]',
+    };
+    queue.push([edge.to, [rootAnchor, step]]);
+  }
+
+  // 2. Direct dependencies of each workspace
+  if (tree.workspaces) {
+    for (const [wsName, wsPath] of tree.workspaces) {
+      const wsLoc = wsPath.replace(tree.path + '/', '');
+      const wsNode = tree.inventory.get(wsLoc);
+      if (!wsNode) continue;
+      const wsPkgPath = path.join(wsLoc, 'package.json');
+      const wsAnchor = {
+        name: wsName,
+        version: wsNode.version,
+        location: wsLoc,
+        isWorkspace: true,
+        isRoot: false,
+        packageJsonPath: wsPkgPath,
+        specifier: `${wsName} (${wsPkgPath})`,
+      };
+
+      for (const edge of wsNode.edgesOut.values()) {
+        if (edge.type === 'peer' || !edge.to) continue;
+        const targetNode = edge.to.isLink ? edge.to.target : edge.to;
+        const isWs = Boolean(targetNode.isWorkspace);
+        const step = {
+          name: targetNode.packageName || targetNode.name,
+          version: targetNode.version,
+          requiredRange: edge.spec,
+          type: edge.type,
+          location: targetNode.location,
+          isWorkspace: isWs,
+          isRoot: false,
+          packageJsonPath: isWs ? path.join(targetNode.location, 'package.json') : wsPkgPath,
+          workspace: isWs ? (targetNode.packageName || targetNode.name) : wsName,
+          specifier: isWs
+            ? `${targetNode.packageName || targetNode.name} (${path.join(targetNode.location, 'package.json')})`
+            : `${targetNode.packageName || targetNode.name}@${targetNode.version}`,
+        };
+        queue.push([targetNode, [wsAnchor, step]]);
+      }
+    }
+  }
+
+  while (queue.length > 0) {
+    const [node, currentChain] = queue.shift();
+
+    if (node.name === targetName) {
+      chains.push(currentChain);
+      continue;
+    }
+
+    if (seenNodes.has(node.path)) {
+      continue;
+    }
+    seenNodes.add(node.path);
+
+    const targetNode = node.isLink ? node.target : node;
+    for (const edge of targetNode.edgesOut.values()) {
+      if (edge.type === 'peer' || !edge.to) continue;
+      const childNode = edge.to.isLink ? edge.to.target : edge.to;
+      const isWs = Boolean(childNode.isWorkspace);
+      const step = {
+        name: childNode.packageName || childNode.name,
+        version: childNode.version,
+        requiredRange: edge.spec,
+        type: edge.type,
+        location: childNode.location,
+        isWorkspace: isWs,
+        isRoot: false,
+        specifier: isWs
+          ? `${childNode.packageName || childNode.name} (${path.join(childNode.location, 'package.json')})`
+          : `${childNode.packageName || childNode.name}@${childNode.version}`,
+      };
+      queue.push([childNode, [...currentChain, step]]);
+    }
+  }
+
+  return chains;
+}
+
+export function traceArboristChains(nodeOrTree, targetNameOrVisited = null) {
+  if (typeof targetNameOrVisited === 'string') {
+    return getArboristLogicalChains(nodeOrTree, targetNameOrVisited);
+  }
+
+  const node = nodeOrTree;
+  const visited = targetNameOrVisited instanceof Set ? targetNameOrVisited : new Set();
   if (visited.has(node)) return [];
   const nextVisited = new Set(visited);
   nextVisited.add(node);
@@ -637,17 +754,18 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
 
   if (tree) {
     const nodes = Array.from(tree.inventory.query('name', pkgName));
-    const allChains = [];
     const workspaceDeclarations = [];
     let hasDirect = false;
     let hasTransitive = false;
 
-    for (const node of nodes) {
-      const nodeChains = traceArboristChains(node);
-      for (const c of nodeChains) {
-        allChains.push(c);
+    let allChains = getArboristLogicalChains(tree, pkgName);
+    if (allChains.length === 0) {
+      for (const node of nodes) {
+        allChains.push(...traceArboristChains(node));
       }
+    }
 
+    for (const node of nodes) {
       // Check incoming edges
       for (const edge of node.edgesIn || []) {
         const parent = edge.from;

@@ -39,7 +39,7 @@ export function extractCveFromText(text) {
   return match ? match[0].toUpperCase() : null;
 }
 
-export function determinePatchedVersions(vulnerableRange, fixAvailable = null) {
+export function determinePatchedVersions(vulnerableRange, fixAvailable = null, targetPkgName = null) {
   const versions = [];
   const seen = new Set();
   const add = (v) => {
@@ -52,10 +52,12 @@ export function determinePatchedVersions(vulnerableRange, fixAvailable = null) {
   };
 
   if (fixAvailable && typeof fixAvailable === 'object' && fixAvailable.version) {
-    add(fixAvailable.version);
+    if (!targetPkgName || !fixAvailable.name || fixAvailable.name === targetPkgName) {
+      add(fixAvailable.version);
+    }
   }
 
-  if (vulnerableRange && typeof vulnerableRange === 'string') {
+  if (vulnerableRange && typeof vulnerableRange === 'string' && vulnerableRange !== '*') {
     const matches = Array.from(vulnerableRange.matchAll(/(?:<=|<)\s*([0-9]+\.[0-9]+\.[0-9]+[a-zA-Z0-9_.-]*)/g));
     for (const m of matches) {
       if (m[1] && semver.valid(m[1])) {
@@ -78,8 +80,8 @@ export function determinePatchedVersions(vulnerableRange, fixAvailable = null) {
   return versions;
 }
 
-export function determineSafeVersion(vulnerableRange, currentVersion, fixAvailable) {
-  const allPatched = determinePatchedVersions(vulnerableRange, fixAvailable);
+export function determineSafeVersion(vulnerableRange, currentVersion, fixAvailable, targetPkgName = null) {
+  const allPatched = determinePatchedVersions(vulnerableRange, fixAvailable, targetPkgName);
   if (allPatched.length === 0) return null;
   return selectBestRemediationVersion(currentVersion, allPatched);
 }
@@ -315,27 +317,14 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     };
   }
 
-  // 5. Transitive with identified Direct Root Parent but no safe version available
-  if (directRoots.length > 0) {
-    const primaryRoot = directRoots[0];
-    return {
-      strategy: 'bump-direct-parent',
-      targetPackage: primaryRoot.name,
-      targetVersion: null,
-      directRoot: primaryRoot.name,
-      packageJsonChanges: [],
-      lockfileUpdates: [primaryRoot.name, vuln.packageName],
-      note: `Introduced via direct root "${primaryRoot.name}". Check for newer release of ${primaryRoot.name} or lockfile update.`,
-    };
-  }
-
-  // 6. Fallback: Lockfile Update
+  // 5. Transitive without safe version available
   return {
-    strategy: 'lockfile-update',
+    strategy: 'none',
     targetPackage: vuln.packageName,
     targetVersion: null,
     packageJsonChanges: [],
-    lockfileUpdates: [vuln.packageName],
+    lockfileUpdates: [],
+    note: `No known patched version is currently available for ${vuln.packageName}. Upstream maintainers have not released a fix; investigate alternative packages or runtime mitigations.`,
   };
 }
 
@@ -547,8 +536,8 @@ export async function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npm
       ? pkgInfo.currentVersion
       : (chains[0]?.slice(-1)[0]?.version || vulnData.range || 'unknown');
 
-    const patchedVersions = determinePatchedVersions(vulnData.range, vulnData.fixAvailable);
-    const targetSafeVersion = determineSafeVersion(vulnData.range, currentVersion, vulnData.fixAvailable);
+    const patchedVersions = determinePatchedVersions(vulnData.range, vulnData.fixAvailable, pkgName);
+    const targetSafeVersion = determineSafeVersion(vulnData.range, currentVersion, vulnData.fixAvailable, pkgName);
     const vulnRecord = {
       id: advisoryId,
       cve,

@@ -13,10 +13,17 @@ import {
 import {
   canBeResolvedInLockfile,
   buildRemediationSuggestion,
+  determinePatchedVersions,
+  determineSafeVersion,
 } from '../src/collectors/npm-audit.js';
 import {
   updatePackageJsonFile,
 } from '../src/core/remediator.js';
+import {
+  formatTargetFix,
+  formatTransitiveDependencyPaths,
+  generateMarkdownReport,
+} from '../src/report/markdown-reporter.js';
 
 test('getArboristClass: loads Arborist from local dependencies or npm global', () => {
   const Arb = getArboristClass();
@@ -523,4 +530,74 @@ test('Scenario 8: Monorepo Workspace-Scoped Override in Root', async () => {
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('Vulnerability with no known patched version formats as No fix and calls out in detailed findings', () => {
+  // When carrier parent has fixAvailable but target package has no fix (e.g. braces)
+  const fixAvailable = { name: 'http-proxy-middleware', version: '0.2.0', isSemVerMajor: true };
+  const patched = determinePatchedVersions('*', fixAvailable, 'braces');
+  assert.deepEqual(patched, [], 'Parent package fixAvailable must not be applied to child target package');
+
+  const safeVer = determineSafeVersion('*', '3.0.3', fixAvailable, 'braces');
+  assert.equal(safeVer, null, 'Safe version must be null when no patch exists');
+
+  const vuln = {
+    packageName: 'braces',
+    severity: 'high',
+    currentVersion: '3.0.3',
+    targetSafeVersion: null,
+    patchedVersions: [],
+    dependencyType: 'Indirect (Transitive)',
+    isDirect: false,
+    isIndirect: true,
+    cves: ['CVE-2026-93687'],
+    dependencyPaths: ['[root] -> http-proxy-middleware@4.1.1 -> micromatch@4.0.8 -> braces@3.0.3'],
+  };
+
+  const rem = buildRemediationSuggestion(vuln, [{ name: 'http-proxy-middleware', section: 'dependencies' }], {});
+  assert.equal(rem.strategy, 'none');
+  assert.equal(rem.targetVersion, null);
+  assert.ok(rem.note.includes('No known patched version is currently available for braces'));
+
+  vuln.remediation = rem;
+  const targetFixStr = formatTargetFix(vuln);
+  assert.equal(targetFixStr, '_No fix_');
+
+  const md = generateMarkdownReport({
+    branches: [{ branch: 'main', summary: { total: 1 }, vulnerabilities: [vuln] }],
+  });
+  assert.ok(md.includes('| _No fix_ |'));
+  assert.ok(md.includes('- **Target Fix Version:** _No fix available_'));
+  assert.ok(md.includes('> ⚠️ **No fix available**: No known patched version is currently available for `braces`.'));
+  assert.ok(md.includes('**Consolidated Remediation Plan (none):**'));
+  assert.ok(md.includes('> ⚠️ **No fix available**: No patched release of `braces` currently exists.'));
+});
+
+test('Transitive dependency path formatting: maps [root] to direct parent and sorts root before workspaces', () => {
+  const vuln = {
+    packageName: 'braces',
+    directRoots: [
+      { name: 'http-proxy-middleware', section: 'dependencies', packageJsonPath: 'package.json' },
+      { name: 'msw', section: 'devDependencies', packageJsonPath: 'client/package.json', workspace: '@mono/client' },
+      { name: 'ts-checker-rspack-plugin', section: 'devDependencies', packageJsonPath: 'client/package.json', workspace: '@mono/client' },
+      { name: 'cypress-tags', section: 'devDependencies', packageJsonPath: 'cypress/package.json', workspace: '@mono/cypress' },
+    ],
+    dependencyPaths: [
+      '@mono/client (client/package.json) -> ts-checker-rspack-plugin@1.6.1 -> chokidar@3.6.0 -> braces@3.0.3',
+      '@mono/cypress (cypress/package.json) -> cypress-tags@1.2.2 -> watchify@4.0.0 -> chokidar@3.6.0 -> braces@3.0.3',
+      '[root] -> http-proxy-middleware@4.1.1 -> micromatch@4.0.8 -> braces@3.0.3',
+      '@mono/client (client/package.json) -> msw@1.3.5 -> chokidar@3.6.0 -> braces@3.0.3',
+    ],
+  };
+
+  const paths = formatTransitiveDependencyPaths(vuln);
+  assert.equal(paths.length, 4);
+  // Verify [root] was replaced with http-proxy-middleware
+  assert.ok(!paths.some((p) => p.includes('[root]')));
+
+  // Verify sort order: package.json before workspaces, client before cypress
+  assert.equal(paths[0], 'package.json/dependencies/http-proxy-middleware/.../braces@3.0.3');
+  assert.equal(paths[1], 'client/package.json/devDependencies/msw/.../braces@3.0.3');
+  assert.equal(paths[2], 'client/package.json/devDependencies/ts-checker-rspack-plugin/.../braces@3.0.3');
+  assert.equal(paths[3], 'cypress/package.json/devDependencies/cypress-tags/.../braces@3.0.3');
 });

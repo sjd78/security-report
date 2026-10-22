@@ -233,7 +233,13 @@ export function formatDirectDependencyPaths(v) {
     directPaths.add(`${pkgFile}/${sec}/${v.packageName}${range}`);
   }
 
-  return Array.from(directPaths);
+  return Array.from(directPaths).sort((a, b) => {
+    const isRootA = a.startsWith('package.json');
+    const isRootB = b.startsWith('package.json');
+    if (isRootA && !isRootB) return -1;
+    if (!isRootA && isRootB) return 1;
+    return a.localeCompare(b);
+  });
 }
 
 export function formatTransitiveDependencyPaths(v) {
@@ -257,9 +263,13 @@ export function formatTransitiveDependencyPaths(v) {
     let pkgFile = 'package.json';
     let directRootPkg = null;
     const targetSegment = segments[segments.length - 1];
-
     if (wsMatch) {
       pkgFile = wsMatch[1];
+      if (segments.length > 1) {
+        directRootPkg = segments[1].split('@')[0];
+      }
+    } else if (firstSeg === '[root]' || firstSeg.startsWith('[root]')) {
+      pkgFile = 'package.json';
       if (segments.length > 1) {
         directRootPkg = segments[1].split('@')[0];
       }
@@ -268,7 +278,7 @@ export function formatTransitiveDependencyPaths(v) {
     }
 
     // Direct dependencies are strictly excluded from transitive paths
-    if (!directRootPkg || directRootPkg === v.packageName) {
+    if (!directRootPkg || directRootPkg === v.packageName || directRootPkg === '[root]') {
       continue;
     }
 
@@ -282,7 +292,23 @@ export function formatTransitiveDependencyPaths(v) {
     transitivePaths.add(`${pkgFile}/${section}/${directRootPkg}/.../${targetSegment}`);
   }
 
-  return Array.from(transitivePaths);
+  return Array.from(transitivePaths).sort((a, b) => {
+    const isRootA = a.startsWith('package.json');
+    const isRootB = b.startsWith('package.json');
+    if (isRootA && !isRootB) return -1;
+    if (!isRootA && isRootB) return 1;
+
+    const fileA = a.substring(0, a.indexOf('/'));
+    const fileB = b.substring(0, b.indexOf('/'));
+    if (fileA !== fileB) return fileA.localeCompare(fileB);
+
+    const isDepA = a.includes('/dependencies/');
+    const isDepB = b.includes('/dependencies/');
+    if (isDepA && !isDepB) return -1;
+    if (!isDepA && isDepB) return 1;
+
+    return a.localeCompare(b);
+  });
 }
 
 export function formatCompactDependencyPaths(v, includeDirect = true) {
@@ -368,7 +394,13 @@ export function generateMarkdownReport(report) {
         : `⚠️ Open (installed version \`${v.currentVersion}\` is vulnerable)`;
       lines.push(`- **Status:** ${statusNote}`);
       lines.push(`- **Current Version:** \`${v.currentVersion}\``);
-      lines.push(`- **Target Fix Version:** \`${formatTargetFix(v, ' | ')}\``);
+      const targetFixFormatted = formatTargetFix(v, ' | ');
+      if (targetFixFormatted === '_No fix_') {
+        lines.push(`- **Target Fix Version:** _No fix available_`);
+        lines.push(`> ⚠️ **No fix available**: No known patched version is currently available for \`${v.packageName}\`.`);
+      } else {
+        lines.push(`- **Target Fix Version:** \`${targetFixFormatted}\``);
+      }
 
       if (v.cves && v.cves.length > 0) {
         lines.push(`- **CVE Identifiers (${v.cves.length}):** ${v.cves.map((c) => `\`${c}\``).join(', ')}`);
@@ -433,13 +465,17 @@ export function generateMarkdownReport(report) {
 
       // Consolidated Remediation Plan
       const rem = v.remediation || {};
-      lines.push(`**Consolidated Remediation Plan (${rem.strategy || 'manual'}):**`);
-      if (rem.note) {
+      const noFix = rem.strategy === 'none' || (!v.targetSafeVersion && (!v.patchedVersions || v.patchedVersions.length === 0));
+      lines.push(`**Consolidated Remediation Plan (${noFix ? 'none' : (rem.strategy || 'manual')}):**`);
+      if (noFix) {
+        lines.push(`> ⚠️ **No fix available**: No patched release of \`${v.packageName}\` currently exists. Mitigations or alternative dependencies should be investigated.`);
+        lines.push(``);
+      } else if (rem.note) {
         lines.push(`> _Note: ${rem.note}_`);
         lines.push(``);
       }
 
-      if (rem.packageJsonChanges && rem.packageJsonChanges.length > 0) {
+      if (!noFix && rem.packageJsonChanges && rem.packageJsonChanges.length > 0) {
         lines.push(`1. Update \`package.json\` file(s):`);
         for (const chg of rem.packageJsonChanges) {
           const fileNote = chg.packageJsonPath ? ` (\`${chg.packageJsonPath}\`)` : '';
@@ -451,7 +487,7 @@ export function generateMarkdownReport(report) {
         }
       }
 
-      if (rem.lockfileUpdates && rem.lockfileUpdates.length > 0) {
+      if (!noFix && rem.lockfileUpdates && rem.lockfileUpdates.length > 0) {
         lines.push(`2. Synchronize lockfile:`);
         for (const pkgName of rem.lockfileUpdates) {
           lines.push(`   \`\`\`bash\n   ${formatLockfileUpdate(pkgName)}\n   \`\`\``);

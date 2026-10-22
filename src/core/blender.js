@@ -522,6 +522,12 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
           }
         }
       }
+    } else if (pkg.remediation) {
+      pkg.remediation.strategy = 'none';
+      pkg.remediation.targetVersion = null;
+      pkg.remediation.packageJsonChanges = [];
+      pkg.remediation.lockfileUpdates = [];
+      pkg.remediation.note = `No known patched version is currently available for ${pkg.packageName}. Upstream maintainers have not released a fix; investigate alternative packages or runtime mitigations.`;
     }
 
     // Determine if vulnerability is resolved in repository
