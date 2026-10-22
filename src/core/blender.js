@@ -626,7 +626,8 @@ export function blendVulnerabilitySources(
           branchReport.pkgJson,
           branchReport.pkgLock,
           branchReport.npmLsData,
-          branchReport.workspaces || branchReport.worktreeDir
+          branchReport.workspaces || branchReport.worktreeDir,
+          branchReport.arboristTree
         );
 
         const currentVersion = pkgInfo.currentVersion !== 'unknown'
@@ -657,7 +658,8 @@ export function blendVulnerabilitySources(
           branchReport.pkgJson,
           pkgInfo.chains,
           pkgInfo.directInfo,
-          branchReport.workspaces || branchReport.worktreeDir
+          branchReport.workspaces || branchReport.worktreeDir,
+          branchReport.arboristTree
         );
 
         rawVulns.push({
@@ -698,7 +700,8 @@ export function blendVulnerabilitySources(
           branchReport.pkgJson,
           branchReport.pkgLock,
           branchReport.npmLsData,
-          branchReport.workspaces || branchReport.worktreeDir
+          branchReport.workspaces || branchReport.worktreeDir,
+          branchReport.arboristTree
         );
 
         const currentVersion = pkgInfo.currentVersion !== 'unknown'
@@ -727,7 +730,8 @@ export function blendVulnerabilitySources(
           branchReport.pkgJson,
           pkgInfo.chains,
           pkgInfo.directInfo,
-          branchReport.workspaces || branchReport.worktreeDir
+          branchReport.workspaces || branchReport.worktreeDir,
+          branchReport.arboristTree
         );
 
         rawVulns.push({

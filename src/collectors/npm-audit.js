@@ -84,15 +84,51 @@ export function determineSafeVersion(vulnerableRange, currentVersion, fixAvailab
   return selectBestRemediationVersion(currentVersion, allPatched);
 }
 
-export function canBeResolvedInLockfile(safeVersion, chains = []) {
-  if (!safeVersion || chains.length === 0) return false;
-
+export function canBeResolvedInLockfile(safeVersion, targetPkgOrChains, arboristTree = null, chains = []) {
+  if (!safeVersion) return false;
   const validSafe = semver.valid(safeVersion);
   if (!validSafe) return false;
 
-  let anyParentHasRange = false;
+  let targetPkgName = null;
+  let tree = null;
+  let evalChains = [];
 
-  for (const chain of chains) {
+  if (Array.isArray(targetPkgOrChains)) {
+    evalChains = targetPkgOrChains;
+  } else if (typeof targetPkgOrChains === 'string') {
+    targetPkgName = targetPkgOrChains;
+    if (arboristTree && arboristTree.inventory) {
+      tree = arboristTree;
+    } else if (Array.isArray(arboristTree)) {
+      evalChains = arboristTree;
+    }
+    if (Array.isArray(chains) && chains.length > 0) {
+      evalChains = chains;
+    }
+  }
+
+  if (tree && targetPkgName) {
+    const nodes = Array.from(tree.inventory.query('name', targetPkgName));
+    if (nodes.length > 0) {
+      let anyEdge = false;
+      for (const node of nodes) {
+        for (const edge of node.edgesIn || []) {
+          if (!edge.spec) continue;
+          anyEdge = true;
+          if (!semver.satisfies(validSafe, edge.spec)) {
+            return false;
+          }
+        }
+      }
+      if (anyEdge) return true;
+    }
+  }
+
+  // Fallback to evaluating chains
+  if (evalChains.length === 0) return false;
+
+  let anyParentHasRange = false;
+  for (const chain of evalChains) {
     if (chain.length < 2) continue;
     const immediateParent = chain[chain.length - 2];
     const targetLink = chain[chain.length - 1];
@@ -124,7 +160,7 @@ export function formatLockfileUpdate(packageName) {
   return `npm update ${packageName} --package-lock-only`;
 }
 
-export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = [], directInfo = null, worktreeDir = null) {
+export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = [], directInfo = null, worktreeDir = null, arboristTree = null) {
   const isDirect = vuln.isDirect;
   const isIndirect = vuln.isIndirect;
   const dependencyType = vuln.dependencyType;
@@ -173,7 +209,21 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     };
   }
 
-  // 2. Direct Root Parent Fix Available (npm audit identified parent fix)
+  // 2. In-Range Transitive Lockfile Bump (parent range allows safe version)
+  const canResolveInLock = canBeResolvedInLockfile(safeVersion, vuln.packageName, arboristTree, chains);
+  if (safeVersion && canResolveInLock) {
+    return {
+      strategy: 'lockfile-update',
+      targetPackage: vuln.packageName,
+      targetVersion: safeVersion,
+      directRoot: directRoots[0]?.name || null,
+      packageJsonChanges: [],
+      lockfileUpdates: [vuln.packageName],
+      note: 'Transitive safe version is permitted within parent declared semver ranges. Can be updated directly in lockfile.',
+    };
+  }
+
+  // 3. Direct Root Parent Fix Available (npm audit identified parent fix)
   if (fix && typeof fix === 'object' && fix.name && fix.version) {
     const parentDirectInfo = directRoots.find((r) => r.name === fix.name) || getDirectDependencies(pkgJson, worktreeDir).get(fix.name);
     const parentDecls = parentDirectInfo?.declarations || (parentDirectInfo ? [parentDirectInfo] : []);
@@ -207,20 +257,65 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     };
   }
 
-  // 3. In-Range Transitive Lockfile Bump (parent range allows safe version)
-  if (safeVersion && canBeResolvedInLockfile(safeVersion, chains)) {
+  // 4. Transitive requiring overrides (parent range forbids safeVersion, no parent update available)
+  if (safeVersion) {
+    let workspaceScope = vuln.workspaceScope || null;
+    let forbiddingParentName = vuln.parentPackage || null;
+
+    if (!workspaceScope && chains.length > 0) {
+      const wsNames = new Set();
+      for (const chain of chains) {
+        for (const link of chain) {
+          if (link.isWorkspace && link.name) {
+            wsNames.add(link.name);
+          } else if (link.workspace) {
+            wsNames.add(link.workspace);
+          }
+        }
+      }
+      if (wsNames.size === 1) {
+        workspaceScope = Array.from(wsNames)[0];
+      }
+    }
+
+    if (!forbiddingParentName && chains.length > 0) {
+      for (const chain of chains) {
+        if (chain.length >= 2) {
+          const immParent = chain[chain.length - 2];
+          const target = chain[chain.length - 1];
+          const range = target.requiredRange || immParent.requiredRange;
+          if (range && !semver.satisfies(safeVersion, range)) {
+            forbiddingParentName = immParent.name;
+            break;
+          }
+        }
+      }
+    }
+
+    const overrideChange = {
+      package: vuln.packageName,
+      section: 'overrides',
+      from: null,
+      to: safeVersion,
+      packageJsonPath: 'package.json',
+    };
+    if (workspaceScope) {
+      overrideChange.workspaceScope = workspaceScope;
+    }
+    if (forbiddingParentName) {
+      overrideChange.parentPackage = forbiddingParentName;
+    }
+
     return {
-      strategy: 'lockfile-update',
+      strategy: 'package-override',
       targetPackage: vuln.packageName,
       targetVersion: safeVersion,
-      directRoot: directRoots[0]?.name || null,
-      packageJsonChanges: [],
-      lockfileUpdates: [vuln.packageName],
-      note: 'Transitive safe version is permitted within parent declared semver ranges. Can be updated directly in lockfile.',
+      packageJsonChanges: [overrideChange],
+      lockfileUpdates: [],
     };
   }
 
-  // 4. Transitive with identified Direct Root Parent (e.g. msw)
+  // 5. Transitive with identified Direct Root Parent but no safe version available
   if (directRoots.length > 0) {
     const primaryRoot = directRoots[0];
     return {
@@ -234,25 +329,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     };
   }
 
-  // 5. Fallback: Package Override
-  if (safeVersion) {
-    return {
-      strategy: 'package-override',
-      targetPackage: vuln.packageName,
-      targetVersion: safeVersion,
-      packageJsonChanges: [
-        {
-          package: vuln.packageName,
-          section: 'overrides',
-          from: null,
-          to: safeVersion,
-          packageJsonPath: 'package.json',
-        },
-      ],
-      lockfileUpdates: [],
-    };
-  }
-
+  // 6. Fallback: Lockfile Update
   return {
     strategy: 'lockfile-update',
     targetPackage: vuln.packageName,
@@ -394,7 +471,7 @@ export async function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npm
       continue;
     }
 
-    const pkgInfo = lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData, worktreeDir);
+    const pkgInfo = lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData, worktreeDir, options.arboristTree);
     const isDirect = pkgInfo.isDirect || Boolean(vulnData.isDirect);
     const isIndirect = pkgInfo.isIndirect || !isDirect;
     const dependencyType = pkgInfo.dependencyType !== 'Unknown' ? pkgInfo.dependencyType : (isDirect ? 'Direct' : 'Indirect (Transitive)');
@@ -513,13 +590,29 @@ export async function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npm
       pkgJson,
       chains,
       pkgInfo.directInfo,
-      worktreeDir
+      worktreeDir,
+      options.arboristTree
     );
     vulnerabilities.push(vulnRecord);
   }
 
   // Resolve advisory details (CVE, targetSafeVersion, GitHub Advisory URL) via GitHub / OSV
   await resolveAuditAdvisories(vulnerabilities, options);
+
+  // Re-synchronize remediation after resolving advisories
+  for (const v of vulnerabilities) {
+    if (v.targetSafeVersion && v.remediation?.strategy !== 'bump-direct' && v.remediation?.strategy !== 'bump-direct-and-lockfile') {
+      v.remediation = buildRemediationSuggestion(
+        v,
+        v.directRoots || [],
+        pkgJson,
+        v.dependencyChains || [],
+        v.directInfo || null,
+        worktreeDir,
+        options.arboristTree
+      );
+    }
+  }
 
   vulnerabilities.sort(sortVulnerabilities);
 
@@ -541,7 +634,7 @@ export async function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npm
 export async function collectNpmAudit(worktreeDir, branchName = 'main', options = {}) {
   const [auditJson, npmLsData] = await Promise.all([
     runNpmAuditRaw(worktreeDir),
-    runNpmLs(worktreeDir),
+    options.arboristTree ? Promise.resolve(null) : runNpmLs(worktreeDir),
   ]);
 
   const pkgJson = readPackageJson(worktreeDir);

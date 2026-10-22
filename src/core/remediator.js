@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import semver from 'semver';
 import { collectNpmAudit } from '../collectors/npm-audit.js';
-import { findWorkspacePackageJsons } from './dependency-graph.js';
+import { findWorkspacePackageJsons, getArboristClass } from './dependency-graph.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -48,12 +48,27 @@ export function updatePackageJsonFile(worktreeDir, changes = [], options = {}) {
         const rootEntry = loadedFiles.get(rootPkgPath);
         if (rootEntry) {
           rootEntry.pkgJson.overrides = rootEntry.pkgJson.overrides || {};
-          const prev = rootEntry.pkgJson.overrides[pkgName] || null;
-          rootEntry.pkgJson.overrides[pkgName] = to;
+          let prev = null;
+          if (change.workspaceScope) {
+            rootEntry.pkgJson.overrides[change.workspaceScope] =
+              rootEntry.pkgJson.overrides[change.workspaceScope] || {};
+            prev = rootEntry.pkgJson.overrides[change.workspaceScope][pkgName] || null;
+            rootEntry.pkgJson.overrides[change.workspaceScope][pkgName] = to;
+          } else if (change.parentPackage) {
+            rootEntry.pkgJson.overrides[change.parentPackage] =
+              rootEntry.pkgJson.overrides[change.parentPackage] || {};
+            prev = rootEntry.pkgJson.overrides[change.parentPackage][pkgName] || null;
+            rootEntry.pkgJson.overrides[change.parentPackage][pkgName] = to;
+          } else {
+            prev = rootEntry.pkgJson.overrides[pkgName] || null;
+            rootEntry.pkgJson.overrides[pkgName] = to;
+          }
           rootEntry.modified = true;
           applied.push({
             package: pkgName,
             section: 'overrides',
+            workspaceScope: change.workspaceScope || null,
+            parentPackage: change.parentPackage || null,
             from: prev,
             to,
             packageJsonPath: 'package.json',
@@ -207,7 +222,8 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
     if (!rem) continue;
 
     for (const chg of rem.packageJsonChanges || []) {
-      const key = `${chg.packageJsonPath || 'root'}:${chg.section || 'dependencies'}:${chg.package}`;
+      const scopeKey = chg.workspaceScope ? `ws:${chg.workspaceScope}` : chg.parentPackage ? `parent:${chg.parentPackage}` : 'global';
+      const key = `${chg.packageJsonPath || 'root'}:${chg.section || 'dependencies'}:${scopeKey}:${chg.package}`;
       const existing = changesMap.get(key);
       if (!existing) {
         changesMap.set(key, chg);
@@ -264,6 +280,17 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
   } catch (err) {
     console.warn(`[Remediator] Warning: Post-remediation audit check failed: ${err.message}`);
     postAudit = { vulnerabilities: [] };
+  }
+
+  // Step 2d: Optional Arborist verification
+  try {
+    const Arb = getArboristClass();
+    if (Arb) {
+      const arb = new Arb({ path: worktreeDir, offline: true });
+      await arb.loadVirtual();
+    }
+  } catch {
+    // ignore optional check failures
   }
 
   const remainingPkgNames = new Set(postAudit.vulnerabilities.map((v) => v.packageName));

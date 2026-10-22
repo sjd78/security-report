@@ -13,6 +13,7 @@ Managing security vulnerabilities across large Node.js repositories is often fra
 1. **Step 1: Aggregate & Analyze**
    - Resolves the target repository: `org/repo` shorthand and Git URLs are cloned into an isolated `REPOS/<org>/<name>` cache; a local path is used **in place** (nothing is copied into `REPOS/`).
    - Detaches the base repository's `HEAD` — including local targets — so every branch name is free, then creates one `git worktree` per target branch, reset to the latest fetched `origin/<branch>` when that remote branch exists (otherwise the existing local branch is used, or a new one is created).
+   - Resolves dependency hierarchies and monorepo workspace relationships via `@npmcli/arborist` virtual trees, eliminating false cross-product ancestry when a package exists across multiple distinct versions.
    - Runs `npm audit` with **intermediate package filtering**: dependency carriers lacking direct advisories in `via` are ignored as top-level findings and preserved in ancestor chains.
    - Cross-references findings with Jira CVE tickets and GitHub Dependabot alerts, querying GitHub Advisory API and OSV to resolve CVE identifiers and **all active major version line fixes** (e.g. `2.4.5`, `3.1.6`, `4.1.3`).
    - Compares installed versions against target fixes to track **`Status` (`✅ Resolved` vs `⚠️ Open`)**, identifying flaws that remain logged in Jira or Dependabot but are already solved in code.
@@ -25,7 +26,7 @@ Managing security vulnerabilities across large Node.js repositories is often fra
    - **`bump-direct`**: Directly updates `package.json` semver constraints for direct dependencies (preserving formatting and `^`/`~` prefixes).
    - **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an update available that patches the transitive dependency, bumps the direct parent in `package.json`.
    - **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), updates the lockfile directly without introducing unnecessary `package.json` overrides.
-   - **`package-override`**: Fallback applied only when parent ranges strictly forbid the safe version and no direct parent update exists.
+   - **`package-override`**: Fallback applied only when parent ranges strictly forbid the safe version and no direct parent update exists. Overrides are placed in the root `package.json`, scoped by workspace (`overrides[workspaceScope][pkg] = ver`) or parent package where applicable.
    - Packages already resolved in the repository skip redundant edits and lockfile changes.
    - Performs atomic lockfile synchronization (`npm install --package-lock-only`, then `npm update <pkg> --package-lock-only` for each package that must move within existing ranges) and post-remediation audit verification.
    - Without `--commit`, the branch worktree is **kept** and its path printed — it holds the only copy of the applied fix. A failed remediation also keeps its worktree for inspection.

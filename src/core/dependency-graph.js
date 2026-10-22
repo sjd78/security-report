@@ -1,10 +1,116 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { execFile } from 'node:child_process';
+import os from 'node:os';
+import { createRequire } from 'node:module';
+import { execFile, execSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import semver from 'semver';
 
 const execFileAsync = promisify(execFile);
+
+let cachedArborist = null;
+
+export function getArboristClass() {
+  if (cachedArborist) return cachedArborist;
+
+  // First attempt: local node_modules
+  try {
+    const req = createRequire(import.meta.url);
+    const mod = req('@npmcli/arborist');
+    cachedArborist = mod.default || mod;
+    return cachedArborist;
+  } catch {
+    // continue to fallback
+  }
+
+  // Fallback attempt: dynamically locate npm's bundled Arborist via npm root -g
+  try {
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
+    const req = createRequire(import.meta.url);
+    const candidatePaths = [
+      path.join(globalRoot, 'npm/node_modules/@npmcli/arborist'),
+      path.join(globalRoot, '@npmcli/arborist'),
+    ];
+    for (const cand of candidatePaths) {
+      try {
+        const mod = req(cand);
+        cachedArborist = mod.default || mod;
+        return cachedArborist;
+      } catch {
+        // try next
+      }
+    }
+  } catch {
+    // fallback failed
+  }
+
+  return null;
+}
+
+export async function loadArboristTree({ dir = null, pkgJson = null, pkgLock = null } = {}) {
+  const Arborist = getArboristClass();
+  if (!Arborist) return null;
+
+  if (dir && fs.existsSync(path.resolve(dir, 'package.json'))) {
+    try {
+      const arb = new Arborist({ path: dir, offline: true });
+      return await arb.loadVirtual();
+    } catch {
+      return null;
+    }
+  }
+
+  if (pkgJson || pkgLock) {
+    let tmpDir = null;
+    try {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-arb-'));
+      if (pkgJson) {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify(pkgJson, null, 2));
+      } else {
+        const rootPkg = pkgLock?.packages?.[''] || { name: 'temp-root' };
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify(rootPkg, null, 2));
+      }
+      if (pkgLock) {
+        fs.writeFileSync(path.join(tmpDir, 'package-lock.json'), JSON.stringify(pkgLock, null, 2));
+      }
+
+      // Automatically create workspace directories and package.json if packages exist in pkgLock
+      if (pkgLock?.packages) {
+        for (const [loc, meta] of Object.entries(pkgLock.packages)) {
+          if (loc && !loc.includes('node_modules')) {
+            const wsDir = path.join(tmpDir, loc);
+            fs.mkdirSync(wsDir, { recursive: true });
+            fs.writeFileSync(
+              path.join(wsDir, 'package.json'),
+              JSON.stringify(
+                {
+                  name: meta.name || path.basename(loc),
+                  version: meta.version || '1.0.0',
+                  ...meta,
+                },
+                null,
+                2
+              )
+            );
+          }
+        }
+      }
+
+      const arb = new Arborist({ path: tmpDir, offline: true });
+      return await arb.loadVirtual();
+    } catch {
+      return null;
+    } finally {
+      if (tmpDir) {
+        try {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        } catch {}
+      }
+    }
+  }
+
+  return null;
+}
 
 export function readPackageJson(dir) {
   const pkgPath = path.resolve(dir, 'package.json');
@@ -405,7 +511,106 @@ export function findDirectRoots(chains, directDeps) {
   return Array.from(rootsMap.values());
 }
 
-export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData = null, worktreeOrWorkspaces = null) {
+function getIncomingEdges(node) {
+  const edges = Array.from(node.edgesIn || []);
+  if (node.isWorkspace && node.linksIn) {
+    for (const link of node.linksIn) {
+      for (const edge of link.edgesIn || []) {
+        if (!edge.from.isProjectRoot) {
+          edges.push(edge);
+        }
+      }
+    }
+  }
+  return edges;
+}
+
+function getNodeLabel(node) {
+  const pkgName = node.packageName || node.name;
+  if (node.isProjectRoot) {
+    return '[root]';
+  }
+  if (node.isWorkspace) {
+    const pkgJsonPath = path.join(node.location, 'package.json');
+    return `${pkgName} (${pkgJsonPath})`;
+  }
+  return `${pkgName}@${node.version || 'unknown'}`;
+}
+
+export function traceArboristChains(node, visited = new Set()) {
+  if (visited.has(node)) return [];
+  const nextVisited = new Set(visited);
+  nextVisited.add(node);
+
+  const edges = getIncomingEdges(node);
+
+  const currentStep = {
+    name: node.packageName || node.name,
+    version: node.version,
+    location: node.location,
+    isWorkspace: Boolean(node.isWorkspace),
+    isRoot: Boolean(node.isProjectRoot),
+    packageJsonPath: node.isWorkspace ? path.join(node.location, 'package.json') : (node.isProjectRoot ? 'package.json' : null),
+    specifier: getNodeLabel(node),
+  };
+
+  if (edges.length === 0) {
+    return [[currentStep]];
+  }
+
+  const chains = [];
+  for (const edge of edges) {
+    const parent = edge.from;
+    const parentChains = traceArboristChains(parent, nextVisited);
+    for (const pChain of parentChains) {
+      chains.push([
+        ...pChain,
+        {
+          ...currentStep,
+          requiredRange: edge.spec,
+          type: edge.type,
+        },
+      ]);
+    }
+  }
+  return chains;
+}
+
+export function findDirectRootsFromArborist(chains, targetPkgName = null) {
+  const rootsMap = new Map();
+  for (const chain of chains) {
+    if (!chain || chain.length < 2) continue;
+    let anchorIdx = 0;
+    for (let i = 0; i < chain.length - 1; i++) {
+      if (chain[i].isRoot || chain[i].isWorkspace) {
+        anchorIdx = i;
+      }
+    }
+    const parent = chain[anchorIdx];
+    const directChild = chain[anchorIdx + 1];
+    if (!directChild) continue;
+
+    const pkgJsonPath = parent.packageJsonPath || (parent.isWorkspace && parent.location ? path.join(parent.location, 'package.json') : 'package.json');
+    const key = `${pkgJsonPath}:${directChild.name}`;
+    if (!rootsMap.has(key)) {
+      const section = directChild.type === 'dev' ? 'devDependencies' :
+                      directChild.type === 'optional' ? 'optionalDependencies' :
+                      directChild.type === 'peer' ? 'peerDependencies' : 'dependencies';
+      rootsMap.set(key, {
+        name: directChild.name,
+        currentRange: directChild.requiredRange || directChild.version,
+        section,
+        installedVersion: directChild.version,
+        workspace: parent.isWorkspace ? (parent.packageName || parent.name) : null,
+        packageJsonPath: pkgJsonPath,
+        location: directChild.location,
+      });
+    }
+  }
+  return Array.from(rootsMap.values());
+}
+
+export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData = null, worktreeOrWorkspaces = null, arboristTree = null) {
   if (!pkgName) {
     return {
       isDirect: false,
@@ -421,9 +626,117 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
     };
   }
 
+  let tree = arboristTree;
+  if (!tree && worktreeOrWorkspaces && typeof worktreeOrWorkspaces === 'object' && worktreeOrWorkspaces.inventory) {
+    tree = worktreeOrWorkspaces;
+  }
+
   const directDeps = getDirectDependencies(pkgJson, worktreeOrWorkspaces);
-  const isDirect = directDeps.has(pkgName);
-  const directInfo = isDirect ? directDeps.get(pkgName) : null;
+  const isDirectInPkg = directDeps.has(pkgName);
+  const directInfoFallback = isDirectInPkg ? directDeps.get(pkgName) : null;
+
+  if (tree) {
+    const nodes = Array.from(tree.inventory.query('name', pkgName));
+    const allChains = [];
+    const workspaceDeclarations = [];
+    let hasDirect = false;
+    let hasTransitive = false;
+
+    for (const node of nodes) {
+      const nodeChains = traceArboristChains(node);
+      for (const c of nodeChains) {
+        allChains.push(c);
+      }
+
+      // Check incoming edges
+      for (const edge of node.edgesIn || []) {
+        const parent = edge.from;
+        const isRoot = Boolean(parent.isProjectRoot);
+        const isWs = Boolean(parent.isWorkspace);
+
+        if (isRoot || isWs) {
+          hasDirect = true;
+          const wsName = isWs ? (parent.packageName || parent.name) : null;
+          const wsLoc = isWs ? parent.location : '';
+          const packageJsonPath = isWs ? path.join(wsLoc, 'package.json') : 'package.json';
+          const section = edge.type === 'dev' ? 'devDependencies' :
+                          edge.type === 'optional' ? 'optionalDependencies' :
+                          edge.type === 'peer' ? 'peerDependencies' : 'dependencies';
+          workspaceDeclarations.push({
+            workspace: wsName,
+            packageJsonPath,
+            range: edge.spec,
+            section,
+            isRoot,
+            location: wsLoc,
+          });
+        } else {
+          hasTransitive = true;
+        }
+      }
+
+      if (node.location && node.location.includes('/node_modules/') && !node.location.startsWith('node_modules/' + pkgName)) {
+        hasTransitive = true;
+      }
+    }
+
+    if (isDirectInPkg) {
+      hasDirect = true;
+      if (directInfoFallback) {
+        for (const decl of directInfoFallback.declarations || [directInfoFallback]) {
+          if (!workspaceDeclarations.some((w) => w.packageJsonPath === decl.packageJsonPath)) {
+            workspaceDeclarations.push(decl);
+          }
+        }
+      }
+    }
+
+    if (allChains.some((c) => c.length > 2 || (c.length === 2 && !c[0].isRoot && !c[0].isWorkspace))) {
+      hasTransitive = true;
+    }
+
+    let dependencyType = 'Unknown';
+    if (hasDirect && hasTransitive) {
+      dependencyType = 'Direct & Indirect';
+    } else if (hasDirect) {
+      dependencyType = 'Direct';
+    } else if (hasTransitive) {
+      dependencyType = 'Indirect (Transitive)';
+    }
+
+    const installedVersionSet = new Set(nodes.map((n) => n.version).filter(Boolean));
+    const versionsList = Array.from(installedVersionSet);
+    let currentVersion = 'unknown';
+    if (versionsList.length === 1) {
+      currentVersion = versionsList[0];
+    } else if (versionsList.length > 1) {
+      currentVersion = versionsList.join(', ');
+    } else if (directInfoFallback?.range) {
+      currentVersion = directInfoFallback.range;
+    }
+
+    const directRoots = findDirectRootsFromArborist(allChains, pkgName);
+    const dependencyPaths = allChains.map((c) => c.map((l) => l.specifier).join(' -> '));
+    const directInfo = workspaceDeclarations[0] || directInfoFallback || null;
+
+    return {
+      isDirect: hasDirect,
+      isIndirect: hasTransitive,
+      dependencyType,
+      currentVersion,
+      installedVersions: versionsList,
+      directRoots,
+      dependencyPaths,
+      chains: allChains,
+      directInfo,
+      workspaceDeclarations,
+      arboristTree: tree,
+    };
+  }
+
+  // Fallback: Legacy parsing for unit tests and environments without preloaded Arborist tree
+  const isDirect = isDirectInPkg;
+  const directInfo = directInfoFallback;
   const workspaceDeclarations = directInfo?.declarations || [];
 
   const installedVersionSet = new Set();
@@ -445,7 +758,6 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
   const chains = extractDependencyChains({ name: pkgName, nodes: installedPaths }, pkgLock, directDeps, npmLsData, worktreeOrWorkspaces);
   const directRoots = findDirectRoots(chains, directDeps);
 
-  // If directly declared in a workspace or root, add every declaration as a direct path entry
   if (isDirect && workspaceDeclarations.length > 0) {
     const directVer = installedVersionSet.size > 0 ? Array.from(installedVersionSet)[0] : directInfo?.range || 'installed';
     for (const decl of workspaceDeclarations) {

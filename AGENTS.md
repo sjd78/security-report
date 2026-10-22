@@ -84,7 +84,8 @@ security-report/
     ├── audit-collector.test.js# Audit parsing, chain tracing, remediation strategies & reporting
     ├── remediator.test.js     # package.json modification, change de-duplication and overrides handling
     ├── external-collectors.test.js # Jira/Dependabot parsing, blending and configuration loading
-    └── integration.test.js    # End-to-end multi-branch scan, report, and commit creation
+    ├── integration.test.js    # End-to-end multi-branch scan, report, and commit creation
+    └── arborist-resolution.test.js # Arborist virtual tree resolution, monorepo workspaces & multi-scenario remediation
 ```
 
 ---
@@ -188,6 +189,19 @@ Every strategy carries `packageJsonChanges` (file-scoped semver edits) and `lock
   2. Direct dependencies strictly pull from workspace/root declarations and are excluded from transitive output.
   3. Both sections render in compact code blocks (`<pkgFile>/<section>/...`) for consistency and readability.
 
+
+### M. Arborist-Powered Virtual Dependency Resolution & Multi-Scenario Remediation
+- **Problem**: Custom regex parsing of `package-lock.json` and string-keyed maps (`dependentsMap`) lead to false cross-product ancestry when a package is installed at multiple distinct versions across the dependency graph. Furthermore, monorepo workspaces and npm symlinks are not natively tracked by manual lockfile parsing.
+- **Solution**:
+  1. `src/core/dependency-graph.js` (`loadArboristTree`, `getArboristClass`) loads virtual trees via `@npmcli/arborist` (`new Arborist({ path, offline: true }).loadVirtual()`), utilizing npm's official dependency tree parser across all lockfile versions (v1, v2, v3).
+  2. Dual-mode loader `getArboristClass()` dynamically falls back to npm's bundled Arborist (`npm root -g`) if local `node_modules` is not yet populated.
+  3. `traceArboristChains` traverses physical node incoming edges (`node.edgesIn`), anchoring chains to `[root]` or declared workspace origins (`name (location/package.json)`), seamlessly traversing inter-workspace links.
+  4. `canBeResolvedInLockfile` inspects whether all incoming parent edges satisfy the target safe version constraint.
+  5. 4 Primary Remediation Scenarios:
+     - **Direct Dependency (`bump-direct` / `bump-direct-and-lockfile`)**: Edits declaring `package.json` files across root and workspaces; issues lockfile update for transitive instances when dual.
+     - **Transitive In-Range Lockfile Update (`lockfile-update`)**: Safe version satisfies parent ranges; updates lockfile without adding redundant overrides.
+     - **Transitive with Upgradable Direct Parent (`bump-direct-parent`)**: Parent range forbids safe version, but direct parent upgrade is available.
+     - **Transitive Requiring Overrides (`package-override`)**: Parent range forbids safe version; writes overrides to root `package.json`, scoped by `workspaceScope` (e.g. `overrides: { "@mono/app": { "pkg": "ver" } }`) or `parentPackage` where applicable.
 ---
 
 ## 5. Configuration & Environment Variables
@@ -254,5 +268,6 @@ The test suite runs via native `node --test` with zero external test runners and
 - `test/remediator.test.js`: Indentation detection, direct and workspace `package.json` updates, `overrides` handling including `allowOverrides: false`, and change de-duplication (highest version wins).
 - `test/external-collectors.test.js`: Jira issue parsing, Dependabot alert parsing, branch grouping, blending, and configuration loading (collector auto-disable, `--no-overrides`, config-file isolation).
 - `test/integration.test.js`: End-to-end multi-branch scan and report generation on a throwaway repository, followed by a dry-run remediation and a real commit whose branch ref is asserted.
+- `test/arborist-resolution.test.js`: Exact virtual tree loading, monorepo workspace direct scoping, inter-workspace dependency chain tracing, multi-workspace updates, in-range transitive updates, and root workspace-scoped overrides.
 
 Behaviour that the suite deliberately does not cover — live `npm install`/`npm update` execution and network collectors — is verified manually against a scratch repository before release.
