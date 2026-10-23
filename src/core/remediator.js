@@ -72,6 +72,8 @@ export function updatePackageJsonFile(worktreeDir, changes = [], options = {}) {
             from: prev,
             to,
             packageJsonPath: 'package.json',
+            isSemVerMajor: Boolean(change.isSemVerMajor),
+            isBreaking: Boolean(change.isBreaking),
           });
         }
       }
@@ -103,6 +105,8 @@ export function updatePackageJsonFile(worktreeDir, changes = [], options = {}) {
           from: cur,
           to,
           packageJsonPath: entry.relativePath,
+          isSemVerMajor: Boolean(change.isSemVerMajor),
+          isBreaking: Boolean(change.isBreaking),
         });
       }
     } else {
@@ -127,6 +131,8 @@ export function updatePackageJsonFile(worktreeDir, changes = [], options = {}) {
             from: cur,
             to,
             packageJsonPath: entry.relativePath,
+            isSemVerMajor: Boolean(change.isSemVerMajor),
+            isBreaking: Boolean(change.isBreaking),
           });
         }
       }
@@ -145,6 +151,8 @@ export function updatePackageJsonFile(worktreeDir, changes = [], options = {}) {
             from: cur,
             to,
             packageJsonPath: 'package.json',
+            isSemVerMajor: Boolean(change.isSemVerMajor),
+            isBreaking: Boolean(change.isBreaking),
           });
         }
       }

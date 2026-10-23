@@ -601,3 +601,40 @@ test('Transitive dependency path formatting: maps [root] to direct parent and so
   assert.equal(paths[2], 'client/package.json/devDependencies/ts-checker-rspack-plugin/.../braces@3.0.3');
   assert.equal(paths[3], 'cypress/package.json/devDependencies/cypress-tags/.../braces@3.0.3');
 });
+
+test('Breaking change flag: flags major version updates in remediation, table, and findings', () => {
+  // Test direct parent bump across major version boundary (e.g. react-scripts 4.0.3 -> 5.0.1)
+  const fixAvailable = { name: 'react-scripts', version: '5.0.1', isSemVerMajor: true };
+  const vuln = {
+    packageName: 'node-forge',
+    currentVersion: '0.10.0',
+    targetSafeVersion: '1.3.0',
+    fixAvailable,
+    isDirect: false,
+    isIndirect: true,
+    dependencyType: 'Indirect (Transitive)',
+    cve: 'CVE-2022-25883',
+    dependencyPaths: ['[root] -> react-scripts@4.0.3 -> webpack-dev-server@3.11.1 -> node-forge@0.10.0'],
+  };
+
+  const directRoots = [{ name: 'react-scripts', currentRange: '^4.0.3', section: 'dependencies', packageJsonPath: 'package.json' }];
+  const rem = buildRemediationSuggestion(vuln, directRoots, {}, [], null, null);
+
+  assert.equal(rem.strategy, 'bump-direct-parent');
+  assert.equal(rem.isSemVerMajor, true);
+  assert.equal(rem.isBreaking, true);
+  assert.equal(rem.packageJsonChanges[0].isBreaking, true);
+
+  vuln.remediation = rem;
+  const md = generateMarkdownReport({
+    branches: [{ branch: 'main', summary: { total: 1 }, vulnerabilities: [vuln] }],
+  });
+
+  // Table includes breaking indicator
+  assert.ok(md.includes('⚠️ _(Breaking)_'));
+  // Detailed findings call out breaking major version upgrade
+  assert.ok(md.includes('⚠️ *(Breaking major version upgrade)*'));
+  assert.ok(md.includes('- **Breaking Change:** ⚠️ Yes (major version upgrade)'));
+  // Remediation plan warns developer to test thoroughly
+  assert.ok(md.includes('⚠️ **Breaking Change**: This remediation requires a major version upgrade'));
+});

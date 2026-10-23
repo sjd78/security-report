@@ -53,13 +53,18 @@ export function generateCommitMessage(branchName, remediationResult, options = {
   if (appliedChanges.length > 0) {
     bodyLines.push('### Changes Applied:');
     for (const chg of appliedChanges) {
+      const isBreaking = Boolean(chg.isBreaking || chg.isSemVerMajor);
+      const breakTag = isBreaking ? ' (BREAKING)' : '';
       if (chg.section === 'overrides') {
-        bodyLines.push(`- Added override: "${chg.package}": "${chg.to}"`);
+        bodyLines.push(`- Added override${breakTag}: "${chg.package}": "${chg.to}"`);
       } else {
-        bodyLines.push(`- Updated ${chg.package} ${chg.from || 'none'} -> ${chg.to} in ${chg.section || 'dependencies'}`);
+        bodyLines.push(`- Updated${breakTag} ${chg.package} ${chg.from || 'none'} -> ${chg.to} in ${chg.section || 'dependencies'}`);
       }
     }
     bodyLines.push('- Synchronized package-lock.json');
+    if (appliedChanges.some((c) => c.isBreaking || c.isSemVerMajor)) {
+      bodyLines.push('- ⚠️ Breaking change: One or more dependencies were upgraded across major version boundaries.');
+    }
     bodyLines.push('');
   }
 

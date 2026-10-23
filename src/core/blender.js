@@ -1,6 +1,6 @@
 import semver from 'semver';
 import { lookupPackageInstalledInfo } from './dependency-graph.js';
-import { buildRemediationSuggestion } from '../collectors/npm-audit.js';
+import { buildRemediationSuggestion, isBreakingChange } from '../collectors/npm-audit.js';
 
 export function isVersionCompatible(ticketVersions = [], targetVersions = []) {
   if (!targetVersions || targetVersions.length === 0) return true;
@@ -521,6 +521,10 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
             }
           }
         }
+        if (isBreakingChange(pkg.currentVersion, optimalSafeVersion)) {
+          pkg.remediation.isSemVerMajor = true;
+          pkg.remediation.isBreaking = true;
+        }
       }
     } else if (pkg.remediation) {
       pkg.remediation.strategy = 'none';
@@ -534,6 +538,8 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
     const resolved = isVulnerabilityResolved(pkg);
     pkg.status = resolved ? 'resolved' : 'open';
     pkg.resolved = resolved;
+    pkg.isSemVerMajor = Boolean(pkg.remediation?.isSemVerMajor);
+    pkg.isBreaking = Boolean(pkg.remediation?.isBreaking);
 
     if (resolved && pkg.remediation) {
       pkg.remediation.packageJsonChanges = [];

@@ -86,6 +86,21 @@ export function determineSafeVersion(vulnerableRange, currentVersion, fixAvailab
   return selectBestRemediationVersion(currentVersion, allPatched);
 }
 
+export function isBreakingChange(fromRangeOrVer, toRangeOrVer) {
+  if (!fromRangeOrVer || !toRangeOrVer) return false;
+  try {
+    const cleanFromStr = String(fromRangeOrVer).replace(/^[~^<>= ]+/, '').trim().split(',')[0].trim();
+    const cleanToStr = String(toRangeOrVer).replace(/^[~^<>= ]+/, '').trim().split(',')[0].trim();
+    const vFrom = semver.coerce(cleanFromStr);
+    const vTo = semver.coerce(cleanToStr);
+    if (!vFrom || !vTo) return false;
+
+    return vTo.major > vFrom.major;
+  } catch {
+    return false;
+  }
+}
+
 export function canBeResolvedInLockfile(safeVersion, targetPkgOrChains, arboristTree = null, chains = []) {
   if (!safeVersion) return false;
   const validSafe = semver.valid(safeVersion);
@@ -176,6 +191,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
   // 1. Direct Dependency (Pure Direct OR Dual Direct & Indirect, like js-yaml)
   if (isDirect || dependencyType === 'Direct & Indirect' || declarations.length > 0) {
     const packageJsonChanges = [];
+    let isBreaking = false;
 
     for (const decl of declarations) {
       const currentRange = decl.range || `^${String(vuln.currentVersion || '').split(',')[0].trim()}`;
@@ -183,6 +199,8 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       const targetRange = safeVersion ? `${prefix}${safeVersion}` : (fix?.version ? `${prefix}${fix.version}` : null);
 
       if (targetRange) {
+        const changeIsBreaking = isBreakingChange(currentRange, targetRange);
+        if (changeIsBreaking) isBreaking = true;
         packageJsonChanges.push({
           package: vuln.packageName,
           section: decl.section || 'dependencies',
@@ -190,6 +208,8 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
           to: targetRange,
           packageJsonPath: decl.packageJsonPath || 'package.json',
           workspace: decl.workspace || null,
+          isSemVerMajor: changeIsBreaking,
+          isBreaking: changeIsBreaking,
         });
       }
     }
@@ -202,6 +222,8 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       targetVersion: safeVersion || fix?.version || null,
       workspaceDeclarations: declarations,
       packageJsonChanges,
+      isSemVerMajor: isBreaking,
+      isBreaking,
       // A pure direct bump is fully carried by the package.json edit plus the base
       // lockfile sync; transitive instances need an explicit re-resolution.
       lockfileUpdates: isDual || packageJsonChanges.length === 0 ? [vuln.packageName] : [],
@@ -220,6 +242,8 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       targetVersion: safeVersion,
       directRoot: directRoots[0]?.name || null,
       packageJsonChanges: [],
+      isSemVerMajor: false,
+      isBreaking: false,
       lockfileUpdates: [vuln.packageName],
       note: 'Transitive safe version is permitted within parent declared semver ranges. Can be updated directly in lockfile.',
     };
@@ -230,11 +254,14 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     const parentDirectInfo = directRoots.find((r) => r.name === fix.name) || getDirectDependencies(pkgJson, worktreeDir).get(fix.name);
     const parentDecls = parentDirectInfo?.declarations || (parentDirectInfo ? [parentDirectInfo] : []);
 
+    let isBreaking = Boolean(fix.isSemVerMajor);
     const packageJsonChanges = [];
     for (const decl of parentDecls) {
       const currentRange = decl.range || `^${fix.version}`;
       const prefix = currentRange.startsWith('~') ? '~' : currentRange.startsWith('^') ? '^' : '';
       const targetRange = `${prefix}${fix.version}`;
+      const changeIsBreaking = isBreaking || isBreakingChange(currentRange, targetRange);
+      if (changeIsBreaking) isBreaking = true;
 
       packageJsonChanges.push({
         package: fix.name,
@@ -243,6 +270,8 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
         to: targetRange,
         packageJsonPath: decl.packageJsonPath || 'package.json',
         workspace: decl.workspace || null,
+        isSemVerMajor: changeIsBreaking,
+        isBreaking: changeIsBreaking,
       });
     }
 
@@ -250,7 +279,8 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       strategy: 'bump-direct-parent',
       targetPackage: fix.name,
       targetVersion: fix.version,
-      isSemVerMajor: Boolean(fix.isSemVerMajor),
+      isSemVerMajor: isBreaking,
+      isBreaking,
       directRoot: parentDirectInfo?.name || fix.name,
       packageJsonChanges,
       lockfileUpdates: packageJsonChanges.length > 0
@@ -294,12 +324,15 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       }
     }
 
+    const isBreaking = isBreakingChange(vuln.currentVersion, safeVersion);
     const overrideChange = {
       package: vuln.packageName,
       section: 'overrides',
       from: null,
       to: safeVersion,
       packageJsonPath: 'package.json',
+      isSemVerMajor: isBreaking,
+      isBreaking,
     };
     if (workspaceScope) {
       overrideChange.workspaceScope = workspaceScope;
@@ -312,6 +345,8 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       strategy: 'package-override',
       targetPackage: vuln.packageName,
       targetVersion: safeVersion,
+      isSemVerMajor: isBreaking,
+      isBreaking,
       packageJsonChanges: [overrideChange],
       lockfileUpdates: [],
     };

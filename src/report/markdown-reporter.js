@@ -331,8 +331,11 @@ export function generateMarkdownReport(report) {
   lines.push(`# 🛡️ Security Vulnerability & Remediation Report`);
   lines.push(``);
   lines.push(`**Repository:** \`${report.repository?.fullName || 'unknown'}\``);
+  lines.push(``);
   lines.push(`**Generated:** ${report.generatedAt}`);
+  lines.push(``);
   lines.push(`**Branches Scanned:** ${report.summary?.totalBranches || 0}`);
+  lines.push(``);
   lines.push(`**Total Vulnerable Packages Identified:** ${report.summary?.totalVulnerabilities || 0}`);
   lines.push(``);
 
@@ -372,7 +375,11 @@ export function generateMarkdownReport(report) {
     for (const v of sortedVulns) {
       const typeLabel = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct' : 'Indirect (Transitive)'));
       const statusBadge = formatStatus(v);
-      const targetFix = formatTargetFix(v);
+      let targetFix = formatTargetFix(v);
+      const isBreaking = Boolean(v.remediation?.isBreaking || v.remediation?.isSemVerMajor || v.isBreaking || v.isSemVerMajor);
+      if (isBreaking && targetFix !== '_No fix_' && !targetFix.includes('⚠️')) {
+        targetFix += `<br>⚠️ _(Breaking)_`;
+      }
       const cves = formatCves(v);
       const sources = formatSources(v);
       lines.push(
@@ -395,9 +402,13 @@ export function generateMarkdownReport(report) {
       lines.push(`- **Status:** ${statusNote}`);
       lines.push(`- **Current Version:** \`${v.currentVersion}\``);
       const targetFixFormatted = formatTargetFix(v, ' | ');
+      const isBreaking = Boolean(v.remediation?.isBreaking || v.remediation?.isSemVerMajor || v.isBreaking || v.isSemVerMajor);
       if (targetFixFormatted === '_No fix_') {
         lines.push(`- **Target Fix Version:** _No fix available_`);
         lines.push(`> ⚠️ **No fix available**: No known patched version is currently available for \`${v.packageName}\`.`);
+      } else if (isBreaking) {
+        lines.push(`- **Target Fix Version:** \`${targetFixFormatted}\` ⚠️ *(Breaking major version upgrade)*`);
+        lines.push(`- **Breaking Change:** ⚠️ Yes (major version upgrade)`);
       } else {
         lines.push(`- **Target Fix Version:** \`${targetFixFormatted}\``);
       }
@@ -457,9 +468,6 @@ export function generateMarkdownReport(report) {
           lines.push("  " + cp);
         }
         lines.push("  ```");
-        if (transitivePaths.some((p) => p.includes('/.../'))) {
-          lines.push(`  > _Note: Compact path summary shown. To inspect full transitive tree, run \`npm ls ${v.packageName}\` or \`npm why ${v.packageName}\`._`);
-        }
       }
       lines.push(``);
 
@@ -470,9 +478,17 @@ export function generateMarkdownReport(report) {
       if (noFix) {
         lines.push(`> ⚠️ **No fix available**: No patched release of \`${v.packageName}\` currently exists. Mitigations or alternative dependencies should be investigated.`);
         lines.push(``);
-      } else if (rem.note) {
-        lines.push(`> _Note: ${rem.note}_`);
-        lines.push(``);
+      } else {
+        if (isBreaking) {
+          const targetPkg = rem.targetPackage || v.packageName;
+          const targetVer = rem.targetVersion || v.targetSafeVersion;
+          lines.push(`> ⚠️ **Breaking Change**: This remediation requires a major version upgrade (\`${targetPkg}\` to \`${targetVer}\`). Review the package changelog and test thoroughly for breaking changes.`);
+          lines.push(``);
+        }
+        if (rem.note) {
+          lines.push(`> _Note: ${rem.note}_`);
+          lines.push(``);
+        }
       }
 
       if (!noFix && rem.packageJsonChanges && rem.packageJsonChanges.length > 0) {
