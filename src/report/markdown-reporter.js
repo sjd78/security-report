@@ -109,31 +109,7 @@ export function formatSources(v) {
     }
   };
 
-  // 1. Jira ticket(s)
-  if (v.sources?.jiraTickets && v.sources.jiraTickets.length > 0) {
-    for (const jt of v.sources.jiraTickets) {
-      if (jt?.ticketKey) {
-        addSource(jt.url ? `[${jt.ticketKey}](${jt.url})` : jt.ticketKey);
-      }
-    }
-  } else if (v.sources?.jira?.ticketKey) {
-    const jt = v.sources.jira;
-    addSource(jt.url ? `[${jt.ticketKey}](${jt.url})` : jt.ticketKey);
-  }
-
-  // 2. GitHub Dependabot alert(s)
-  if (v.sources?.dependabotAlerts && v.sources.dependabotAlerts.length > 0) {
-    for (const da of v.sources.dependabotAlerts) {
-      if (da?.alertNumber) {
-        addSource(da.url ? `[#${da.alertNumber}](${da.url})` : `#${da.alertNumber}`);
-      }
-    }
-  } else if (v.sources?.dependabot?.alertNumber) {
-    const da = v.sources.dependabot;
-    addSource(da.url ? `[#${da.alertNumber}](${da.url})` : `#${da.alertNumber}`);
-  }
-
-  // 3. npm audit
+  // 1. npm audit
   const hasExplicitNpmAudit = Boolean(v.sources?.npmAudit) || (Array.isArray(v.advisories) && v.advisories.some((a) => Boolean(a.sources?.npmAudit)));
   const hasOtherSources = Boolean(
     v.sources?.jira ||
@@ -176,11 +152,34 @@ export function formatSources(v) {
     }
   }
 
+  // 2. Jira ticket(s)
+  if (v.sources?.jiraTickets && v.sources.jiraTickets.length > 0) {
+    for (const jt of v.sources.jiraTickets) {
+      if (jt?.ticketKey) {
+        addSource(jt.url ? `[${jt.ticketKey}](${jt.url})` : jt.ticketKey);
+      }
+    }
+  } else if (v.sources?.jira?.ticketKey) {
+    const jt = v.sources.jira;
+    addSource(jt.url ? `[${jt.ticketKey}](${jt.url})` : jt.ticketKey);
+  }
+
+  // 3. GitHub Dependabot alert(s)
+  if (v.sources?.dependabotAlerts && v.sources.dependabotAlerts.length > 0) {
+    for (const da of v.sources.dependabotAlerts) {
+      if (da?.alertNumber) {
+        addSource(da.url ? `[#${da.alertNumber}](${da.url})` : `#${da.alertNumber}`);
+      }
+    }
+  } else if (v.sources?.dependabot?.alertNumber) {
+    const da = v.sources.dependabot;
+    addSource(da.url ? `[#${da.alertNumber}](${da.url})` : `#${da.alertNumber}`);
+  }
   if (sources.length === 0) {
     return '_None_';
   }
 
-  return sources.join(', <br>');
+  return sources.join('<br>');
 }
 
 export function formatTicketLinks(v) {
@@ -453,7 +452,7 @@ export function generateMarkdownReport(report) {
       // Direct Dependencies
       const directPaths = formatDirectDependencyPaths(v);
       if (directPaths.length > 0) {
-        lines.push(`- **Direct Dependency Paths:**`);
+        lines.push(`- **Direct Dependencies:**`);
         lines.push("  ```text");
         for (const dp of directPaths) {
           lines.push("  " + dp);
@@ -464,7 +463,7 @@ export function generateMarkdownReport(report) {
       // Transitive Dependency Paths
       const transitivePaths = formatTransitiveDependencyPaths(v);
       if (transitivePaths.length > 0) {
-        lines.push(`- **Transitive Dependency Paths:**`);
+        lines.push(`- **Transitive Dependency Path:**`);
         lines.push("  ```text");
         for (const cp of transitivePaths) {
           lines.push("  " + cp);

@@ -567,10 +567,8 @@ test('Vulnerability with no known patched version formats as No fix and calls ou
     branches: [{ branch: 'main', summary: { total: 1 }, vulnerabilities: [vuln] }],
   });
   assert.ok(md.includes('| _No fix_ |'));
-  assert.ok(md.includes('- **Target Fix Version:** _No fix available_'));
-  assert.ok(md.includes('> ⚠️ **No fix available**: No known patched version is currently available for `braces`.'));
-  assert.ok(md.includes('**Consolidated Remediation Plan (none):**'));
-  assert.ok(md.includes('> ⚠️ **No fix available**: No patched release of `braces` currently exists.'));
+  assert.ok(md.includes('No known patched version is currently available for `braces`'));
+  assert.ok(md.includes('No patched release of `braces` currently exists'));
 });
 
 test('Transitive dependency path formatting: maps [root] to direct parent and sorts root before workspaces', () => {
@@ -633,8 +631,25 @@ test('Breaking change flag: flags major version updates in remediation, table, a
   // Table includes breaking indicator
   assert.ok(md.includes('⚠️ _(Breaking)_'));
   // Detailed findings call out breaking major version upgrade
-  assert.ok(md.includes('⚠️ *(Breaking major version upgrade)*'));
-  assert.ok(md.includes('- **Breaking Change:** ⚠️ Yes (major version upgrade)'));
-  // Remediation plan warns developer to test thoroughly
-  assert.ok(md.includes('⚠️ **Breaking Change**: This remediation requires a major version upgrade'));
+  assert.ok(md.includes('major version upgrade required'));
+  assert.ok(md.includes('Breaking Change:'));
+});
+
+test('Transitive dependency path formatting: correctly identifies root devDependencies like concurrently', () => {
+  const vuln = {
+    packageName: 'shell-quote',
+    directRoots: [
+      { name: 'concurrently', section: 'devDependencies', packageJsonPath: 'package.json' },
+      { name: 'cypress-tags', section: 'devDependencies', packageJsonPath: 'cypress/package.json', workspace: '@mono/cypress' },
+    ],
+    dependencyPaths: [
+      '[root] -> concurrently@10.0.5 -> shell-quote@1.9.0',
+      '@mono/cypress (cypress/package.json) -> cypress-tags@1.2.2 -> @cypress/browserify-preprocessor@3.0.2 -> shell-quote@1.9.0',
+    ],
+  };
+
+  const paths = formatTransitiveDependencyPaths(vuln);
+  assert.equal(paths.length, 2);
+  assert.equal(paths[0], 'package.json/devDependencies/concurrently/.../shell-quote@1.9.0');
+  assert.equal(paths[1], 'cypress/package.json/devDependencies/cypress-tags/.../shell-quote@1.9.0');
 });

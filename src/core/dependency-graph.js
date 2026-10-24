@@ -556,7 +556,7 @@ export function getArboristLogicalChains(tree, targetName) {
       location: edge.to.location,
       packageJsonPath: 'package.json',
       workspace: null,
-      isRoot: true,
+      isRoot: false,
       specifier: `${directRootName}@${edge.to.version}`,
     };
     const rootAnchor = {
