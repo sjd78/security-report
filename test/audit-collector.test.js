@@ -206,7 +206,7 @@ test('generateMarkdownReport: table renders multiple CVEs and multiple sources w
   const mdReport = generateMarkdownReport(jsonReport);
   assert.ok(
     mdReport.includes(
-      '| **`multi-vuln-pkg`** | ⚠️ Open | **HIGH** | Indirect (Transitive) | `2.0.0` | `2.1.0` | `CVE-2023-1111`<br>`CVE-2023-2222` | npm audit<br>[MTA-5000](https://jira/MTA-5000)<br>[#99](https://github/alert/99) |'
+      '| **`multi-vuln-pkg`** | ⚠️ Open | **HIGH** | Indirect (Transitive) | `2.0.0` | `2.1.0` | `CVE-2023-1111`<br>`CVE-2023-2222` | [MTA-5000](https://jira/MTA-5000)<br>[#99](https://github/alert/99)<br>npm audit |'
     )
   );
 });
@@ -292,7 +292,7 @@ test('formatSources: formats npm audit, jira link, dependabot link, and multiple
         dependabot: { alertNumber: 42, url: 'https://github.com/org/repo/security/dependabot/42' },
       },
     }),
-    'npm audit<br>[MTA-7680](https://issues.redhat.com/browse/MTA-7680)<br>[#42](https://github.com/org/repo/security/dependabot/42)'
+    '[MTA-7680](https://issues.redhat.com/browse/MTA-7680)<br>[#42](https://github.com/org/repo/security/dependabot/42)<br>npm audit'
   );
 
   // Multiple Jira tickets and Dependabot alerts
