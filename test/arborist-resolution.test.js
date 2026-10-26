@@ -653,3 +653,49 @@ test('Transitive dependency path formatting: correctly identifies root devDepend
   assert.equal(paths[0], 'package.json/devDependencies/concurrently/.../shell-quote@1.9.0');
   assert.equal(paths[1], 'cypress/package.json/devDependencies/cypress-tags/.../shell-quote@1.9.0');
 });
+
+test('Remediation planning: detects in-range transient override vs out-of-range persistent override', () => {
+  // 1. In-range transitive: parent allows safeVersion (e.g. express allows body-parser ^2.2.0, installed 2.3.0, safe 2.4.0)
+  const inRangeVuln = {
+    packageName: 'body-parser',
+    currentVersion: '2.3.0',
+    targetSafeVersion: '2.4.0',
+    isDirect: false,
+    isIndirect: true,
+  };
+  const mockChains = [
+    [
+      { name: '[root]', isRoot: true },
+      { name: 'express', version: '5.1.0', requiredRange: '^2.2.0' },
+      { name: 'body-parser', version: '2.3.0', requiredRange: '^2.2.0' },
+    ],
+  ];
+  const remInRange = buildRemediationSuggestion(inRangeVuln, [{ name: 'express', section: 'dependencies' }], {}, mockChains);
+  assert.equal(remInRange.strategy, 'lockfile-update');
+  assert.equal(remInRange.isOutOfRange, false);
+  assert.equal(remInRange.packageJsonChanges.length, 0);
+  assert.equal(remInRange.transientOverrides.length, 1);
+  assert.equal(remInRange.transientOverrides[0].package, 'body-parser');
+
+  // 2. Out-of-range transitive: parent forbids safeVersion (e.g. parent requires ~1.0.0, installed 1.0.2, safe 1.2.0)
+  const outOfRangeVuln = {
+    packageName: 'child',
+    currentVersion: '1.0.2',
+    targetSafeVersion: '1.2.0',
+    isDirect: false,
+    isIndirect: true,
+  };
+  const forbidChains = [
+    [
+      { name: '[root]', isRoot: true },
+      { name: 'parent', version: '1.0.0', requiredRange: '~1.0.0' },
+      { name: 'child', version: '1.0.2', requiredRange: '~1.0.0' },
+    ],
+  ];
+  const remOut = buildRemediationSuggestion(outOfRangeVuln, [{ name: 'parent', section: 'dependencies' }], {}, forbidChains);
+  assert.equal(remOut.strategy, 'package-override');
+  assert.equal(remOut.isOutOfRange, true);
+  assert.equal(remOut.packageJsonChanges.length, 1);
+  assert.equal(remOut.packageJsonChanges[0].section, 'overrides');
+  assert.equal(remOut.packageJsonChanges[0].isOutOfRange, true);
+});

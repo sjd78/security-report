@@ -101,6 +101,21 @@ export function isBreakingChange(fromRangeOrVer, toRangeOrVer) {
   }
 }
 
+export function isOutOfRangeChange(currentRangeOrVer, targetVersion) {
+  if (!currentRangeOrVer || !targetVersion) return false;
+  try {
+    const range = String(currentRangeOrVer).trim().split(',')[0].trim();
+    const cleanVer = semver.clean(String(targetVersion).replace(/^[~^]/, '')) || semver.coerce(targetVersion)?.version;
+    if (!cleanVer) return false;
+    if (semver.validRange(range) && !semver.satisfies(cleanVer, range)) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function canBeResolvedInLockfile(safeVersion, targetPkgOrChains, arboristTree = null, chains = []) {
   if (!safeVersion) return false;
   const validSafe = semver.valid(safeVersion);
@@ -201,6 +216,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       if (targetRange) {
         const changeIsBreaking = isBreakingChange(currentRange, targetRange);
         if (changeIsBreaking) isBreaking = true;
+
         packageJsonChanges.push({
           package: vuln.packageName,
           section: decl.section || 'dependencies',
@@ -208,6 +224,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
           to: targetRange,
           packageJsonPath: decl.packageJsonPath || 'package.json',
           workspace: decl.workspace || null,
+          isOutOfRange: changeIsBreaking,
           isSemVerMajor: changeIsBreaking,
           isBreaking: changeIsBreaking,
         });
@@ -222,10 +239,10 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       targetVersion: safeVersion || fix?.version || null,
       workspaceDeclarations: declarations,
       packageJsonChanges,
+      isOutOfRange: isBreaking,
       isSemVerMajor: isBreaking,
       isBreaking,
-      // A pure direct bump is fully carried by the package.json edit plus the base
-      // lockfile sync; transitive instances need an explicit re-resolution.
+      transientOverrides: isDual && safeVersion ? [{ package: vuln.packageName, to: `^${safeVersion}` }] : [],
       lockfileUpdates: isDual || packageJsonChanges.length === 0 ? [vuln.packageName] : [],
       note: isDual
         ? 'Package is both a direct dependency and required transitively. Resolution updates package.json semver and synchronizes lockfile for all instances.'
@@ -242,10 +259,17 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       targetVersion: safeVersion,
       directRoot: directRoots[0]?.name || null,
       packageJsonChanges: [],
+      transientOverrides: [
+        {
+          package: vuln.packageName,
+          to: `^${safeVersion}`,
+        },
+      ],
+      isOutOfRange: false,
       isSemVerMajor: false,
       isBreaking: false,
       lockfileUpdates: [vuln.packageName],
-      note: 'Transitive safe version is permitted within parent declared semver ranges. Can be updated directly in lockfile.',
+      note: 'Transitive safe version is permitted within parent declared semver ranges. Can be updated directly in lockfile via transient pin.',
     };
   }
 
@@ -255,6 +279,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     const parentDecls = parentDirectInfo?.declarations || (parentDirectInfo ? [parentDirectInfo] : []);
 
     let isBreaking = Boolean(fix.isSemVerMajor);
+    let isOutOfRange = false;
     const packageJsonChanges = [];
     for (const decl of parentDecls) {
       const currentRange = decl.range || `^${fix.version}`;
@@ -262,6 +287,8 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       const targetRange = `${prefix}${fix.version}`;
       const changeIsBreaking = isBreaking || isBreakingChange(currentRange, targetRange);
       if (changeIsBreaking) isBreaking = true;
+      const changeOutOfRange = isOutOfRangeChange(decl.range, targetRange);
+      if (changeOutOfRange) isOutOfRange = true;
 
       packageJsonChanges.push({
         package: fix.name,
@@ -270,6 +297,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
         to: targetRange,
         packageJsonPath: decl.packageJsonPath || 'package.json',
         workspace: decl.workspace || null,
+        isOutOfRange: changeOutOfRange,
         isSemVerMajor: changeIsBreaking,
         isBreaking: changeIsBreaking,
       });
@@ -279,6 +307,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       strategy: 'bump-direct-parent',
       targetPackage: fix.name,
       targetVersion: fix.version,
+      isOutOfRange,
       isSemVerMajor: isBreaking,
       isBreaking,
       directRoot: parentDirectInfo?.name || fix.name,
@@ -331,6 +360,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       from: null,
       to: safeVersion,
       packageJsonPath: 'package.json',
+      isOutOfRange: true,
       isSemVerMajor: isBreaking,
       isBreaking,
     };
@@ -345,10 +375,12 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       strategy: 'package-override',
       targetPackage: vuln.packageName,
       targetVersion: safeVersion,
+      isOutOfRange: true,
       isSemVerMajor: isBreaking,
       isBreaking,
       packageJsonChanges: [overrideChange],
       lockfileUpdates: [],
+      note: 'Transitive dependency is forbidden by parent declared ranges. Requires persistent root override.',
     };
   }
 
@@ -636,6 +668,12 @@ export async function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npm
         options.arboristTree
       );
     }
+  }
+
+  for (const v of vulnerabilities) {
+    v.isOutOfRange = Boolean(v.remediation?.isOutOfRange);
+    v.isBreaking = Boolean(v.remediation?.isBreaking);
+    v.isSemVerMajor = Boolean(v.remediation?.isSemVerMajor);
   }
 
   vulnerabilities.sort(sortVulnerabilities);

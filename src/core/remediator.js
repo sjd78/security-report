@@ -223,6 +223,7 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
   }
 
   const changesMap = new Map();
+  const transientOverridesMap = new Map();
   const lockfileUpdates = [];
 
   for (const vuln of vulnerabilities) {
@@ -244,6 +245,19 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
       }
     }
 
+    for (const tOv of rem.transientOverrides || []) {
+      const existing = transientOverridesMap.get(tOv.package);
+      if (!existing) {
+        transientOverridesMap.set(tOv.package, tOv);
+        continue;
+      }
+      const cleanExisting = semver.clean(String(existing.to).replace(/^[~^]/, ''));
+      const cleanNew = semver.clean(String(tOv.to).replace(/^[~^]/, ''));
+      if (cleanExisting && cleanNew && semver.gt(cleanNew, cleanExisting)) {
+        transientOverridesMap.set(tOv.package, tOv);
+      }
+    }
+
     for (const pkgName of rem.lockfileUpdates || []) {
       if (pkgName && !lockfileUpdates.includes(pkgName)) lockfileUpdates.push(pkgName);
     }
@@ -251,12 +265,14 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
 
   // Deduplicated per target; the highest requested version wins.
   const pendingChanges = Array.from(changesMap.values());
+  const pendingTransient = Array.from(transientOverridesMap.values());
 
   if (options.dryRun) {
     return {
       branch: branchName,
       dryRun: true,
       appliedChanges: pendingChanges,
+      transientOverrides: pendingTransient,
       lockfileUpdates,
       resolved: vulnerabilities,
       remaining: [],
@@ -267,10 +283,35 @@ export async function remediateBranch(worktreeDir, branchReport, options = {}) {
   // Step 2a: Update package.json files (root and workspaces)
   const { applied, touchedFiles } = updatePackageJsonFile(worktreeDir, pendingChanges, options);
 
-  // Step 2b: Rebuild the lockfile from the updated ranges, then re-resolve every
-  // package whose fix lives inside ranges the parents already permit.
-  await syncLockfile(worktreeDir, options);
+  // Step 2b: If transient overrides exist for in-range transitive packages:
+  // Apply temporary override -> sync lockfile -> strip temporary override -> re-sync lockfile
+  if (pendingTransient.length > 0 && options.allowOverrides !== false) {
+    const rootPkgPath = path.resolve(worktreeDir, 'package.json');
+    const rootRaw = fs.readFileSync(rootPkgPath, 'utf8');
+    const rootPkg = JSON.parse(rootRaw);
+    const indent = detectIndentation(rootRaw);
 
+    const savedOverrides = rootPkg.overrides ? JSON.parse(JSON.stringify(rootPkg.overrides)) : null;
+
+    rootPkg.overrides = rootPkg.overrides || {};
+    for (const tOv of pendingTransient) {
+      rootPkg.overrides[tOv.package] = tOv.to;
+    }
+    fs.writeFileSync(rootPkgPath, JSON.stringify(rootPkg, null, indent) + '\n', 'utf8');
+
+    await syncLockfile(worktreeDir, options);
+
+    if (savedOverrides) {
+      rootPkg.overrides = savedOverrides;
+    } else {
+      delete rootPkg.overrides;
+    }
+    fs.writeFileSync(rootPkgPath, JSON.stringify(rootPkg, null, indent) + '\n', 'utf8');
+
+    await syncLockfile(worktreeDir, options);
+  } else {
+    await syncLockfile(worktreeDir, options);
+  }
   const appliedLockfileUpdates = [];
   for (const pkgName of lockfileUpdates) {
     try {

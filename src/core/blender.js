@@ -1,6 +1,6 @@
 import semver from 'semver';
 import { lookupPackageInstalledInfo } from './dependency-graph.js';
-import { buildRemediationSuggestion, isBreakingChange } from '../collectors/npm-audit.js';
+import { buildRemediationSuggestion, isBreakingChange, isOutOfRangeChange } from '../collectors/npm-audit.js';
 
 export function isVersionCompatible(ticketVersions = [], targetVersions = []) {
   if (!targetVersions || targetVersions.length === 0) return true;
@@ -525,6 +525,13 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
           pkg.remediation.isSemVerMajor = true;
           pkg.remediation.isBreaking = true;
         }
+        if (pkg.remediation.strategy === 'package-override') {
+          pkg.remediation.isOutOfRange = true;
+        } else if (pkg.isDirect && pkg.workspaceDeclarations && pkg.workspaceDeclarations.length > 0) {
+          pkg.remediation.isOutOfRange = pkg.workspaceDeclarations.some((d) => isOutOfRangeChange(d.range, optimalSafeVersion));
+        } else if (pkg.remediation.strategy === 'lockfile-update') {
+          pkg.remediation.isOutOfRange = false;
+        }
       }
     } else if (pkg.remediation) {
       pkg.remediation.strategy = 'none';
@@ -540,7 +547,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
     pkg.resolved = resolved;
     pkg.isSemVerMajor = Boolean(pkg.remediation?.isSemVerMajor);
     pkg.isBreaking = Boolean(pkg.remediation?.isBreaking);
-
+    pkg.isOutOfRange = Boolean(pkg.remediation?.isOutOfRange);
     if (resolved && pkg.remediation) {
       pkg.remediation.packageJsonChanges = [];
       pkg.remediation.lockfileUpdates = [];

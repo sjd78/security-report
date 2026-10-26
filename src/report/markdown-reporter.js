@@ -376,8 +376,11 @@ export function generateMarkdownReport(report) {
       const statusBadge = formatStatus(v);
       let targetFix = formatTargetFix(v);
       const isBreaking = Boolean(v.remediation?.isBreaking || v.remediation?.isSemVerMajor || v.isBreaking || v.isSemVerMajor);
+      const isOutOfRange = Boolean(v.remediation?.isOutOfRange || v.isOutOfRange);
       if (isBreaking && targetFix !== '_No fix_' && !targetFix.includes('⚠️')) {
         targetFix += `<br>⚠️ _(Breaking)_`;
+      } else if (isOutOfRange && targetFix !== '_No fix_' && !targetFix.includes('⚠️')) {
+        targetFix += `<br>⚠️ _(Out of range)_`;
       }
       const cves = formatCves(v);
       const sources = formatSources(v);
@@ -404,14 +407,21 @@ export function generateMarkdownReport(report) {
       lines.push(`- **Current Version:** \`${v.currentVersion}\``);
       const targetFixFormatted = formatTargetFix(v, ' | ');
       const isBreaking = Boolean(v.remediation?.isBreaking || v.remediation?.isSemVerMajor || v.isBreaking || v.isSemVerMajor);
+      const isOutOfRange = Boolean(v.remediation?.isOutOfRange || v.isOutOfRange);
       if (targetFixFormatted === '_No fix_') {
         lines.push(`- **Target Fix Version:** _⚠️ No known patched version is currently available for \`${v.packageName}\`._`);
       } else if (isBreaking) {
         lines.push(`- **Target Fix Version:** ${targetFixFormatted} _⚠️ major version upgrade required_`);
+        lines.push(`- **Breaking Change:** ⚠️ Yes (major version upgrade)`);
+        if (isOutOfRange) {
+          lines.push(`- **Out of Range Upgrade:** ⚠️ Yes (outside declared range)`);
+        }
+      } else if (isOutOfRange) {
+        lines.push(`- **Target Fix Version:** ${targetFixFormatted} _⚠️ out of range upgrade required_`);
+        lines.push(`- **Out of Range Upgrade:** ⚠️ Yes (outside declared range)`);
       } else {
         lines.push(`- **Target Fix Version:** ${targetFixFormatted}`);
       }
-
       if (v.cves && v.cves.length > 0) {
         lines.push(`- **CVE Identifiers (${v.cves.length}):** ${v.cves.map((c) => `\`${c}\``).join(', ')}`);
       } else if (v.cve) {
@@ -480,13 +490,17 @@ export function generateMarkdownReport(report) {
         lines.push(`- > ⚠️ **No fix available**: No patched release of \`${v.packageName}\` currently exists. Mitigations or alternative dependencies should be investigated.`);
         lines.push(``);
       } else {
-        lines.push(`- **Fix Strategy:** ${noFix ? 'none' : (rem.strategy || 'manual')}`);
+        lines.push(`- **Fix Strategy:** ${rem.strategy || 'manual'}`);
+        if (rem.strategy === 'package-override') {
+          lines.push(`- > ⚠️ **Out of range override:** Transitive dependency requires a persistent override in root \`package.json\` because parent constraints forbid the safe version.`);
+        }
         if (isBreaking) {
           const targetPkg = rem.targetPackage || v.packageName;
           const targetVer = rem.targetVersion || v.targetSafeVersion;
           lines.push(`- > ⚠️ **Breaking Change:** This remediation requires a major version upgrade (\`${targetPkg}\` to \`${targetVer}\`). Review the package changelog and test thoroughly for breaking changes.`);
+        } else if (isOutOfRange && rem.strategy !== 'package-override') {
+          lines.push(`- > ⚠️ **Out of Range Upgrade:** This update moves beyond the declared semver range.`);
         }
-
         if (rem.note) {
           lines.push(`- > **Note:** _${rem.note}_`);
         }
@@ -503,12 +517,15 @@ export function generateMarkdownReport(report) {
             }
           }
         }
-
         if (rem.lockfileUpdates && rem.lockfileUpdates.length > 0) {
           lines.push(``);
-          lines.push(`Update lockfile:`);
+          if (rem.strategy === 'lockfile-update' && rem.transientOverrides && rem.transientOverrides.length > 0) {
+            lines.push(`Synchronize lockfile (transient pin):`);
+          } else {
+            lines.push(`Update lockfile:`);
+          }
           for (const pkgName of rem.lockfileUpdates) {
-            lines.push("```bash")
+            lines.push("```bash");
             lines.push(`${formatLockfileUpdate(pkgName)}`);
             lines.push("```");
           }
