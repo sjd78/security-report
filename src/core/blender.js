@@ -489,7 +489,9 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
     if (optimalSafeVersion) {
       pkg.targetSafeVersion = optimalSafeVersion;
       if (pkg.remediation) {
-        pkg.remediation.targetVersion = optimalSafeVersion;
+        if (pkg.remediation.strategy !== 'bump-direct-parent') {
+          pkg.remediation.targetVersion = optimalSafeVersion;
+        }
 
         // If package is Direct or Direct & Indirect, ensure all workspace declarations are updated
         const isDual = pkg.dependencyType === 'Direct & Indirect' || (pkg.isDirect && pkg.isIndirect);
@@ -521,9 +523,11 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
             }
           }
         }
-        if (isBreakingChange(pkg.currentVersion, optimalSafeVersion)) {
-          pkg.remediation.isSemVerMajor = true;
-          pkg.remediation.isBreaking = true;
+        if (pkg.remediation.strategy !== 'bump-direct-parent') {
+          if (isBreakingChange(pkg.currentVersion, optimalSafeVersion)) {
+            pkg.remediation.isSemVerMajor = true;
+            pkg.remediation.isBreaking = true;
+          }
         }
         if (pkg.remediation.strategy === 'package-override') {
           pkg.remediation.isOutOfRange = true;

@@ -713,14 +713,25 @@ export function findDirectRootsFromArborist(chains, targetPkgName = null) {
       const section = directChild.type === 'dev' ? 'devDependencies' :
                       directChild.type === 'optional' ? 'optionalDependencies' :
                       directChild.type === 'peer' ? 'peerDependencies' : 'dependencies';
+      const range = directChild.requiredRange || directChild.version;
       rootsMap.set(key, {
         name: directChild.name,
-        currentRange: directChild.requiredRange || directChild.version,
+        range,
+        currentRange: range,
         section,
         installedVersion: directChild.version,
         workspace: parent.isWorkspace ? (parent.packageName || parent.name) : null,
         packageJsonPath: pkgJsonPath,
         location: directChild.location,
+        declarations: [
+          {
+            workspace: parent.isWorkspace ? (parent.packageName || parent.name) : null,
+            packageJsonPath: pkgJsonPath,
+            section,
+            range,
+            isRoot: Boolean(parent.isRoot),
+          },
+        ],
       });
     }
   }

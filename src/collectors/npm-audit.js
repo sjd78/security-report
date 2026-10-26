@@ -282,40 +282,43 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     let isOutOfRange = false;
     const packageJsonChanges = [];
     for (const decl of parentDecls) {
-      const currentRange = decl.range || `^${fix.version}`;
+      const currentRange = decl.range || decl.currentRange || `^${fix.version}`;
       const prefix = currentRange.startsWith('~') ? '~' : currentRange.startsWith('^') ? '^' : '';
       const targetRange = `${prefix}${fix.version}`;
       const changeIsBreaking = isBreaking || isBreakingChange(currentRange, targetRange);
       if (changeIsBreaking) isBreaking = true;
-      const changeOutOfRange = isOutOfRangeChange(decl.range, targetRange);
+      const changeOutOfRange = isOutOfRangeChange(currentRange, targetRange);
       if (changeOutOfRange) isOutOfRange = true;
 
-      packageJsonChanges.push({
-        package: fix.name,
-        section: decl.section || 'dependencies',
-        from: currentRange,
-        to: targetRange,
-        packageJsonPath: decl.packageJsonPath || 'package.json',
-        workspace: decl.workspace || null,
-        isOutOfRange: changeOutOfRange,
-        isSemVerMajor: changeIsBreaking,
-        isBreaking: changeIsBreaking,
-      });
+      // Only add to packageJsonChanges if it represents an actual version change!
+      if (currentRange !== targetRange && (!semver.validRange(currentRange) || !semver.satisfies(fix.version, currentRange))) {
+        packageJsonChanges.push({
+          package: fix.name,
+          section: decl.section || 'dependencies',
+          from: currentRange,
+          to: targetRange,
+          packageJsonPath: decl.packageJsonPath || 'package.json',
+          workspace: decl.workspace || null,
+          isOutOfRange: changeOutOfRange,
+          isSemVerMajor: changeIsBreaking,
+          isBreaking: changeIsBreaking,
+        });
+      }
     }
 
-    return {
-      strategy: 'bump-direct-parent',
-      targetPackage: fix.name,
-      targetVersion: fix.version,
-      isOutOfRange,
-      isSemVerMajor: isBreaking,
-      isBreaking,
-      directRoot: parentDirectInfo?.name || fix.name,
-      packageJsonChanges,
-      lockfileUpdates: packageJsonChanges.length > 0
-        ? [vuln.packageName]
-        : [fix.name, vuln.packageName],
-    };
+    if (packageJsonChanges.length > 0) {
+      return {
+        strategy: 'bump-direct-parent',
+        targetPackage: fix.name,
+        targetVersion: fix.version,
+        isOutOfRange,
+        isSemVerMajor: isBreaking,
+        isBreaking,
+        directRoot: parentDirectInfo?.name || fix.name,
+        packageJsonChanges,
+        lockfileUpdates: [vuln.packageName],
+      };
+    }
   }
 
   // 4. Transitive requiring overrides (parent range forbids safeVersion, no parent update available)
