@@ -282,6 +282,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
               },
             ],
         dependencyPaths: [...(v.dependencyPaths || [])],
+        dependencyChains: [...(v.dependencyChains || v.chains || [])],
         directRoots: [...(v.directRoots || [])],
         sources: {
           jiraTickets: v.sources?.jira ? [v.sources.jira] : (v.sources?.jiraTickets ? [...v.sources.jiraTickets] : []),
@@ -355,6 +356,10 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         if (!existing.workspaceDeclarations.some((ed) => ed.packageJsonPath === d.packageJsonPath)) {
           existing.workspaceDeclarations.push(d);
         }
+      }
+      for (const dc of v.dependencyChains || v.chains || []) {
+        existing.dependencyChains = existing.dependencyChains || [];
+        existing.dependencyChains.push(dc);
       }
 
       // 6. Add advisory entry / entries
@@ -701,6 +706,7 @@ export function blendVulnerabilitySources(
           targetSafeVersion: targetSafe,
           dependencyPaths: pkgInfo.dependencyPaths.length > 0 ? pkgInfo.dependencyPaths : [ticket.packageName || ticket.summary],
           directRoots: pkgInfo.directRoots,
+          dependencyChains: pkgInfo.chains || [],
           sources: {
             jira: {
               ticketKey: ticket.ticketKey,
@@ -773,6 +779,7 @@ export function blendVulnerabilitySources(
           targetSafeVersion: alert.targetSafeVersion,
           dependencyPaths: pkgInfo.dependencyPaths.length > 0 ? pkgInfo.dependencyPaths : [alert.packageName],
           directRoots: pkgInfo.directRoots,
+          dependencyChains: pkgInfo.chains || [],
           sources: {
             dependabot: {
               alertNumber: alert.alertNumber,

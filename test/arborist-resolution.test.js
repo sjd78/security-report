@@ -699,3 +699,35 @@ test('Remediation planning: detects in-range transient override vs out-of-range 
   assert.equal(remOut.packageJsonChanges[0].section, 'overrides');
   assert.equal(remOut.packageJsonChanges[0].isOutOfRange, true);
 });
+
+test('Transitive dependency path formatting: includes semver constraint alongside lockfile version', () => {
+  const vuln = {
+    packageName: 'shell-quote',
+    directRoots: [
+      { name: 'concurrently', section: 'devDependencies', packageJsonPath: 'package.json' },
+      { name: 'cypress-tags', section: 'devDependencies', packageJsonPath: 'cypress/package.json', workspace: '@mono/cypress' },
+    ],
+    dependencyPaths: [
+      '[root] -> concurrently@10.0.5 -> shell-quote@1.9.0',
+      '@mono/cypress (cypress/package.json) -> cypress-tags@1.2.2 -> @cypress/browserify-preprocessor@3.0.2 -> shell-quote@1.9.0',
+    ],
+    dependencyChains: [
+      [
+        { name: '[root]', isRoot: true },
+        { name: 'concurrently', version: '10.0.5' },
+        { name: 'shell-quote', version: '1.9.0', requiredRange: '^1.9.0' },
+      ],
+      [
+        { name: '@mono/cypress', isWorkspace: true, packageJsonPath: 'cypress/package.json' },
+        { name: 'cypress-tags', version: '1.2.2' },
+        { name: '@cypress/browserify-preprocessor', version: '3.0.2' },
+        { name: 'shell-quote', version: '1.9.0', requiredRange: '^1.6.1' },
+      ],
+    ],
+  };
+
+  const paths = formatTransitiveDependencyPaths(vuln);
+  assert.equal(paths.length, 2);
+  assert.equal(paths[0], 'package.json/devDependencies/concurrently/.../shell-quote@1.9.0 (^1.9.0)');
+  assert.equal(paths[1], 'cypress/package.json/devDependencies/cypress-tags/.../shell-quote@1.9.0 (^1.6.1)');
+});

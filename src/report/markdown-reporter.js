@@ -248,6 +248,18 @@ export function formatTransitiveDependencyPaths(v) {
     directRootsMap.set(root.name, root);
   }
 
+  // Pre-index chains to look up requiredRange for (directRoot, targetName, version)
+  const chains = v.dependencyChains || v.chains || [];
+  const rangeLookup = new Map();
+  for (const c of chains) {
+    if (c.length < 2) continue;
+    const directRoot = c[1]?.name;
+    const target = c[c.length - 1];
+    if (directRoot && target && target.requiredRange) {
+      rangeLookup.set(`${directRoot}:${target.name}:${target.version}`, target.requiredRange);
+      rangeLookup.set(`${directRoot}:${target.name}`, target.requiredRange);
+    }
+  }
   for (const pathStr of v.dependencyPaths || []) {
     if (pathStr.includes(' (dependencies) -> ') || pathStr.includes(' (devDependencies) -> ')) {
       continue;
@@ -261,7 +273,7 @@ export function formatTransitiveDependencyPaths(v) {
 
     let pkgFile = 'package.json';
     let directRootPkg = null;
-    const targetSegment = segments[segments.length - 1];
+    let targetSegment = segments[segments.length - 1];
     if (wsMatch) {
       pkgFile = wsMatch[1];
       if (segments.length > 1) {
@@ -286,6 +298,17 @@ export function formatTransitiveDependencyPaths(v) {
       const rootMeta = directRootsMap.get(directRootPkg);
       if (rootMeta.section) section = rootMeta.section;
       if (rootMeta.packageJsonPath && !wsMatch) pkgFile = rootMeta.packageJsonPath;
+    }
+
+    if (!targetSegment.includes('(')) {
+      const parts = targetSegment.split('@');
+      const tName = parts[0];
+      const tVer = parts[1];
+      const lookupKey = `${directRootPkg}:${tName}:${tVer}`;
+      const foundRange = rangeLookup.get(lookupKey) || rangeLookup.get(`${directRootPkg}:${tName}`);
+      if (foundRange) {
+        targetSegment = `${tName}@${tVer} (${foundRange})`;
+      }
     }
 
     transitivePaths.add(`${pkgFile}/${section}/${directRootPkg}/.../${targetSegment}`);
