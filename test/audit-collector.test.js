@@ -17,7 +17,7 @@ import {
   tracePathsFromPackageLock,
 } from '../src/core/dependency-graph.js';
 import { generateJsonReport } from '../src/report/json-reporter.js';
-import { generateMarkdownReport, formatCompactDependencyPaths, formatDirectDependencyPaths, formatTransitiveDependencyPaths, formatCves, formatSources, formatTargetFix, formatStatus } from '../src/report/markdown-reporter.js';
+import { generateMarkdownReport, formatCompactDependencyPaths, formatDirectDependencyPaths, formatTransitiveDependencyPaths, formatCves, formatSources, formatTargetFix, formatStatus, formatRemediationStatus } from '../src/report/markdown-reporter.js';
 
 test('determineSafeVersion: range parsing', () => {
   assert.equal(determineSafeVersion('< 2.1.4', '2.1.0'), '2.1.4');
@@ -173,8 +173,8 @@ test('generateJsonReport and generateMarkdownReport', () => {
   assert.ok(mdReport.includes('CVE-2023-9999'));
   assert.ok(mdReport.includes('package-override'));
   assert.ok(mdReport.includes('npm update vuln-lib --package-lock-only'));
-  assert.ok(mdReport.includes('| Package | Status | Severity | Type | Current Version | Target Fix | CVEs | Sources |'));
-  assert.ok(mdReport.includes('| **`vuln-lib`** | ⚠️ Open | **CRITICAL** | Indirect (Transitive) | `1.0.0` | `1.1.0` | `CVE-2023-9999` | [npm audit](https://github.com/advisories/GHSA-xxxx) |'));
+  assert.ok(mdReport.includes('| Package | Status | Remediation | Severity | Type | Current Version | Target Fix | CVEs | Sources |'));
+  assert.ok(mdReport.includes('| **`vuln-lib`** | ⚠️ Open | 🛡️ Override required | **CRITICAL** | Indirect (Transitive) | `1.0.0` | `1.1.0` | `CVE-2023-9999` | [npm audit](https://github.com/advisories/GHSA-xxxx) |'));
 });
 
 test('generateMarkdownReport: table renders multiple CVEs and multiple sources with <br>', () => {
@@ -206,7 +206,7 @@ test('generateMarkdownReport: table renders multiple CVEs and multiple sources w
   const mdReport = generateMarkdownReport(jsonReport);
   assert.ok(
     mdReport.includes(
-      '| **`multi-vuln-pkg`** | ⚠️ Open | **HIGH** | Indirect (Transitive) | `2.0.0` | `2.1.0` | `CVE-2023-1111`<br>`CVE-2023-2222` | [MTA-5000](https://jira/MTA-5000)<br>[#99](https://github/alert/99)<br>npm audit |'
+      '| **`multi-vuln-pkg`** | ⚠️ Open | ⚡ Safe fix | **HIGH** | Indirect (Transitive) | `2.0.0` | `2.1.0` | `CVE-2023-1111`<br>`CVE-2023-2222` | [MTA-5000](https://jira/MTA-5000)<br>[#99](https://github/alert/99)<br>npm audit |'
     )
   );
 });
@@ -584,7 +584,7 @@ test('resolveAuditAdvisories: enriches npm audit vulnerability with CVE, target 
   const md = generateMarkdownReport({
     branches: [{ branch: 'main', summary: { total: 1 }, vulnerabilities: vulns }],
   });
-  assert.ok(md.includes('| **`demo-pkg`** | ⚠️ Open | **HIGH** | Indirect (Transitive) | `1.0.0` | `1.2.0` | `CVE-2024-99999` | [npm audit](https://github.com/advisories/GHSA-test-1234) |'));
+  assert.ok(md.includes('| **`demo-pkg`** | ⚠️ Open | ⚡ Safe fix | **HIGH** | Indirect (Transitive) | `1.0.0` | `1.2.0` | `CVE-2024-99999` | [npm audit](https://github.com/advisories/GHSA-test-1234) |'));
 });
 
 test('parseAuditVulnerabilities: automatically resolves and enriches CVE and target fix via options.advisoryCache', async () => {
@@ -632,7 +632,7 @@ test('parseAuditVulnerabilities: automatically resolves and enriches CVE and tar
   const md = generateMarkdownReport({
     branches: [result],
   });
-  assert.ok(md.includes('| **`cookie`** | ⚠️ Open | **LOW** | Direct | `0.4.0` | `0.7.0` | `CVE-2024-47764` | [npm audit](https://github.com/advisories/GHSA-pxg6-pf52-xh8x) |'));
+  assert.ok(md.includes('| **`cookie`** | ⚠️ Open | ⚡ Safe fix | **LOW** | Direct | `0.4.0` | `0.7.0` | `CVE-2024-47764` | [npm audit](https://github.com/advisories/GHSA-pxg6-pf52-xh8x) |'));
 });
 
 test('determinePatchedVersions: extracts all patched versions across major version lines from semver ranges', () => {
@@ -690,7 +690,7 @@ test('generateMarkdownReport: lists all major version line fixes under Target Fi
 
   assert.ok(
     md.includes(
-      '| **`fast-uri`** | ⚠️ Open | **HIGH** | Direct | `2.4.2` | `2.4.5`<br>`3.1.6`<br>`4.1.3` | `CVE-2026-75931` | [npm audit](https://github.com/advisories/GHSA-5jgf-p345-68v8) |'
+      '| **`fast-uri`** | ⚠️ Open | ⚡ Safe fix | **HIGH** | Direct | `2.4.2` | `2.4.5`<br>`3.1.6`<br>`4.1.3` | `CVE-2026-75931` | [npm audit](https://github.com/advisories/GHSA-5jgf-p345-68v8) |'
     )
   );
 });
@@ -737,11 +737,22 @@ test('generateMarkdownReport: marks logged vulnerability as resolved when curren
   // Table displays ✅ Resolved
   assert.ok(
     md.includes(
-      '| **`fast-uri`** | ✅ Resolved | **HIGH** | Direct | `2.4.5` | `2.4.5`<br>`3.1.6`<br>`4.1.3` | `CVE-2026-75931` | [MTA-9999](https://jira/MTA-9999) |'
+      '| **`fast-uri`** | ✅ Resolved | ✅ Resolved | **HIGH** | Direct | `2.4.5` | `2.4.5`<br>`3.1.6`<br>`4.1.3` | `CVE-2026-75931` | [MTA-9999](https://jira/MTA-9999) |'
     )
   );
 
   // Detailed finding includes (✅ Resolved) and status note
   assert.ok(md.includes('#### `fast-uri` — HIGH (✅ Resolved)'));
   assert.ok(md.includes('- **Status:** ✅ Resolved (installed version `2.4.5` satisfies target fix)'));
+});
+
+test('formatRemediationStatus: returns appropriate emoji badge for all 6 states', () => {
+  assert.equal(formatRemediationStatus({ status: 'resolved' }), '✅ Resolved');
+  assert.equal(formatRemediationStatus({ remediation: { strategy: 'lockfile-update' }, targetSafeVersion: '1.2.0' }), '⚡ Safe fix');
+  assert.equal(formatRemediationStatus({ remediation: { strategy: 'bump-direct' }, targetSafeVersion: '1.2.0' }), '⚡ Safe fix');
+  assert.equal(formatRemediationStatus({ remediation: { strategy: 'bump-direct-parent' }, targetSafeVersion: '1.2.0' }), '⬆️ Parent upgrade');
+  assert.equal(formatRemediationStatus({ remediation: { strategy: 'bump-direct-parent', isBreaking: true }, targetSafeVersion: '2.0.0' }), '⚠️ Breaking upgrade');
+  assert.equal(formatRemediationStatus({ remediation: { strategy: 'package-override' }, targetSafeVersion: '1.2.0' }), '🛡️ Override required');
+  assert.equal(formatRemediationStatus({ remediation: { strategy: 'none' } }), '❌ No fix');
+  assert.equal(formatRemediationStatus({}), '❌ No fix');
 });

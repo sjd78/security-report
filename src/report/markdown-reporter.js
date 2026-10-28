@@ -48,6 +48,37 @@ export function formatStatus(v) {
   return resolved ? '✅ Resolved' : '⚠️ Open';
 }
 
+export function formatRemediationStatus(v) {
+  if (v.status === 'resolved' || isVulnerabilityResolved(v)) {
+    return '✅ Resolved';
+  }
+
+  const rem = v.remediation || {};
+  const targetFix = formatTargetFix(v);
+  const noFix = rem.strategy === 'none' || targetFix === '_No fix_';
+
+  if (noFix) {
+    return '❌ No fix';
+  }
+
+  const isBreaking = Boolean(rem.isBreaking || rem.isSemVerMajor || v.isBreaking || v.isSemVerMajor);
+  const strategy = rem.strategy || '';
+
+  if (strategy === 'package-override') {
+    return '🛡️ Override required';
+  }
+
+  if (isBreaking) {
+    return '⚠️ Breaking upgrade';
+  }
+
+  if (strategy === 'bump-direct-parent') {
+    return '⬆️ Parent upgrade';
+  }
+
+  return '⚡ Safe fix';
+}
+
 export function formatTargetFix(v, joiner = '<br>') {
   const versions = [];
   const seen = new Set();
@@ -391,8 +422,8 @@ export function generateMarkdownReport(report) {
 
     lines.push(`### Package Vulnerability Overview`);
     lines.push(``);
-    lines.push(`| Package | Status | Severity | Type | Current Version | Target Fix | CVEs | Sources |`);
-    lines.push(`| :--- | :---: | :---: | :---: | :--- | :--- | :--- | :--- |`);
+    lines.push(`| Package | Status | Remediation | Severity | Type | Current Version | Target Fix | CVEs | Sources |`);
+    lines.push(`| :--- | :---: | :---: | :---: | :---: | :--- | :--- | :--- | :--- |`);
 
     for (const v of sortedVulns) {
       const typeLabel = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct' : 'Indirect (Transitive)'));
@@ -407,8 +438,9 @@ export function generateMarkdownReport(report) {
       }
       const cves = formatCves(v);
       const sources = formatSources(v);
+      const remediationBadge = formatRemediationStatus(v);
       lines.push(
-        `| **\`${v.packageName}\`** | ${statusBadge} | **${(v.severity || 'moderate').toUpperCase()}** | ${typeLabel} | \`${v.currentVersion}\` | ${targetFix} | ${cves} | ${sources} |`
+        `| **\`${v.packageName}\`** | ${statusBadge} | ${remediationBadge} | **${(v.severity || 'moderate').toUpperCase()}** | ${typeLabel} | \`${v.currentVersion}\` | ${targetFix} | ${cves} | ${sources} |`
       );
     }
     lines.push(``);
