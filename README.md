@@ -12,7 +12,7 @@ Managing security vulnerabilities across large Node.js repositories is often fra
 
 1. **Step 1: Aggregate & Analyze**
    - Resolves the target repository: `org/repo` shorthand and Git URLs are cloned into an isolated `REPOS/<org>/<name>` cache; a local path is used **in place** (nothing is copied into `REPOS/`).
-   - Detaches the base repository's `HEAD` — including local targets — so every branch name is free, then creates one `git worktree` per target branch, reset to the latest fetched `origin/<branch>` when that remote branch exists (otherwise the existing local branch is used, or a new one is created).
+   - Fetches remote references and scans isolated, detached worktree snapshots of each configured branch. Scanning does not reset local branches or remove retained remediation worktrees; every report records the exact scanned commit.
    - Resolves dependency hierarchies and monorepo workspace relationships via `@npmcli/arborist` virtual trees, eliminating false cross-product ancestry when a package exists across multiple distinct versions.
    - Runs `npm audit` with **intermediate package filtering**: dependency carriers lacking direct advisories in `via` are ignored as top-level findings and preserved in ancestor chains.
    - Cross-references findings with Jira CVE tickets and GitHub Dependabot alerts, querying GitHub Advisory API and OSV to resolve CVE identifiers and **all active major version line fixes** (e.g. `2.4.5`, `3.1.6`, `4.1.3`).
@@ -21,6 +21,7 @@ Managing security vulnerabilities across large Node.js repositories is often fra
    - Outputs machine-readable JSON (`reports/security-report.json`) and human-readable Markdown (`reports/security-report.md`) featuring:
      - **Package Overview Table**: `Package`, `Status` (`✅ Resolved` / `⚠️ Open`), `Severity`, `Type`, `Current Version`, `Target Fix` (all major line fixes separated by `<br>`), `CVEs` (separated by `<br>`), and `Sources` (linked advisories, Jira tickets, Dependabot alerts separated by `<br>`).
      - **Detailed Package Findings**: Unnumbered findings with status badges, explicit current and target fix versions, individual advisory links, and strictly partitioned **Direct Dependencies** and **Transitive Dependency Paths** in compact code blocks (`<pkgFile>/<section>/...`).
+   - Writes `reports/security-remediation-plan.json`: a standalone, versioned action plan grouped by branch and package, with scanned commit SHAs, manifest preconditions, advisory motivations, reconciled actions, and explicit unresolved dispositions.
 2. **Step 2: Automated Remediation (5-Tier Preference Hierarchy)**
    - **`bump-direct-and-lockfile`**: For dual dependencies (`Direct & Indirect`, e.g. `js-yaml`), bumps the direct `package.json` semver constraint AND issues lockfile updates to synchronize all transitive instances.
    - **`bump-direct`**: Directly updates `package.json` semver constraints for direct dependencies (preserving formatting and `^`/`~` prefixes).
@@ -160,6 +161,19 @@ sec-remediate scan [repo] [options]
 - `--no-jira`: Disable Jira collector.
 - `--no-dependabot`: Disable GitHub Dependabot collector.
 - `--debug`: Save intermediate collector outputs to `security-<name>-collection.json`.
+
+#### Remediation-plan artifact
+
+Every scan writes `security-remediation-plan.json` alongside the existing JSON and Markdown reports. Generating the plan does not edit target manifests or lockfiles.
+
+- Top level: `schemaVersion`, `kind: "security-remediation-plan"`, `generatedAt`, repository identity/path, summary counts, and `branches`.
+- Each branch records its `baseCommit`, a summary sentence, `packages`, reconciled `actions`, and any `blockers`. Its status is `ready`, `blocked`, or `no-op`; `no-op` means no executable actions, not necessarily no findings.
+- Every package keeps installed versions, dependency paths, all advisory/CVE/Jira/Dependabot motivations, and a disposition: `ready`, `resolved`, `manual-review`, `no-fix`, or `not-installed`.
+- Actions are structured data: `update-dependency` identifies a manifest, dependency section, package, `expectedRange`, and `targetRange`; `set-override` identifies the nested override scope, expected value, and target version; `update-lockfile` requests re-resolution within the declared constraints.
+- Branch actions deduplicate shared edits and retain their motivating package/finding references. Conflicting edits, missing snapshots, and scan failures block execution rather than silently selecting a target.
+- Targets must satisfy every known advisory. Workspace declarations can retain different safe major lines. Missing evidence and unsupported ranges remain explicit manual-review items rather than speculative edits.
+
+Review package dispositions and branch blockers before using an action plan. Planned fixes are not verified resolutions; verification happens only after applying changes.
 
 ---
 

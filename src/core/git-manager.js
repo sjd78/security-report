@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { randomUUID } from 'node:crypto';
 
 const execFileAsync = promisify(execFile);
 
@@ -132,14 +133,20 @@ export async function detachHead(repoPath) {
   }
 }
 
+export async function getOriginUrl(repoPath) {
+  const { stdout } = await execGit(['config', '--get', 'remote.origin.url'], repoPath).catch(() => ({ stdout: '' }));
+  return stdout.replace(CREDENTIAL_IN_URL, '//') || null;
+}
+
 export async function ensureRepo(spec, config = {}) {
   const parsed = parseRepoSpec(spec, config);
   const reposDir = config.reposDir || path.resolve(process.cwd(), 'REPOS');
   const authEnv = gitAuthEnv(parsed.cloneUrl, config.githubToken);
 
   if (parsed.type === 'local') {
+    const remoteUrl = await getOriginUrl(parsed.localPath);
     try {
-      await execGit(['fetch', '--all', '--prune', '--tags'], parsed.localPath);
+      await execGit(['fetch', '--all', '--prune', '--tags'], parsed.localPath, gitAuthEnv(remoteUrl, config.githubToken));
     } catch {
       // ignore if offline or no remotes
     }
@@ -151,6 +158,7 @@ export async function ensureRepo(spec, config = {}) {
     return {
       ...parsed,
       repoPath: parsed.localPath,
+      remoteUrl,
     };
   }
 
@@ -167,6 +175,7 @@ export async function ensureRepo(spec, config = {}) {
     return {
       ...parsed,
       repoPath: targetDir,
+      remoteUrl: await getOriginUrl(targetDir),
     };
   }
 
@@ -181,6 +190,7 @@ export async function ensureRepo(spec, config = {}) {
   return {
     ...parsed,
     repoPath: targetDir,
+    remoteUrl: await getOriginUrl(targetDir),
   };
 }
 
@@ -205,7 +215,16 @@ export function sanitizeBranchName(branch) {
   return branch.replace(/[^a-zA-Z0-9._-]/g, '_');
 }
 
-export async function createWorktree(repoPath, branch, customPath = null) {
+export async function createWorktree(repoPath, branch, customPath = null, options = {}) {
+  if (options.snapshot) {
+    await execGit(['check-ref-format', '--branch', branch], repoPath);
+    const remoteRef = `refs/remotes/origin/${branch}`;
+    const startPoint = await resolveRef(repoPath, remoteRef) ? remoteRef : `refs/heads/${branch}`;
+    const snapshotDir = customPath || path.resolve(repoPath, '.worktrees', `${sanitizeBranchName(branch)}-${randomUUID()}`);
+    fs.mkdirSync(path.dirname(snapshotDir), { recursive: true });
+    await execGit(['worktree', 'add', '--detach', snapshotDir, startPoint], repoPath);
+    return snapshotDir;
+  }
   const sanitized = sanitizeBranchName(branch);
   const worktreeDir = customPath || path.resolve(repoPath, '.worktrees', sanitized);
 
@@ -279,7 +298,7 @@ export async function removeWorktree(repoPath, worktreeDir) {
 }
 
 export async function withWorktree(repoPath, branch, fn, options = {}) {
-  const worktreeDir = await createWorktree(repoPath, branch, options.worktreeDir);
+  const worktreeDir = await createWorktree(repoPath, branch, options.worktreeDir, options);
   let succeeded = false;
   try {
     const result = await fn(worktreeDir);

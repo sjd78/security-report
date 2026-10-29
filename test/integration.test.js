@@ -7,6 +7,7 @@ import { execGit, withWorktree, stageAndCommit } from '../src/core/git-manager.j
 import { scanRepository } from '../src/index.js';
 import { generateCommitMessage } from '../src/core/commit-generator.js';
 import { remediateBranch } from '../src/core/remediator.js';
+import { startRegistry, fixturePackage } from './fixtures/registry.js';
 
 test('End-to-End: Multi-branch scan, report, and commit message flow', async () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-e2e-'));
@@ -72,9 +73,9 @@ test('End-to-End: Multi-branch scan, report, and commit message flow', async () 
       reposDir,
       reportsDir,
       debug: true,
-      // Hermetic: never read the developer's .security-report.json, never hit the network.
+      // Reporting integration is offline; collector behavior has dedicated fixtures.
       noConfigFile: true,
-      collectors: 'npm-audit',
+      collectors: 'none',
       githubToken: '',
     });
 
@@ -160,5 +161,86 @@ test('End-to-End: Multi-branch scan, report, and commit message flow', async () 
     assert.ok(logOut.includes('fix(deps): remediate 1 vulnerable package on branch main'));
   } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test('scan snapshots preserve retained edits and record executable-plan base commits', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-plan-snapshot-'));
+  const repo = path.join(tmp, 'repo');
+  fs.mkdirSync(repo);
+  try {
+    await execGit(['init', '-b', 'main'], repo);
+    await execGit(['config', 'user.name', 'Security Bot'], repo);
+    await execGit(['config', 'user.email', 'bot@example.com'], repo);
+    const pkg = { name: 'snapshot-app', version: '1.0.0' };
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify(pkg));
+    fs.writeFileSync(path.join(repo, 'package-lock.json'), JSON.stringify({
+      name: pkg.name, version: pkg.version, lockfileVersion: 3, packages: { '': pkg },
+    }));
+    await execGit(['add', '.'], repo);
+    await execGit(['commit', '-m', 'Initial snapshot'], repo);
+    await execGit(['branch', 'review'], repo);
+    const { stdout: baseCommit } = await execGit(['rev-parse', 'main'], repo);
+    let retained;
+    await withWorktree(repo, 'review', async (dir) => {
+      retained = dir;
+      fs.writeFileSync(path.join(dir, 'retained-fix.txt'), 'uncommitted fix');
+    }, { keepWorktree: true });
+
+    const result = await scanRepository(repo, {
+      noConfigFile: true, collectors: 'none', githubToken: '',
+      branches: 'main,review', reportsDir: path.join(tmp, 'reports'),
+    });
+    const plan = JSON.parse(fs.readFileSync(result.remediationPlanPath, 'utf8'));
+    assert.deepEqual(plan.branches.map((branch) => branch.baseCommit), [baseCommit, baseCommit]);
+    assert.ok(plan.branches.every((branch) => branch.status === 'no-op'));
+    assert.equal(fs.readFileSync(path.join(retained, 'retained-fix.txt'), 'utf8'), 'uncommitted fix');
+    assert.equal((await execGit(['rev-parse', 'main'], repo)).stdout, baseCommit);
+    assert.equal((await execGit(['rev-parse', 'review'], repo)).stdout, baseCommit);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('real npm scan produces actionable plans and preserves audit failures', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-plan-registry-'));
+  const registry = await startRegistry(path.join(tmp, 'registry'));
+  const previousEnv = Object.fromEntries(Object.keys(registry.env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, registry.env);
+  const repo = path.join(tmp, 'repo');
+  fs.mkdirSync(repo);
+  try {
+    await execGit(['init', '-b', 'main'], repo);
+    await execGit(['config', 'user.name', 'Security Bot'], repo);
+    await execGit(['config', 'user.email', 'bot@example.com'], repo);
+    const pkg = { name: 'fixture-app', version: '1.0.0', dependencies: { [fixturePackage]: '1.0.0' } };
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify(pkg));
+    fs.writeFileSync(path.join(repo, 'package-lock.json'), JSON.stringify(registry.packageLock()));
+    await execGit(['add', '.'], repo);
+    await execGit(['commit', '-m', 'Vulnerable dependency'], repo);
+    const { stdout: baseCommit } = await execGit(['rev-parse', 'HEAD'], repo);
+    const options = {
+      noConfigFile: true, collectors: 'npm-audit', githubToken: '',
+      githubApiUrl: `${registry.url}/github`, branches: 'main', reportsDir: path.join(tmp, 'reports'),
+    };
+    const result = await scanRepository(repo, options);
+    const [branch] = result.remediationPlan.branches;
+    assert.equal(branch.baseCommit, baseCommit);
+    assert.equal(branch.status, 'ready');
+    assert.equal(branch.packages[0].status, 'ready');
+    assert.ok(branch.packages[0].findings.some((finding) => finding.cve === 'CVE-2026-12345'));
+    assert.ok(branch.actions.some((action) => action.type === 'update-dependency'
+      && action.package === fixturePackage && action.expectedRange === '1.0.0' && action.targetRange === '1.0.1'));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(repo, 'package.json'))).dependencies[fixturePackage], '1.0.0');
+    registry.state.failAudit = true;
+    const failed = await scanRepository(repo, options);
+    assert.equal(failed.remediationPlan.branches[0].status, 'blocked');
+    assert.ok(failed.remediationPlan.branches[0].blockers.some((reason) => /audit/i.test(reason)));
+  } finally {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await registry.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

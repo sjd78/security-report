@@ -17,6 +17,7 @@ export function generateJsonReport(repository, branchReports, options = {}) {
       org: repository.org || 'unknown',
       fullName: repository.fullName || `${repository.org}/${repository.name}`,
       path: repository.repoPath || repository.localPath || '',
+      remoteUrl: repository.remoteUrl || null,
     },
     summary: {
       totalBranches: sortedBranches.length,

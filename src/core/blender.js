@@ -82,6 +82,11 @@ export function selectBestRemediationVersion(installedVersion, candidateVersions
   return validCandidates[validCandidates.length - 1];
 }
 
+function isVersionVulnerable(version, advisories) {
+  return advisories.some((adv) => typeof adv.vulnerableVersionRange === 'string'
+    && semver.satisfies(version, adv.vulnerableVersionRange));
+}
+
 export function calculateOptimalSafeVersion(installedVersion, advisories = []) {
   const candidateVersions = [];
 
@@ -101,9 +106,12 @@ export function calculateOptimalSafeVersion(installedVersion, advisories = []) {
     }
   }
 
-  if (candidateVersions.length === 0) return null;
+  const safeCandidates = candidateVersions.filter((version) => {
+    const cleanVersion = semver.clean(String(version).replace(/^[~^]/, ''));
+    return cleanVersion && !isVersionVulnerable(cleanVersion, advisories);
+  });
 
-  return selectBestRemediationVersion(installedVersion, candidateVersions);
+  return selectBestRemediationVersion(installedVersion, safeCandidates);
 }
 
 export function isVulnerabilityResolved(v) {
@@ -145,6 +153,8 @@ export function isVulnerabilityResolved(v) {
 
   if (candidateVersions.length === 0) return false;
 
+  const advisories = [v, ...(v.advisories || [])];
+
   for (const installed of cleanVersions) {
     const installedMajor = semver.major(installed);
 
@@ -163,15 +173,7 @@ export function isVulnerabilityResolved(v) {
       }
     }
 
-    if (v.vulnerableVersionRange && typeof v.vulnerableVersionRange === 'string') {
-      try {
-        if (semver.satisfies(installed, v.vulnerableVersionRange)) {
-          return false;
-        }
-      } catch {
-        // ignore invalid range format
-      }
-    }
+    if (isVersionVulnerable(installed, advisories)) return false;
   }
 
   return true;
@@ -337,7 +339,11 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
 
       // Collect patched versions
       const existingPatched = existing.patchedVersions || existing.targetSafeVersions || [];
-      const newPatched = v.patchedVersions || v.targetSafeVersions || (v.targetSafeVersion ? [v.targetSafeVersion] : []);
+      const newPatched = [
+        ...(v.patchedVersions || []),
+        ...(v.targetSafeVersions || []),
+        ...(v.targetSafeVersion ? [v.targetSafeVersion] : []),
+      ];
       for (const p of newPatched) {
         if (p && !existingPatched.includes(p)) existingPatched.push(p);
       }
@@ -469,7 +475,11 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
   // Optimize target safe versions across all advisories for each package
   for (const pkg of packageMap.values()) {
     // Consolidate all patched versions across all advisories
-    const allPatched = pkg.patchedVersions || [];
+    const allPatched = [...new Set([
+      ...(pkg.patchedVersions || []),
+      ...(pkg.targetSafeVersions || []),
+      ...(pkg.targetSafeVersion ? [pkg.targetSafeVersion] : []),
+    ])];
     for (const adv of pkg.advisories || []) {
       if (Array.isArray(adv.patchedVersions)) {
         for (const pv of adv.patchedVersions) if (pv && !allPatched.includes(pv)) allPatched.push(pv);
@@ -490,9 +500,9 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
     pkg.patchedVersions = allPatched;
     pkg.targetSafeVersions = allPatched;
 
-    const optimalSafeVersion = calculateOptimalSafeVersion(pkg.currentVersion, pkg.advisories);
+    const optimalSafeVersion = calculateOptimalSafeVersion(pkg.currentVersion, [...pkg.advisories, pkg]);
+    pkg.targetSafeVersion = optimalSafeVersion;
     if (optimalSafeVersion) {
-      pkg.targetSafeVersion = optimalSafeVersion;
       if (pkg.remediation) {
         if (pkg.remediation.strategy !== 'bump-direct-parent') {
           pkg.remediation.targetVersion = optimalSafeVersion;

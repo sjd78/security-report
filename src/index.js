@@ -7,6 +7,7 @@ import {
   withWorktree,
   stageAndCommit,
   pushBranch,
+  execGit,
 } from './core/git-manager.js';
 import { readPackageJson, readPackageLock, runNpmLs, findWorkspacePackageJsons, loadArboristTree } from './core/dependency-graph.js';
 import { collectNpmAudit } from './collectors/npm-audit.js';
@@ -15,6 +16,7 @@ import { fetchDependabotAlerts, groupDependabotAlertsByBranch } from './collecto
 import { blendVulnerabilitySources } from './core/blender.js';
 import { generateJsonReport, writeJsonReport } from './report/json-reporter.js';
 import { generateMarkdownReport, writeMarkdownReport } from './report/markdown-reporter.js';
+import { generateRemediationPlan, writeRemediationPlan } from './report/remediation-reporter.js';
 import { remediateBranch } from './core/remediator.js';
 import { generateCommitMessage } from './core/commit-generator.js';
 
@@ -42,7 +44,9 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
   console.log(`✅ [Scan] Local repo ready at: ${repoInfo.repoPath}`);
 
   // Determine branches to scan
-  let branchesToScan = config.defaultBranches;
+  let branchesToScan = Array.isArray(config.defaultBranches)
+    ? config.defaultBranches
+    : String(config.defaultBranches).split(',').map((branch) => branch.trim()).filter(Boolean);
   if (cliOptions.branches) {
     branchesToScan = String(cliOptions.branches).split(',').map((b) => b.trim()).filter(Boolean);
   } else if (cliOptions.allBranches) {
@@ -87,6 +91,7 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
     console.log(`🔬 [Scan] Inspecting branch: ${branch}`);
     try {
       const branchReport = await withWorktree(repoInfo.repoPath, branch, async (worktreeDir) => {
+        const { stdout: baseCommit } = await execGit(['rev-parse', 'HEAD'], worktreeDir);
         const pkgJson = readPackageJson(worktreeDir);
         const pkgLock = readPackageLock(worktreeDir);
         const workspaces = findWorkspacePackageJsons(worktreeDir, pkgJson);
@@ -118,6 +123,7 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
         return {
           ...audit,
           branch,
+          baseCommit,
           pkgJson,
           pkgLock,
           npmLsData,
@@ -125,7 +131,7 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
           arboristTree,
           worktreeDir,
         };
-      });
+      }, { snapshot: true });
       rawBranchReports.push(branchReport);
     } catch (err) {
       console.warn(`⚠️ [Scan] Failed to inspect branch ${branch}: ${err.message}`);
@@ -156,9 +162,12 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
   // Write reports
   const jsonPath = writeJsonReport(report, config.reportsDir);
   const mdPath = writeMarkdownReport(report, config.reportsDir);
+  const remediationPlan = generateRemediationPlan(report, { allowOverrides: config.allowOverrides });
+  const remediationPlanPath = writeRemediationPlan(remediationPlan, config.reportsDir);
 
   console.log(`\n📄 [Scan] Intermediate JSON report generated: ${jsonPath}`);
   console.log(`📝 [Scan] Human-readable Markdown report generated: ${mdPath}`);
+  console.log(`Remediation plan generated: ${remediationPlanPath}`);
 
   return {
     config,
@@ -166,6 +175,8 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
     report,
     jsonPath,
     mdPath,
+    remediationPlan,
+    remediationPlanPath,
   };
 }
 

@@ -15,21 +15,38 @@ import { extractGhsaId, extractCveId, fetchAdvisoryDetails } from './advisories.
 const execFileAsync = promisify(execFile);
 
 export async function runNpmAuditRaw(cwd) {
+  let stdout;
   try {
-    const { stdout } = await execFileAsync('npm', ['audit', '--json'], {
+    ({ stdout } = await execFileAsync('npm', ['audit', '--json'], {
       cwd,
       maxBuffer: 30 * 1024 * 1024,
-    });
-    return JSON.parse(stdout);
+    }));
   } catch (err) {
-    if (err.stdout) {
-      try {
-        return JSON.parse(err.stdout);
-      } catch {
-        // failed to parse JSON stdout
-      }
+    if (!err.stdout) {
+      throw new Error(`npm audit failed in ${cwd}: ${err.stderr || err.message}`);
     }
-    throw new Error(`npm audit failed in ${cwd}: ${err.stderr || err.message}`);
+    stdout = err.stdout;
+  }
+
+  try {
+    const audit = JSON.parse(stdout);
+    if (!audit || typeof audit !== 'object' || Array.isArray(audit)) {
+      throw new Error('Invalid npm audit payload');
+    }
+    if (audit.error) {
+      const detail = typeof audit.error === 'string'
+        ? audit.error
+        : [audit.error.code, audit.error.summary, audit.error.detail].filter(Boolean).join(': ');
+      throw new Error(detail || 'npm returned an audit error');
+    }
+    if (!audit.vulnerabilities || typeof audit.vulnerabilities !== 'object'
+      || Array.isArray(audit.vulnerabilities)
+      || Object.values(audit.vulnerabilities).some((v) => !v || typeof v !== 'object' || Array.isArray(v))) {
+      throw new Error('Missing or invalid vulnerabilities in npm audit payload');
+    }
+    return audit;
+  } catch (err) {
+    throw new Error(`npm audit failed in ${cwd}: ${err.message}`);
   }
 }
 

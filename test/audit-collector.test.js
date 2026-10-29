@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
+  runNpmAuditRaw,
   determineSafeVersion,
   determinePatchedVersions,
   buildRemediationSuggestion,
@@ -9,7 +13,7 @@ import {
   parseAuditVulnerabilities,
   resolveAuditAdvisories,
 } from '../src/collectors/npm-audit.js';
-import { selectBestRemediationVersion, isVulnerabilityResolved } from '../src/core/blender.js';
+import { selectBestRemediationVersion, isVulnerabilityResolved, consolidateVulnerabilitiesByPackage } from '../src/core/blender.js';
 import {
   extractDependencyChains,
   findDirectRoots,
@@ -18,6 +22,62 @@ import {
 } from '../src/core/dependency-graph.js';
 import { generateJsonReport } from '../src/report/json-reporter.js';
 import { generateMarkdownReport, formatCompactDependencyPaths, formatDirectDependencyPaths, formatTransitiveDependencyPaths, formatCves, formatSources, formatTargetFix, formatStatus, formatRemediationStatus } from '../src/report/markdown-reporter.js';
+
+test('runNpmAuditRaw: rejects failed or invalid audits while retaining nonzero vulnerability results', async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-response-'));
+  const originalPath = process.env.PATH;
+  t.after(() => {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+  fs.writeFileSync(path.join(tmpDir, 'npm'), `#!${process.execPath}
+const fs = require('node:fs');
+const response = JSON.parse(fs.readFileSync('audit-response.json', 'utf8'));
+process.stdout.write(response.stdout);
+process.stderr.write(response.stderr || '');
+process.exitCode = response.exitCode;
+`, { mode: 0o755 });
+  process.env.PATH = `${tmpDir}${path.delimiter}${originalPath || ''}`;
+  const respond = (payload, exitCode = 0) => {
+    fs.writeFileSync(path.join(tmpDir, 'audit-response.json'), JSON.stringify({
+      stdout: typeof payload === 'string' ? payload : JSON.stringify(payload),
+      exitCode,
+    }));
+    return runNpmAuditRaw(tmpDir);
+  };
+
+  const audit = {
+    auditReportVersion: 2,
+    vulnerabilities: {
+      'vulnerable-lib': {
+        name: 'vulnerable-lib',
+        severity: 'high',
+        range: '<1.2.0',
+        via: [{ source: 123, range: '<1.2.0', title: 'Unsafe library' }],
+        nodes: ['node_modules/vulnerable-lib'],
+      },
+    },
+  };
+  assert.deepEqual(await respond(audit, 1), audit);
+  assert.deepEqual(await respond({ vulnerabilities: {} }), { vulnerabilities: {} });
+
+  for (const exitCode of [0, 1]) {
+    await assert.rejects(respond({
+      error: { code: 'E503', summary: 'Registry audit endpoint unavailable' },
+      vulnerabilities: {},
+    }, exitCode), /npm audit failed.*E503.*Registry audit endpoint unavailable/);
+  }
+  for (const payload of [
+    null, [], {}, { vulnerabilities: null }, { vulnerabilities: [] },
+    { vulnerabilities: 'unavailable' }, { vulnerabilities: { broken: null } },
+    { vulnerabilities: { broken: [] } },
+  ]) {
+    await assert.rejects(respond(payload), /npm audit failed.*(?:Invalid npm audit payload|Missing or invalid vulnerabilities)/);
+  }
+  await assert.rejects(respond('not JSON', 1), /npm audit failed/);
+  await assert.rejects(respond('', 1), /npm audit failed/);
+});
 
 test('determineSafeVersion: range parsing', () => {
   assert.equal(determineSafeVersion('< 2.1.4', '2.1.0'), '2.1.4');
@@ -706,6 +766,64 @@ test('isVulnerabilityResolved: checks currentVersion >= target fix across major 
   assert.equal(isVulnerabilityResolved({ currentVersion: '1.0.0', targetSafeVersion: '1.1.0' }), false);
   assert.equal(isVulnerabilityResolved({ currentVersion: '1.1.0', targetSafeVersion: '1.1.0' }), true);
   assert.equal(isVulnerabilityResolved({ currentVersion: 'unknown', targetSafeVersion: '1.1.0' }), false);
+});
+
+test('isVulnerabilityResolved: requires every installed version to be safe against every advisory', () => {
+  const vulnerability = {
+    currentVersion: '1.2.0',
+    vulnerableVersionRange: '<1.2.0',
+    patchedVersions: ['1.2.0', '2.0.0'],
+    advisories: [
+      { vulnerableVersionRange: '<1.2.0', targetSafeVersion: '1.2.0' },
+      { vulnerableVersionRange: '<2.0.0', targetSafeVersion: '2.0.0' },
+    ],
+  };
+  assert.equal(isVulnerabilityResolved(vulnerability), false);
+  assert.equal(isVulnerabilityResolved({
+    ...vulnerability, installedVersions: ['2.0.0', '1.2.0'],
+  }), false);
+  assert.equal(isVulnerabilityResolved({
+    ...vulnerability, installedVersions: ['2.0.0', '2.1.0'],
+  }), true);
+});
+
+test('consolidation retains npm-derived fixes when advisory enrichment has no patch metadata', async () => {
+  const advisoryId = 'GHSA-PXG6-PF52-XH8X';
+  const auditJson = {
+    vulnerabilities: {
+      cookie: {
+        name: 'cookie',
+        severity: 'low',
+        isDirect: true,
+        range: '<0.7.0',
+        fixAvailable: { name: 'cookie', version: '0.7.0', isSemVerMajor: false },
+        via: [{
+          source: 123,
+          title: 'Cookie vulnerability',
+          range: '<0.7.0',
+          url: `https://github.com/advisories/${advisoryId}`,
+        }],
+        nodes: ['node_modules/cookie'],
+      },
+    },
+  };
+  const pkgJson = { dependencies: { cookie: '^0.6.0' } };
+  const pkgLock = { packages: {
+    '': { dependencies: pkgJson.dependencies },
+    'node_modules/cookie': { version: '0.6.0' },
+  } };
+  for (const details of [null, { id: advisoryId, cve: 'CVE-2024-47764' }]) {
+    const report = await parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, null, null, 'main', {
+      advisoryCache: new Map([[advisoryId, Promise.resolve(details)]]),
+    });
+    const [cookie] = consolidateVulnerabilitiesByPackage(report.vulnerabilities);
+    assert.equal(cookie.targetSafeVersion, '0.7.0');
+    assert.deepEqual(cookie.patchedVersions, ['0.7.0']);
+    assert.equal(cookie.remediation.strategy, 'bump-direct');
+    assert.equal(cookie.remediation.targetVersion, '0.7.0');
+    assert.equal(cookie.remediation.packageJsonChanges[0].to, '^0.7.0');
+    assert.equal(cookie.status, 'open');
+  }
 });
 
 test('formatStatus: returns ✅ Resolved or ⚠️ Open', () => {
