@@ -79,6 +79,52 @@ export function formatRemediationStatus(v) {
   return '⚡ Safe fix';
 }
 
+export function formatFixStrategy(rem, v) {
+  if (!rem || !rem.strategy || rem.strategy === 'none') {
+    return 'none';
+  }
+
+  if (rem.strategyLabel) {
+    return rem.strategyLabel;
+  }
+
+  const strategy = rem.strategy;
+
+  if (strategy === 'lockfile-update') {
+    const hasTransient = Array.isArray(rem.transientOverrides) && rem.transientOverrides.length > 0;
+    const isTransitive = (v?.isIndirect && !v?.isDirect) || rem.directRoot || (!rem.workspaceDeclarations?.length);
+    if (hasTransient || isTransitive) {
+      return 'lockfile-update (transitive pin)';
+    }
+    return 'lockfile-update (direct)';
+  }
+
+  if (strategy === 'package-override') {
+    const changes = rem.packageJsonChanges || [];
+    if (changes.some((c) => c.workspaceScope)) {
+      return 'package-override (workspace-scoped)';
+    }
+    if (changes.some((c) => c.parentPackage)) {
+      return 'package-override (parent-scoped)';
+    }
+    return 'package-override (root override)';
+  }
+
+  if (strategy === 'bump-direct-and-lockfile') {
+    return 'bump-direct-and-lockfile (direct + transitive pin)';
+  }
+
+  if (strategy === 'bump-direct-parent') {
+    return 'bump-direct-parent';
+  }
+
+  if (strategy === 'bump-direct') {
+    return 'bump-direct';
+  }
+
+  return strategy;
+}
+
 export function formatTargetFix(v, joiner = '<br>') {
   const versions = [];
   const seen = new Set();
@@ -540,12 +586,12 @@ export function generateMarkdownReport(report) {
       const rem = v.remediation || {};
       const noFix = rem.strategy === 'none' || (!v.targetSafeVersion && (!v.patchedVersions || v.patchedVersions.length === 0));
       lines.push(``);
-      lines.push(`##### Consolidated Remediation Plan`);
+      lines.push(`##### Remediation Plan`);
       if (noFix) {
         lines.push(`- > ⚠️ **No fix available**: No patched release of \`${v.packageName}\` currently exists. Mitigations or alternative dependencies should be investigated.`);
         lines.push(``);
       } else {
-        lines.push(`- **Fix Strategy:** ${rem.strategy || 'manual'}`);
+        lines.push(`- **Fix Strategy:** ${formatFixStrategy(rem, v)}`);
         if (rem.strategy === 'package-override') {
           lines.push(`- > ⚠️ **Out of range override:** Transitive dependency requires a persistent override in root \`package.json\` because parent constraints forbid the safe version.`);
         }

@@ -22,6 +22,7 @@ import {
 import {
   formatTargetFix,
   formatTransitiveDependencyPaths,
+  formatFixStrategy,
   generateMarkdownReport,
 } from '../src/report/markdown-reporter.js';
 
@@ -730,4 +731,54 @@ test('Transitive dependency path formatting: includes semver constraint alongsid
   assert.equal(paths.length, 2);
   assert.equal(paths[0], 'package.json/devDependencies/concurrently/.../shell-quote@1.9.0 (^1.9.0)');
   assert.equal(paths[1], 'cypress/package.json/devDependencies/cypress-tags/.../shell-quote@1.9.0 (^1.6.1)');
+});
+
+test('formatFixStrategy: formats fix strategy labels for all remediation permutations', () => {
+  // 1. lockfile-update (transitive pin)
+  assert.equal(
+    formatFixStrategy({ strategy: 'lockfile-update', transientOverrides: [{ package: 'foo', to: '^1.2.0' }] }),
+    'lockfile-update (transitive pin)'
+  );
+  // 2. lockfile-update (direct)
+  assert.equal(
+    formatFixStrategy({ strategy: 'lockfile-update', workspaceDeclarations: [{ packageJsonPath: 'package.json' }] }, { isDirect: true }),
+    'lockfile-update (direct)'
+  );
+  // 3. package-override (root override)
+  assert.equal(
+    formatFixStrategy({ strategy: 'package-override', packageJsonChanges: [{ package: 'bar' }] }),
+    'package-override (root override)'
+  );
+  // 4. package-override (workspace-scoped)
+  assert.equal(
+    formatFixStrategy({ strategy: 'package-override', packageJsonChanges: [{ package: 'bar', workspaceScope: '@mono/app' }] }),
+    'package-override (workspace-scoped)'
+  );
+  // 5. bump-direct-and-lockfile (direct + transitive pin)
+  assert.equal(
+    formatFixStrategy({ strategy: 'bump-direct-and-lockfile' }),
+    'bump-direct-and-lockfile (direct + transitive pin)'
+  );
+  // 6. bump-direct
+  assert.equal(formatFixStrategy({ strategy: 'bump-direct' }), 'bump-direct');
+  // 7. bump-direct-parent
+  assert.equal(formatFixStrategy({ strategy: 'bump-direct-parent' }), 'bump-direct-parent');
+  // 8. none
+  assert.equal(formatFixStrategy({ strategy: 'none' }), 'none');
+  assert.equal(formatFixStrategy(null), 'none');
+});
+
+test('generateMarkdownReport: renders Remediation Plan section heading', () => {
+  const vuln = {
+    packageName: 'lodash',
+    severity: 'high',
+    currentVersion: '4.17.15',
+    targetSafeVersion: '4.17.21',
+    remediation: { strategy: 'bump-direct', targetVersion: '4.17.21', packageJsonChanges: [{ package: 'lodash', to: '^4.17.21', section: 'dependencies' }] },
+  };
+  const md = generateMarkdownReport({
+    branches: [{ branch: 'main', summary: { total: 1 }, vulnerabilities: [vuln] }],
+  });
+  assert.ok(md.includes('##### Remediation Plan'));
+  assert.ok(md.includes('- **Fix Strategy:** bump-direct'));
 });

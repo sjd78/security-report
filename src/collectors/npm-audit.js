@@ -232,9 +232,17 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     }
 
     const isDual = isIndirect || dependencyType === 'Direct & Indirect';
+    const isDirectLockOnly = !isDual && packageJsonChanges.length === 0 && (safeVersion || fix?.version);
+    const strategy = isDirectLockOnly
+      ? 'lockfile-update'
+      : (isDual ? 'bump-direct-and-lockfile' : 'bump-direct');
+    const strategyLabel = isDirectLockOnly
+      ? 'lockfile-update (direct)'
+      : (isDual ? 'bump-direct-and-lockfile (direct + transitive pin)' : 'bump-direct');
 
     return {
-      strategy: isDual ? 'bump-direct-and-lockfile' : 'bump-direct',
+      strategy,
+      strategyLabel,
       targetPackage: vuln.packageName,
       targetVersion: safeVersion || fix?.version || null,
       workspaceDeclarations: declarations,
@@ -243,10 +251,10 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       isSemVerMajor: isBreaking,
       isBreaking,
       transientOverrides: isDual && safeVersion ? [{ package: vuln.packageName, to: `^${safeVersion}` }] : [],
-      lockfileUpdates: isDual || packageJsonChanges.length === 0 ? [vuln.packageName] : [],
+      lockfileUpdates: isDual || isDirectLockOnly ? [vuln.packageName] : [],
       note: isDual
         ? 'Package is both a direct dependency and required transitively. Resolution updates package.json semver and synchronizes lockfile for all instances.'
-        : undefined,
+        : (isDirectLockOnly ? 'Direct dependency declared range already permits the safe version. Update lockfile directly without package.json changes.' : undefined),
     };
   }
 
@@ -255,6 +263,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
   if (safeVersion && canResolveInLock) {
     return {
       strategy: 'lockfile-update',
+      strategyLabel: 'lockfile-update (transitive pin)',
       targetPackage: vuln.packageName,
       targetVersion: safeVersion,
       directRoot: directRoots[0]?.name || null,
@@ -309,6 +318,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
     if (packageJsonChanges.length > 0) {
       return {
         strategy: 'bump-direct-parent',
+        strategyLabel: 'bump-direct-parent',
         targetPackage: fix.name,
         targetVersion: fix.version,
         isOutOfRange,
@@ -374,8 +384,13 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
       overrideChange.parentPackage = forbiddingParentName;
     }
 
+    const strategyLabel = workspaceScope
+      ? 'package-override (workspace-scoped)'
+      : (forbiddingParentName ? 'package-override (parent-scoped)' : 'package-override (root override)');
+
     return {
       strategy: 'package-override',
+      strategyLabel,
       targetPackage: vuln.packageName,
       targetVersion: safeVersion,
       isOutOfRange: true,
@@ -390,6 +405,7 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
   // 5. Transitive without safe version available
   return {
     strategy: 'none',
+    strategyLabel: 'none',
     targetPackage: vuln.packageName,
     targetVersion: null,
     packageJsonChanges: [],
