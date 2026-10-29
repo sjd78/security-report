@@ -474,14 +474,7 @@ export function generateMarkdownReport(report) {
     for (const v of sortedVulns) {
       const typeLabel = v.dependencyType || (v.isDirect && v.isIndirect ? 'Direct & Indirect' : (v.isDirect ? 'Direct' : 'Indirect (Transitive)'));
       const statusBadge = formatStatus(v);
-      let targetFix = formatTargetFix(v);
-      const isBreaking = Boolean(v.remediation?.isBreaking || v.remediation?.isSemVerMajor || v.isBreaking || v.isSemVerMajor);
-      const isOutOfRange = Boolean(v.remediation?.isOutOfRange || v.isOutOfRange);
-      if (isBreaking && targetFix !== '_No fix_' && !targetFix.includes('⚠️')) {
-        targetFix += `<br>⚠️ _(Breaking)_`;
-      } else if (isOutOfRange && targetFix !== '_No fix_' && !targetFix.includes('⚠️')) {
-        targetFix += `<br>⚠️ _(Out of range)_`;
-      }
+      const targetFix = formatTargetFix(v);
       const cves = formatCves(v);
       const sources = formatSources(v);
       const remediationBadge = formatRemediationStatus(v);

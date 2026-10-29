@@ -629,8 +629,10 @@ test('Breaking change flag: flags major version updates in remediation, table, a
     branches: [{ branch: 'main', summary: { total: 1 }, vulnerabilities: [vuln] }],
   });
 
-  // Table includes breaking indicator
-  assert.ok(md.includes('⚠️ _(Breaking)_'));
+  // Table includes breaking indicator in Remediation column
+  assert.ok(md.includes('⚠️ Breaking upgrade'));
+  // Target Fix column does not contain breaking warning
+  assert.ok(!md.includes('⚠️ _(Breaking)_'));
   // Detailed findings call out breaking major version upgrade
   assert.ok(md.includes('major version upgrade required'));
   assert.ok(md.includes('Breaking Change:'));
