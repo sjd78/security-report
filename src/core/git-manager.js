@@ -147,8 +147,9 @@ export async function ensureRepo(spec, config = {}) {
     const remoteUrl = await getOriginUrl(parsed.localPath);
     try {
       await execGit(['fetch', '--all', '--prune', '--tags'], parsed.localPath, gitAuthEnv(remoteUrl, config.githubToken));
-    } catch {
-      // ignore if offline or no remotes
+    } catch (error) {
+      if (config.strictFetch && remoteUrl) throw error;
+      // Reporting may still inspect local snapshots when offline.
     }
     // Detach so a branch checked out here cannot force worktrees onto a detached
     // HEAD, which would strand remediation commits outside refs/heads/<branch>.
@@ -170,6 +171,7 @@ export async function ensureRepo(spec, config = {}) {
       await execGit(['fetch', '--all', '--prune', '--tags'], targetDir, authEnv);
       await detachHead(targetDir);
     } catch (err) {
+      if (config.strictFetch) throw err;
       console.warn(`[GitManager] Warning: 'git fetch' failed in ${targetDir}: ${err.message}`);
     }
     return {
@@ -216,8 +218,8 @@ export function sanitizeBranchName(branch) {
 }
 
 export async function createWorktree(repoPath, branch, customPath = null, options = {}) {
+  await execGit(['check-ref-format', '--branch', branch], repoPath);
   if (options.snapshot) {
-    await execGit(['check-ref-format', '--branch', branch], repoPath);
     const remoteRef = `refs/remotes/origin/${branch}`;
     const startPoint = await resolveRef(repoPath, remoteRef) ? remoteRef : `refs/heads/${branch}`;
     const snapshotDir = customPath || path.resolve(repoPath, '.worktrees', `${sanitizeBranchName(branch)}-${randomUUID()}`);
@@ -228,48 +230,26 @@ export async function createWorktree(repoPath, branch, customPath = null, option
   const sanitized = sanitizeBranchName(branch);
   const worktreeDir = customPath || path.resolve(repoPath, '.worktrees', sanitized);
 
-  // Clean up existing worktree if stale
-  if (fs.existsSync(worktreeDir)) {
-    try {
-      await execGit(['worktree', 'remove', '--force', worktreeDir], repoPath);
-    } catch {
-      try {
-        fs.rmSync(worktreeDir, { recursive: true, force: true });
-        await execGit(['worktree', 'prune'], repoPath);
-      } catch {
-        // ignore
-      }
-    }
-  }
+  if (fs.existsSync(worktreeDir)) throw new Error(`Refusing to overwrite retained worktree ${worktreeDir}.`);
 
   fs.mkdirSync(path.dirname(worktreeDir), { recursive: true });
 
-  // Check if origin/<branch> exists remotely
-  let hasRemoteBranch = false;
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  const localRef = `refs/heads/${branch}`;
+  const remoteCommit = await resolveRef(repoPath, remoteRef);
+  const localCommit = await resolveRef(repoPath, localRef);
   try {
-    const { stdout } = await execGit(['rev-parse', '--verify', `origin/${branch}`], repoPath);
-    hasRemoteBranch = Boolean(stdout.trim());
-  } catch {
-    hasRemoteBranch = false;
-  }
-
-  // Check if branch exists locally
-  const { stdout: localBranches } = await execGit(['branch', '--list', branch], repoPath);
-  const branchExists = Boolean(localBranches.trim());
-
-  try {
-    if (hasRemoteBranch) {
-      // Force local branch ref to match the latest fetched remote HEAD (origin/<branch>)
-      await execGit(['worktree', 'add', '-B', branch, worktreeDir, `origin/${branch}`], repoPath);
-    } else if (branchExists) {
+    if (localCommit) {
       await execGit(['worktree', 'add', worktreeDir, branch], repoPath);
+    } else if (remoteCommit) {
+      await execGit(['worktree', 'add', '-b', branch, worktreeDir, remoteRef], repoPath);
     } else {
       await execGit(['worktree', 'add', '-b', branch, worktreeDir], repoPath);
     }
   } catch (err) {
     // If failed because branch is currently checked out at repo root, use --detach
     if (err.stderr?.includes('already used by worktree') || err.message?.includes('already used by worktree')) {
-      const startPoint = hasRemoteBranch ? `origin/${branch}` : branch;
+      const startPoint = localCommit ? localRef : remoteRef;
       await execGit(['worktree', 'add', '--detach', worktreeDir, startPoint], repoPath);
     } else {
       throw err;
@@ -380,8 +360,7 @@ export async function stageAndCommit(worktreeDir, { message, files = ['.'], allo
   };
 }
 
-export async function pushBranch(worktreeDir, branch, remote = 'origin', force = false) {
-  const args = ['push', remote, branch];
-  if (force) args.push('--force');
-  return await execGit(args, worktreeDir);
+export async function pushBranch(worktreeDir, branch, { remote = 'origin', githubToken = '' } = {}) {
+  const remoteUrl = await getOriginUrl(worktreeDir);
+  return execGit(['push', remote, `refs/heads/${branch}:refs/heads/${branch}`], worktreeDir, gitAuthEnv(remoteUrl, githubToken));
 }

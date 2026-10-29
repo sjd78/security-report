@@ -176,13 +176,8 @@ export function updatePackageJsonFile(worktreeDir, changes = [], options = {}) {
   };
 }
 
-async function runNpm(worktreeDir, args, options = {}) {
-  const npmArgs = [...args, '--package-lock-only'];
-
-  if (options.legacyPeerDeps) {
-    npmArgs.push('--legacy-peer-deps');
-  }
-
+async function runNpm(worktreeDir, args) {
+  const npmArgs = [...args, '--package-lock-only', '--ignore-scripts'];
   try {
     const { stdout, stderr } = await execFileAsync('npm', npmArgs, {
       cwd: worktreeDir,
@@ -190,176 +185,326 @@ async function runNpm(worktreeDir, args, options = {}) {
     });
     return { success: true, stdout, stderr };
   } catch (err) {
-    if (!options.legacyPeerDeps && (err.stderr?.includes('ERESOLVE') || err.stdout?.includes('ERESOLVE'))) {
-      return await runNpm(worktreeDir, args, { ...options, legacyPeerDeps: true });
-    }
     throw new Error(`Failed to run "npm ${npmArgs.join(' ')}" in ${worktreeDir}: ${err.stderr || err.message}`);
   }
 }
 
 /** Rebuilds package-lock.json from the current package.json ranges and overrides. */
-export async function syncLockfile(worktreeDir, options = {}) {
-  return await runNpm(worktreeDir, ['install'], options);
+export async function syncLockfile(worktreeDir) {
+  return await runNpm(worktreeDir, ['install']);
 }
 
 /** Re-resolves one package inside the lockfile; see formatLockfileUpdate. */
-export async function updateLockfilePackage(worktreeDir, packageName, options = {}) {
-  return await runNpm(worktreeDir, ['update', packageName], options);
+export async function updateLockfilePackage(worktreeDir, packageName) {
+  return await runNpm(worktreeDir, ['update', packageName]);
 }
 
-export async function remediateBranch(worktreeDir, branchReport, options = {}) {
-  const branchName = branchReport.branch || 'main';
-  const vulnerabilities = branchReport.vulnerabilities || [];
+const dependencySections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+const dangerousKeys = new Set(['__proto__', 'constructor', 'prototype']);
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const owns = (object, key) => Object.hasOwn(object, key);
+const cleanVersion = (value) => typeof value === 'string' ? semver.valid(value.replace(/^[~^]/, '')) : null;
 
-  if (vulnerabilities.length === 0) {
-    return {
-      branch: branchName,
-      appliedChanges: [],
-      resolved: [],
-      remaining: [],
-      isClean: true,
-      message: 'No vulnerabilities to remediate.',
-    };
+function packageName(value) {
+  return typeof value === 'string' && !dangerousKeys.has(value)
+    && /^(?:@[a-zA-Z0-9._~-]+\/)?[a-zA-Z0-9_~][a-zA-Z0-9._~-]*$/.test(value);
+}
+
+function overrideKey(value) {
+  if (typeof value !== 'string' || dangerousKeys.has(value) || !value) return false;
+  if (value === '.') return true;
+  const separator = value.lastIndexOf('@');
+  return packageName(value) || (separator > 0 && packageName(value.slice(0, separator))
+    && Boolean(semver.validRange(value.slice(separator + 1))));
+}
+
+function inside(root, target) {
+  const relative = path.relative(root, target);
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+
+function containedFile(root, realRoot, file, required = true) {
+  if (typeof file !== 'string' || !file || file.includes('\\') || path.posix.isAbsolute(file)
+    || /^[a-zA-Z]:/.test(file) || file.split('/').some((part) => !part || part === '.' || part === '..')) {
+    throw new Error(`Unsafe repository-relative file path: ${JSON.stringify(file)}`);
   }
+  const absolute = path.resolve(root, file);
+  if (!inside(root, absolute)) throw new Error(`File escapes worktree: ${file}`);
+  // Resolve the parent even for a not-yet-created lockfile; dangling symlinks are not missing files.
+  const parent = fs.realpathSync(path.dirname(absolute));
+  if (!inside(realRoot, parent)) throw new Error(`File symlink escapes worktree: ${file}`);
+  let stat;
+  try {
+    stat = fs.lstatSync(absolute);
+  } catch (error) {
+    if (!required && error.code === 'ENOENT') return absolute;
+    throw error;
+  }
+  const real = fs.realpathSync(absolute);
+  if (!inside(realRoot, real)) throw new Error(`File symlink escapes worktree: ${file}`);
+  if (!(stat.isFile() || (stat.isSymbolicLink() && fs.statSync(real).isFile()))) {
+    throw new Error(`Expected a regular file: ${file}`);
+  }
+  return absolute;
+}
 
-  const changesMap = new Map();
-  const transientOverridesMap = new Map();
+function stringList(value, label, validate = (entry) => typeof entry === 'string' && entry.length > 0) {
+  if (!Array.isArray(value) || !value.every(validate)) throw new Error(`Invalid ${label}`);
+}
+
+function safeForFinding(version, finding) {
+  if (!semver.valid(version)) return false;
+  const range = finding.vulnerableVersionRange;
+  if (range && (!semver.validRange(range) || semver.satisfies(version, range, { includePrerelease: true }))) return false;
+  const fixes = [...(finding.patchedVersions || []), finding.targetSafeVersion]
+    .map(cleanVersion).filter(Boolean).filter((fix) => semver.major(fix) === semver.major(version));
+  if (fixes.length) return semver.gte(version, fixes.sort(semver.compare)[0]);
+  // A different major's patch floor does not establish safety on this major.
+  return Boolean(range && semver.validRange(range));
+}
+
+/**
+ * Validate the complete saved intent and simulate it without filesystem writes.
+ * Reuse requires the final values, not a mixture of pre- and post-execution values.
+ */
+export function validateBranchActions(worktreeDir, branchPlan, options = {}) {
+  if (!isObject(branchPlan) || typeof branchPlan.branch !== 'string' || !branchPlan.branch
+    || !['ready', 'no-op'].includes(branchPlan.status)
+    || !Array.isArray(branchPlan.actions) || !Array.isArray(branchPlan.packages)
+    || !Array.isArray(branchPlan.blockers) || branchPlan.blockers.length) {
+    throw new Error('Invalid or blocked branch plan; generate a valid saved plan before execution');
+  }
+  const root = path.resolve(worktreeDir);
+  const realRoot = fs.realpathSync(root);
+  const manifests = new Map();
+  const loadManifest = (file) => {
+    if (path.posix.basename(file) !== 'package.json') throw new Error(`Action must target a package.json file: ${file}`);
+    if (!manifests.has(file)) {
+      const absolute = containedFile(root, realRoot, file);
+      const real = fs.realpathSync(absolute);
+      if ([...manifests.values()].some((entry) => entry.real === real)) {
+        throw new Error(`Multiple manifest paths alias the same file: ${file}`);
+      }
+      const raw = fs.readFileSync(absolute, 'utf8');
+      const json = JSON.parse(raw);
+      if (!isObject(json)) throw new Error(`Invalid manifest object: ${file}`);
+      manifests.set(file, { file, absolute, real, raw, json, modified: false });
+    }
+    return manifests.get(file);
+  };
+  loadManifest('package.json');
+  containedFile(root, realRoot, 'package-lock.json', false);
+  // npm prefers shrinkwrap over package-lock; it is not an executable plan target.
+  if (fs.existsSync(path.join(root, 'npm-shrinkwrap.json'))) {
+    throw new Error('npm-shrinkwrap.json is not supported by package-lock remediation plans');
+  }
+  const ready = new Map();
+  for (const pkg of branchPlan.packages) {
+    if (!isObject(pkg) || !packageName(pkg.packageName)
+      || !['ready', 'resolved', 'manual-review', 'no-fix', 'not-installed'].includes(pkg.status)) {
+      throw new Error('Invalid package entry in branch plan');
+    }
+    if (pkg.status !== 'ready') continue;
+    if (ready.has(pkg.packageName)) throw new Error(`Duplicate ready package: ${pkg.packageName}`);
+    if (!Array.isArray(pkg.findings) || !pkg.findings.length) throw new Error(`Missing findings for ${pkg.packageName}`);
+    for (const finding of pkg.findings) {
+      if (!isObject(finding) || typeof finding.id !== 'string' || !finding.id
+        || (finding.vulnerableVersionRange != null && !semver.validRange(finding.vulnerableVersionRange))
+        || (finding.patchedVersions != null && (!Array.isArray(finding.patchedVersions)
+          || !finding.patchedVersions.every((version) => Boolean(cleanVersion(version)))))
+        || (finding.targetSafeVersion != null && !cleanVersion(finding.targetSafeVersion))
+        || (!finding.vulnerableVersionRange && !finding.targetSafeVersion && !finding.patchedVersions?.length)) {
+        throw new Error(`Invalid or incomplete finding for ${pkg.packageName}`);
+      }
+    }
+    ready.set(pkg.packageName, pkg);
+  }
+  if (branchPlan.status === 'no-op' && (branchPlan.actions.length || ready.size)) {
+    throw new Error('No-op branch plan cannot contain ready packages or actions');
+  }
+  const keys = new Set();
+  const motivated = new Set();
   const lockfileUpdates = [];
-
-  for (const vuln of vulnerabilities) {
-    const rem = vuln.remediation;
-    if (!rem) continue;
-
-    for (const chg of rem.packageJsonChanges || []) {
-      const scopeKey = chg.workspaceScope ? `ws:${chg.workspaceScope}` : chg.parentPackage ? `parent:${chg.parentPackage}` : 'global';
-      const key = `${chg.packageJsonPath || 'root'}:${chg.section || 'dependencies'}:${scopeKey}:${chg.package}`;
-      const existing = changesMap.get(key);
-      if (!existing) {
-        changesMap.set(key, chg);
-        continue;
-      }
-      const cleanExisting = semver.clean(String(existing.to).replace(/^[~^]/, ''));
-      const cleanNew = semver.clean(String(chg.to).replace(/^[~^]/, ''));
-      if (cleanExisting && cleanNew && semver.gt(cleanNew, cleanExisting)) {
-        changesMap.set(key, chg);
-      }
+  for (const action of branchPlan.actions) {
+    if (!isObject(action)) throw new Error('Invalid branch action');
+    const fields = {
+      'update-dependency': ['type', 'file', 'section', 'package', 'expectedRange', 'targetRange', 'packageNames', 'findingIds'],
+      'set-override': ['type', 'file', 'package', 'scope', 'expectedValue', 'targetVersion', 'packageNames', 'findingIds'],
+      'update-lockfile': ['type', 'package', 'packageNames', 'findingIds'],
+    }[action.type];
+    if (!fields || Object.keys(action).some((field) => !fields.includes(field))
+      || fields.some((field) => !owns(action, field))) {
+      throw new Error(`Invalid fields for action ${JSON.stringify(action.type)}`);
     }
-
-    for (const tOv of rem.transientOverrides || []) {
-      const existing = transientOverridesMap.get(tOv.package);
-      if (!existing) {
-        transientOverridesMap.set(tOv.package, tOv);
-        continue;
+    stringList(action.packageNames, 'action packageNames', packageName);
+    stringList(action.findingIds, 'action findingIds');
+    if (!action.packageNames.length || !action.findingIds.length
+      || action.packageNames.some((name) => !ready.has(name))) {
+      throw new Error('Actions must identify motivating ready packages and findings');
+    }
+    const knownFindings = new Set(action.packageNames.flatMap((name) => ready.get(name).findings.map((finding) => finding.id)));
+    if (action.findingIds.some((id) => !knownFindings.has(id))) throw new Error('Action references an unknown finding');
+    for (const name of action.packageNames) motivated.add(name);
+    if (action.type === 'update-lockfile') {
+      if (!packageName(action.package)) throw new Error('Invalid lockfile update package');
+      const key = `lockfile:${action.package}`;
+      if (keys.has(key)) throw new Error(`Duplicate action: ${key}`);
+      keys.add(key);
+      lockfileUpdates.push(action.package);
+      continue;
+    }
+    if (typeof action.file !== 'string') throw new Error('Missing action manifest file');
+    const entry = loadManifest(action.file);
+    let container;
+    let expected;
+    let target;
+    let key;
+    if (action.type === 'update-dependency') {
+      if (!dependencySections.includes(action.section) || !packageName(action.package)
+        || typeof action.expectedRange !== 'string' || !semver.validRange(action.expectedRange)
+        || typeof action.targetRange !== 'string' || !semver.validRange(action.targetRange)) {
+        throw new Error('Invalid dependency action section, package, or range');
       }
-      const cleanExisting = semver.clean(String(existing.to).replace(/^[~^]/, ''));
-      const cleanNew = semver.clean(String(tOv.to).replace(/^[~^]/, ''));
-      if (cleanExisting && cleanNew && semver.gt(cleanNew, cleanExisting)) {
-        transientOverridesMap.set(tOv.package, tOv);
+      container = entry.json[action.section];
+      if (!isObject(container) || !owns(container, action.package) || typeof container[action.package] !== 'string') {
+        throw new Error(`Missing declaration: ${action.file} ${action.section}.${action.package}`);
       }
-    }
-
-    for (const pkgName of rem.lockfileUpdates || []) {
-      if (pkgName && !lockfileUpdates.includes(pkgName)) lockfileUpdates.push(pkgName);
-    }
-  }
-
-  // Deduplicated per target; the highest requested version wins.
-  const pendingChanges = Array.from(changesMap.values());
-  const pendingTransient = Array.from(transientOverridesMap.values());
-
-  if (options.dryRun) {
-    return {
-      branch: branchName,
-      dryRun: true,
-      appliedChanges: pendingChanges,
-      transientOverrides: pendingTransient,
-      lockfileUpdates,
-      resolved: vulnerabilities,
-      remaining: [],
-      isClean: true,
-    };
-  }
-
-  // Step 2a: Update package.json files (root and workspaces)
-  const { applied, touchedFiles } = updatePackageJsonFile(worktreeDir, pendingChanges, options);
-
-  // Step 2b: If transient overrides exist for in-range transitive packages:
-  // Apply temporary override -> sync lockfile -> strip temporary override -> re-sync lockfile
-  if (pendingTransient.length > 0 && options.allowOverrides !== false) {
-    const rootPkgPath = path.resolve(worktreeDir, 'package.json');
-    const rootRaw = fs.readFileSync(rootPkgPath, 'utf8');
-    const rootPkg = JSON.parse(rootRaw);
-    const indent = detectIndentation(rootRaw);
-
-    const savedOverrides = rootPkg.overrides ? JSON.parse(JSON.stringify(rootPkg.overrides)) : null;
-
-    rootPkg.overrides = rootPkg.overrides || {};
-    for (const tOv of pendingTransient) {
-      rootPkg.overrides[tOv.package] = tOv.to;
-    }
-    fs.writeFileSync(rootPkgPath, JSON.stringify(rootPkg, null, indent) + '\n', 'utf8');
-
-    await syncLockfile(worktreeDir, options);
-
-    if (savedOverrides) {
-      rootPkg.overrides = savedOverrides;
+      expected = action.expectedRange;
+      target = action.targetRange;
+      key = JSON.stringify([entry.real, action.section, action.package]);
     } else {
-      delete rootPkg.overrides;
+      if (options.allowOverrides === false) throw new Error('Saved plan requires overrides, but overrides are disabled');
+      if (action.file !== 'package.json' || !overrideKey(action.package)
+        || !Array.isArray(action.scope) || !action.scope.every(overrideKey)
+        || (action.expectedValue !== null && typeof action.expectedValue !== 'string')
+        || !cleanVersion(action.targetVersion)) {
+        throw new Error('Invalid override action scope, package, or version');
+      }
+      if (owns(entry.json, 'overrides') && !isObject(entry.json.overrides)) {
+        throw new Error('Existing overrides must be an object');
+      }
+      container = entry.json.overrides ??= {};
+      for (const scope of action.scope) {
+        if (owns(container, scope) && !isObject(container[scope])) {
+          throw new Error(`Override scope is not an object: ${scope}`);
+        }
+        if (!owns(container, scope)) container[scope] = {};
+        container = container[scope];
+      }
+      expected = action.expectedValue;
+      target = action.targetVersion;
+      key = JSON.stringify([entry.real, 'overrides', ...action.scope, action.package]);
     }
-    fs.writeFileSync(rootPkgPath, JSON.stringify(rootPkg, null, indent) + '\n', 'utf8');
-
-    await syncLockfile(worktreeDir, options);
-  } else {
-    await syncLockfile(worktreeDir, options);
-  }
-  const appliedLockfileUpdates = [];
-  for (const pkgName of lockfileUpdates) {
-    try {
-      await updateLockfilePackage(worktreeDir, pkgName, options);
-      appliedLockfileUpdates.push(pkgName);
-    } catch (err) {
-      console.warn(`[Remediator] Warning: lockfile update for ${pkgName} failed: ${err.message}`);
+    if (keys.has(key)) throw new Error(`Duplicate action: ${key}`);
+    keys.add(key);
+    const present = owns(container, action.package);
+    const actual = present ? container[action.package] : null;
+    const required = options.reuse ? target : expected;
+    if (actual !== required || (required === null && present)) {
+      throw new Error(`Manifest precondition conflict at ${action.file} ${action.section || 'overrides'}.${action.package}: expected ${JSON.stringify(required)}, found ${JSON.stringify(actual)}`);
+    }
+    if (!options.reuse && actual !== target) {
+      container[action.package] = target;
+      entry.modified = true;
     }
   }
-
-  // Step 2c: Verify via re-audit
-  let postAudit;
-  try {
-    postAudit = await collectNpmAudit(worktreeDir, branchName);
-  } catch (err) {
-    console.warn(`[Remediator] Warning: Post-remediation audit check failed: ${err.message}`);
-    postAudit = { vulnerabilities: [] };
+  for (const name of ready.keys()) {
+    if (!motivated.has(name)) throw new Error(`Ready package has no executable branch action: ${name}`);
   }
-
-  // Step 2d: Optional Arborist verification
-  try {
-    const Arb = getArboristClass();
-    if (Arb) {
-      const arb = new Arb({ path: worktreeDir, offline: true });
-      await arb.loadVirtual();
+  const rootManifest = manifests.get('package.json').json;
+  for (const section of dependencySections) {
+    for (const [name, range] of Object.entries(rootManifest[section] || {})) {
+      const override = rootManifest.overrides?.[name];
+      const spec = isObject(override) ? override['.'] : override;
+      if (typeof spec === 'string' && !spec.startsWith('$') && spec !== range) {
+        throw new Error(`Direct dependency override for ${name} must exactly match ${section} (${range}); npm would reject EOVERRIDE`);
+      }
     }
-  } catch {
-    // ignore optional check failures
   }
+  return { manifests, lockfileUpdates };
+}
 
-  const remainingPkgNames = new Set(postAudit.vulnerabilities.map((v) => v.packageName));
-  const remainingIds = new Set(postAudit.vulnerabilities.map((v) => v.id));
-
-  const resolved = vulnerabilities.filter(
-    (v) => !remainingPkgNames.has(v.packageName) || !remainingIds.has(v.id)
-  );
-
-  const remaining = postAudit.vulnerabilities;
-
+/** Apply canonical saved actions, then prove the installed graph and audit are safe. */
+export async function executeBranchPlan(worktreeDir, branchPlan, options = {}) {
+  const { manifests, lockfileUpdates } = validateBranchActions(worktreeDir, branchPlan, options);
+  const ready = branchPlan.packages.filter((pkg) => pkg.status === 'ready');
+  const unresolved = branchPlan.packages.filter((pkg) => ['manual-review', 'no-fix', 'not-installed'].includes(pkg.status));
+  const appliedChanges = branchPlan.actions.filter((action) => action.type !== 'update-lockfile').map((action) => ({
+    package: action.package,
+    section: action.type === 'set-override' ? 'overrides' : action.section,
+    from: action.type === 'set-override' ? action.expectedValue : action.expectedRange,
+    to: action.type === 'set-override' ? action.targetVersion : action.targetRange,
+    packageJsonPath: action.file,
+    ...(action.type === 'set-override' ? { scope: [...action.scope] } : {}),
+  }));
+  const result = {
+    branch: branchPlan.branch,
+    dryRun: Boolean(options.dryRun),
+    verified: false,
+    appliedChanges,
+    lockfileUpdates,
+    touchedFiles: [],
+    resolved: [],
+    remaining: [],
+    unresolved: options.dryRun ? [...ready, ...unresolved] : unresolved,
+    isClean: false,
+    postAuditSummary: null,
+  };
+  if (options.dryRun) return result;
+  if (!options.reuse) {
+    for (const entry of manifests.values()) {
+      if (!entry.modified) continue;
+      fs.writeFileSync(entry.absolute, JSON.stringify(entry.json, null, detectIndentation(entry.raw)) + '\n', 'utf8');
+      result.touchedFiles.push(entry.file);
+    }
+    const lockfilePath = path.join(worktreeDir, 'package-lock.json');
+    const previousLockfile = fs.existsSync(lockfilePath) ? fs.readFileSync(lockfilePath, 'utf8') : null;
+    if (result.touchedFiles.length) await syncLockfile(worktreeDir);
+    for (const name of lockfileUpdates) await updateLockfilePackage(worktreeDir, name);
+    if (branchPlan.actions.length && fs.existsSync(lockfilePath)
+      && fs.readFileSync(lockfilePath, 'utf8') !== previousLockfile) result.touchedFiles.push('package-lock.json');
+  }
+  let tree;
+  if (ready.length) {
+    const Arborist = getArboristClass();
+    if (!Arborist) throw new Error('Arborist is required to verify planned package instances');
+    tree = await new Arborist({ path: worktreeDir, offline: true }).loadVirtual();
+    if (!tree?.inventory) throw new Error('Failed to load the virtual dependency graph for verification');
+  }
+  const installed = new Map(ready.map((pkg) => [pkg.packageName, []]));
+  for (const node of tree?.inventory.values() || []) {
+    const nodes = installed.get(node.package?.name || node.name);
+    if (nodes && !node.isProjectRoot) nodes.push(node);
+  }
+  const resolved = [];
+  for (const pkg of ready) {
+    const nodes = installed.get(pkg.packageName);
+    if (!nodes.length) throw new Error(`Verification failed: planned package ${pkg.packageName} is absent from the virtual dependency graph`);
+    for (const node of nodes) {
+      const version = node.package?.version || node.version;
+      if (!pkg.findings.every((finding) => safeForFinding(version, finding))) {
+        throw new Error(`Verification failed: ${pkg.packageName}@${version || 'unknown'} at ${node.location} remains vulnerable or lacks a safe patched major line`);
+      }
+    }
+    resolved.push({ ...pkg, installedVersions: [...new Set(nodes.map((node) => node.package?.version || node.version))].sort(semver.compare) });
+  }
+  const postAudit = await collectNpmAudit(worktreeDir, branchPlan.branch, {
+    githubToken: options.githubToken,
+    githubApiUrl: options.githubApiUrl,
+    ...(tree ? { arboristTree: tree } : {}),
+  });
+  // Advisory IDs change between npm, GHSA and CVE; package-level audit evidence wins.
+  for (const pkg of ready) {
+    if (postAudit.vulnerabilities.some((finding) => finding.packageName === pkg.packageName)) {
+      throw new Error(`Verification failed: npm audit still reports planned package ${pkg.packageName} as vulnerable`);
+    }
+  }
   return {
-    branch: branchName,
-    dryRun: false,
-    appliedChanges: applied,
-    lockfileUpdates: appliedLockfileUpdates,
-    touchedFiles,
+    ...result,
+    verified: true,
     resolved,
-    remaining,
-    isClean: remaining.length === 0,
+    remaining: postAudit.vulnerabilities,
+    isClean: postAudit.vulnerabilities.length === 0 && unresolved.length === 0,
     postAuditSummary: postAudit.summary,
   };
 }

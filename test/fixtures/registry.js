@@ -39,7 +39,7 @@ export async function startRegistry(directory) {
   }
   let url;
   const requests = [];
-  const state = { failAudit: false };
+  const state = { failAudit: false, failPr: false, pullRequests: [] };
   const server = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -66,6 +66,25 @@ export async function startRegistry(directory) {
       return send({ ghsa_id: fixtureGhsa, cve_id: 'CVE-2026-12345', severity: 'high',
         summary: 'Fixture denial of service', html_url: `https://github.com/advisories/${fixtureGhsa}`,
         vulnerabilities: [{ package: { name: fixturePackage, ecosystem: 'npm' }, vulnerable_version_range: '<1.0.1', first_patched_version: '1.0.1' }] });
+    }
+    const parsedUrl = new URL(req.url, url);
+    if (/\/repos\/[^/]+\/[^/]+\/pulls$/.test(parsedUrl.pathname)) {
+      if (state.failPr) return send({ message: 'Publishing denied' }, 403);
+      if (req.method === 'GET') return send(state.pullRequests.filter((pr) =>
+        `${pr.head.repo.owner.login}:${pr.head.ref}` === parsedUrl.searchParams.get('head')
+        && pr.base.ref === parsedUrl.searchParams.get('base')));
+      if (req.method === 'POST') {
+        const pr = { number: state.pullRequests.length + 1, html_url: `${url}/pull/${state.pullRequests.length + 1}`,
+          title: body.title, body: body.body, head: { ref: body.head, repo: { owner: { login: 'fixture' } } }, base: { ref: body.base } };
+        state.pullRequests.push(pr);
+        return send(pr, 201);
+      }
+    }
+    if (/\/pulls\/\d+$/.test(parsedUrl.pathname) && req.method === 'PATCH') {
+      const pr = state.pullRequests.find((item) => item.number === Number(parsedUrl.pathname.split('/').at(-1)));
+      if (!pr) return send({ message: 'Not found' }, 404);
+      Object.assign(pr, body);
+      return send(pr);
     }
     return send({ message: 'Not found' }, 404);
   });

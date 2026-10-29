@@ -22,18 +22,16 @@ Managing security vulnerabilities across large Node.js repositories is often fra
      - **Package Overview Table**: `Package`, `Status` (`✅ Resolved` / `⚠️ Open`), `Severity`, `Type`, `Current Version`, `Target Fix` (all major line fixes separated by `<br>`), `CVEs` (separated by `<br>`), and `Sources` (linked advisories, Jira tickets, Dependabot alerts separated by `<br>`).
      - **Detailed Package Findings**: Unnumbered findings with status badges, explicit current and target fix versions, individual advisory links, and strictly partitioned **Direct Dependencies** and **Transitive Dependency Paths** in compact code blocks (`<pkgFile>/<section>/...`).
    - Writes `reports/security-remediation-plan.json`: a standalone, versioned action plan grouped by branch and package, with scanned commit SHAs, manifest preconditions, advisory motivations, reconciled actions, and explicit unresolved dispositions.
-2. **Step 2: Automated Remediation (5-Tier Preference Hierarchy)**
-   - **`bump-direct-and-lockfile`**: For dual dependencies (`Direct & Indirect`, e.g. `js-yaml`), bumps the direct `package.json` semver constraint AND issues lockfile updates to synchronize all transitive instances.
-   - **`bump-direct`**: Directly updates `package.json` semver constraints for direct dependencies (preserving formatting and `^`/`~` prefixes).
-   - **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an update available that patches the transitive dependency, bumps the direct parent in `package.json`.
-   - **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), updates the lockfile directly without introducing unnecessary `package.json` overrides.
-   - **`package-override`**: Fallback applied only when parent ranges strictly forbid the safe version and no direct parent update exists. Overrides are placed in the root `package.json`, scoped by workspace (`overrides[workspaceScope][pkg] = ver`) or parent package where applicable.
-   - Packages already resolved in the repository skip redundant edits and lockfile changes.
-   - Performs atomic lockfile synchronization (`npm install --package-lock-only`, then `npm update <pkg> --package-lock-only` for each package that must move within existing ranges) and post-remediation audit verification.
-   - Without `--commit`, the branch worktree is **kept** and its path printed — it holds the only copy of the applied fix. A failed remediation also keeps its worktree for inspection.
-3. **Step 3: Structured Commit Generation & Publishing**
-   - Generates conventional commit messages linking CVE IDs, GHSA identifiers, advisory URLs, Jira tickets, Dependabot alert numbers, and the exact dependency path.
-   - Stages the touched `package.json` files (root and workspaces) plus `package-lock.json`, commits on the target branch, and optionally pushes. The commit is guaranteed to advance `refs/heads/<branch>`; if the branch is held by another worktree the run aborts instead of stranding the commit.
+2. **Step 2: Execute a Reviewed Plan**
+   - `fix --plan <path>` consumes the saved actions without rescanning or silently choosing a different remediation.
+   - Checks every selected branch's scanned SHA and manifest preconditions before applying changes. Stale plans, conflicting actions, escaping paths, and disabled override requirements fail explicitly.
+   - Applies root/workspace dependency edits, persistent overrides, and lockfile re-resolution in separate `security-remediation/*` branches. It never resets the target branches or overwrites retained worktrees.
+   - Runs npm lockfile operations with lifecycle scripts disabled, verifies all planned package instances against their findings, and requires a successful post-change audit.
+   - Apply-only and failed runs retain the worktree for inspection. `--commit` commits verified changes on the remediation branch; `--commit --push` pushes that branch.
+3. **Step 3: Publish Pull Requests**
+   - `pr --plan <path>` commits, pushes, and opens one PR per target branch. Rerunning the same plan re-verifies its existing remediation branch and updates the matching open PR instead of duplicating it.
+   - PR descriptions include saved actions, actual installed versions, CVE/GHSA/npm audit/Jira/Dependabot references, verification results, and findings that remain manual or have no fix.
+   - Titles are configurable through `prTitleTemplate`, `SEC_PR_TITLE_TEMPLATE`, or `--pr-title-template`.
 
 ---
 
@@ -63,14 +61,14 @@ npm link
 # 1. Scan multiple branches on a repository (Step 1)
 sec-remediate scan facebook/react --branches main,release/18.x
 
-# 2. Preview remediations and commit messages without modifying files (Dry-Run)
-sec-remediate fix facebook/react --branches main --dry-run
+# 2. Review reports/security-remediation-plan.json, then preview its actions
+sec-remediate fix --plan reports/security-remediation-plan.json --dry-run
 
-# 3. Remediate and commit changes to the target branches (Step 2 + Step 3)
-sec-remediate fix facebook/react --branches main,release/18.x --commit
+# 3. Apply and commit on separate remediation branches, without publishing PRs
+sec-remediate fix --plan reports/security-remediation-plan.json --commit
 
-# 4. Remediate, commit, and push to remote
-sec-remediate fix facebook/react --branches main --commit --push
+# 4. Apply, verify, and publish one PR per target branch
+sec-remediate pr --plan reports/security-remediation-plan.json
 ```
 
 ---
@@ -97,6 +95,7 @@ Precedence is **CLI option > environment variable > config file**, except for `g
 | `JIRA_JQL` | `--jira-jql <query>` | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
 | `SEC_COLLECTORS` | `--collectors <list>` | Active collectors to run (`npm-audit`, `jira`, `dependabot`) | `npm-audit,jira,dependabot` |
 | `SEC_DEBUG` | `--debug` | Save raw collector outputs to `security-<name>-collection.json` | `false` |
+| `SEC_PR_TITLE_TEMPLATE` | `--pr-title-template <text>` | PR/commit title; config field `prTitleTemplate`; supports `{targetBranch}`, `{targetPackages}`, `{summary}` | `fix(deps): {summary} ({targetBranch})` |
 
 > **Note on Credentials:** `.security-report.json` holds API tokens and is listed in `.gitignore` — keep it untracked. The GitHub token is never written into a clone URL or `.git/config`: it is passed per git invocation via `GIT_CONFIG_*` and stripped from any git error message. Library callers can bypass config-file discovery entirely with `loadConfig({ noConfigFile: true })`; the test suite relies on this to stay hermetic.
 
@@ -116,6 +115,7 @@ Precedence is **CLI option > environment variable > config file**, except for `g
   },
 
   "githubToken": "<token, or use `gh auth token`>",
+  "prTitleTemplate": "fix(deps): {targetPackages} on {targetBranch} — {summary}",
   "jira": {
     "baseUrl": "https://redhat.atlassian.net",
     "project": "MTA",
@@ -160,6 +160,7 @@ sec-remediate scan [repo] [options]
 - `--no-npm-audit`: Disable npm audit collector.
 - `--no-jira`: Disable Jira collector.
 - `--no-dependabot`: Disable GitHub Dependabot collector.
+- `--no-overrides`: Leave override-only package plans for manual review.
 - `--debug`: Save intermediate collector outputs to `security-<name>-collection.json`.
 
 #### Remediation-plan artifact
@@ -177,24 +178,43 @@ Review package dispositions and branch blockers before using an action plan. Pla
 
 ---
 
-### `sec-remediate fix [repo]` (or `sec-remediate remediate [repo]`)
+### `sec-remediate fix [repo] --plan <path>` (alias: `remediate`)
 
-Runs a scan, then applies remediations (`package.json` updates, lockfile synchronization), verifies the result with a second `npm audit`, and optionally creates Git commits. If `[repo]` is omitted, the `repo` value from the config file (or `SEC_REPO`) is used.
-
-```bash
-sec-remediate fix [repo] [options]
-```
+Executes a saved remediation plan; it does **not** scan or regenerate the plan. The optional repository argument overrides the configured repository, otherwise the plan's recorded local path is used. The repository origin, when recorded, must match.
 
 **Options:**
-- `-b, --branches <branches>`: Comma-separated list of branches to remediate.
-- `--all-branches`: Remediate all branches found in the repository.
-- `--dry-run`: Print the changes and the generated commit message without touching `package.json` or the lockfile. The scan reports in `--reports-dir` are still written.
-- `--commit`: Create Git commits on the target branches with motivating links.
-- `--push`: Push created commits to the remote repository. Requires `--commit`; on its own it has no effect.
-- `--no-overrides`: Do not insert npm `overrides` into `package.json`; findings that only have an override strategy are left unremediated.
-- All connection and path options from `scan` (`--github-token`, `--jira-*`, `--branch-map`, `--repos-dir`, `--reports-dir`, `--collectors`, `--no-*`, `--debug`).
+- `--plan <path>`: Required saved `security-remediation-plan.json`.
+- `-b, --branches <branches>`: Select branches already present in the plan; omitted means all saved branches.
+- `--dry-run`: Validate branch snapshots, manifest preconditions, policy, and title text; print actions without applying changes, running post-change verification, committing, pushing, or creating PRs.
+- `--commit`: Commit verified changes on a separate remediation branch.
+- `--push`: Push the remediation branch; requires `--commit`.
+- `--no-overrides`: Reject a plan requiring overrides rather than silently skipping its actions.
+- `--pr-title-template <text>`, `--github-token <token>`, `--repos-dir <path>`, `--reports-dir <path>`.
 
-Without `--commit` and without `--dry-run` the changes are applied and the worktree is retained; the path is printed so the result can be reviewed and committed by hand.
+Without `--commit`, the verified worktree is retained and its path printed. Failed execution also retains its worktree. A rerun refuses to overwrite it: review the files, then remove that worktree explicitly when it is no longer needed.
+
+### `sec-remediate pr [repo] --plan <path>`
+
+Executes the same saved plan, commits and pushes verified remediation branches, then creates or updates an open GitHub PR for each base/head pair. Accepts the `fix` options above except `--commit` and `--push`, which are implicit. Requires an origin URL identifying the GitHub owner/repository, Git push access, and a GitHub token with repository-content and pull-request write permissions. SSH origins still use SSH authentication; HTTPS Git operations receive the configured token per invocation. `GITHUB_API_URL` supports GitHub Enterprise.
+
+Existing remediation branches are reused only when their commit identifies the same saved plan and their changed files remain within that plan. They are re-audited before publication. Target branch changes require a fresh scan and review; the executor never rebases or force-pushes stale plans.
+
+Execution writes `security-remediation-results.json` under the configured reports directory, including dry-run/unverified state, observed verification results, commit/PR details, or error and retained-worktree information. Unreadable or unsupported plan files are rejected before execution. Audit failure or a still-vulnerable planned package prevents publication. Manual/no-fix findings are disclosed rather than counted as fixed. `npm-shrinkwrap.json` repositories require manual review because the plan targets `package-lock.json`.
+
+#### PR title templates
+
+Precedence: CLI `--pr-title-template` > `SEC_PR_TITLE_TEMPLATE` > config-file `prTitleTemplate` > built-in default. Available tokens:
+
+- `{targetBranch}`: the PR's base branch.
+- `{targetPackages}`: comma-separated names of the packages being remediated.
+- `{summary}`: the branch plan's summary sentence.
+
+Unknown placeholders, empty titles, and multiline titles are rejected before applying changes.
+
+```bash
+export SEC_PR_TITLE_TEMPLATE='fix(deps): {targetPackages} [{targetBranch}] — {summary}'
+sec-remediate pr --plan reports/security-remediation-plan.json
+```
 
 ---
 
@@ -246,34 +266,17 @@ Without `--commit` and without `--dry-run` the changes are applied and the workt
 
 ---
 
-## 6. Sample Commit Message
+## 6. Commit and PR Contents
 
-When running with `--commit`, the engine creates structured commit messages:
+Verified commits and PRs use the configured title and a generated Markdown body describing:
 
-```text
-fix(deps): remediate 2 vulnerable packages on branch main
+- The target branch and scanned base commit.
+- Canonical manifest/override/lockfile actions from the reviewed plan.
+- The actual verified installed versions for each remediated package.
+- Each motivating advisory and its npm audit, GHSA, CVE, Jira, and Dependabot references.
+- Post-change audit results and unresolved findings, without claiming that unplanned issues were fixed.
 
-Automated security remediation applied based on aggregated audit findings.
-
-### Resolved Packages & Security Advisories:
-- [HIGH] tough-cookie (2.5.0 -> 4.1.3) (CVE-2023-26136)
-  - Title: Prototype Pollution in tough-cookie
-  - Advisory: https://github.com/advisories/GHSA-72xf-g2v4-qvf3
-  - Jira: MTA-7680 (https://issues.example.com/browse/MTA-7680)
-  - Dependabot: #42 (https://github.com/org/repo/security/dependabot/42)
-  - Chain: package.json/dependencies/request-lib/.../tough-cookie@2.5.0
-- [CRITICAL] lodash (4.17.15 -> 4.17.21) (CVE-2021-23337)
-  - Title: Command Injection in lodash
-  - Advisory: https://github.com/advisories/GHSA-35jh-r3h4-6jhm
-  - Chain: package.json/dependencies/lodash@4.17.15
-
-### Changes Applied:
-- Updated lodash ^4.17.15 -> ^4.17.21 in dependencies
-- Added override: "tough-cookie": "4.1.3"
-- Synchronized package-lock.json
-
-Verification: Post-remediation npm audit scan reported 0 remaining vulnerabilities.
-```
+Commits include a `Security-Remediation-Plan` digest trailer used to recognize safe reruns. Execution results, not the plan's expected outcomes, establish which packages were resolved.
 
 ---
 
@@ -283,6 +286,6 @@ Verification: Post-remediation npm audit scan reported 0 remaining vulnerabiliti
 npm test
 ```
 
-Runs the complete unit and integration suite on Node's native `node:test` runner (no external test framework). `git` and `npm` must be on `PATH`; the integration test creates throwaway repositories under the system temp directory.
+Runs the unit and integration suite on Node's native `node:test` runner. `git` and `npm` must be on `PATH`. Integration tests run real npm against an isolated loopback registry and real Git against temporary local bare remotes; PR protocol tests use a loopback GitHub REST fixture.
 
-The suite is hermetic: every test that touches `loadConfig` passes `noConfigFile: true`, so a `.security-report.json` in the working directory is never read and no credential ever leaves the machine during a test run.
+Tests skip developer config discovery with `noConfigFile: true`, except dedicated configuration-discovery tests that run in a temporary working directory with known fixture files. Registry fixtures isolate npm configuration and caches so developer credentials are not used.

@@ -3,13 +3,11 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
-import { execGit, withWorktree, stageAndCommit } from '../src/core/git-manager.js';
-import { scanRepository } from '../src/index.js';
-import { generateCommitMessage } from '../src/core/commit-generator.js';
-import { remediateBranch } from '../src/core/remediator.js';
+import { execGit, withWorktree } from '../src/core/git-manager.js';
+import { scanRepository, remediateRepository } from '../src/index.js';
 import { startRegistry, fixturePackage } from './fixtures/registry.js';
 
-test('End-to-End: Multi-branch scan, report, and commit message flow', async () => {
+test('Multi-branch scan writes reports and collector diagnostics', async () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-e2e-'));
   const localRepoPath = path.join(tmpBase, 'my-repo');
   const reportsDir = path.join(tmpBase, 'reports');
@@ -91,74 +89,6 @@ test('End-to-End: Multi-branch scan, report, and commit message flow', async () 
     assert.ok(fs.existsSync(path.join(reportsDir, 'security-dependabot-collection.json')));
     assert.ok(fs.existsSync(path.join(reportsDir, 'security-npm-audit-collection.json')));
 
-    // 3. Test Commit Message generation with mock remediation
-    const mockRemResult = {
-      resolved: [
-        {
-          id: 'GHSA-c2qf-rxjj-qqgw',
-          cve: 'CVE-2022-25883',
-          packageName: 'semver',
-          severity: 'high',
-          currentVersion: '5.0.0',
-          targetSafeVersion: '7.5.4',
-          title: 'Regular Expression Denial of Service in semver',
-          url: 'https://github.com/advisories/GHSA-c2qf-rxjj-qqgw',
-          dependencyPaths: ['semver@5.0.0'],
-          sources: {
-            jira: { ticketKey: 'SEC-101', url: 'https://jira.corp/browse/SEC-101' },
-            dependabot: { alertNumber: 5, url: 'https://github.com/org/repo/security/dependabot/5' },
-          },
-        },
-      ],
-      appliedChanges: [
-        { package: 'semver', section: 'dependencies', from: '5.0.0', to: '^7.5.4' },
-      ],
-      remaining: [],
-    };
-
-    const commitMsg = generateCommitMessage('main', mockRemResult);
-    assert.ok(commitMsg.includes('fix(deps): remediate 1 vulnerable package on branch main'));
-    assert.ok(commitMsg.includes('CVE-2022-25883'));
-    assert.ok(commitMsg.includes('SEC-101'));
-    assert.ok(commitMsg.includes('Dependabot: #5'));
-    assert.ok(commitMsg.includes('Updated semver 5.0.0 -> ^7.5.4 in dependencies'));
-
-    // 4. Test worktree remediation & commit execution on main
-    await withWorktree(localRepoPath, 'main', async (wtPath) => {
-      const branchReport = {
-        branch: 'main',
-        vulnerabilities: mockRemResult.resolved.map((r) => ({
-          ...r,
-          remediation: {
-            strategy: 'bump-direct',
-            packageJsonChanges: mockRemResult.appliedChanges,
-          },
-        })),
-      };
-
-      const remResult = await remediateBranch(wtPath, branchReport, { dryRun: true });
-      assert.equal(remResult.appliedChanges.length, 1);
-      assert.equal(remResult.appliedChanges[0].package, 'semver');
-
-      // Actual modification & commit
-      const pkgPath = path.join(wtPath, 'package.json');
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      pkg.dependencies.semver = '^7.5.4';
-      fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
-
-      const commitResult = await stageAndCommit(wtPath, {
-        message: commitMsg,
-        files: ['package.json'],
-        branch: 'main',
-      });
-
-      assert.equal(commitResult.committed, true);
-      assert.ok(commitResult.commitHash);
-    });
-
-    // The branch ref itself must carry the commit, not just the worktree HEAD.
-    const { stdout: logOut } = await execGit(['log', '-n', '1', '--oneline', 'main'], localRepoPath);
-    assert.ok(logOut.includes('fix(deps): remediate 1 vulnerable package on branch main'));
   } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
@@ -236,6 +166,106 @@ test('real npm scan produces actionable plans and preserves audit failures', asy
     const failed = await scanRepository(repo, options);
     assert.equal(failed.remediationPlan.branches[0].status, 'blocked');
     assert.ok(failed.remediationPlan.branches[0].blockers.some((reason) => /audit/i.test(reason)));
+  } finally {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await registry.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('saved plans publish verified PRs idempotently, reject stale bases, and retain failed verification', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-execution-e2e-'));
+  const registry = await startRegistry(path.join(tmp, 'registry'));
+  const previousEnv = Object.fromEntries(Object.keys(registry.env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, registry.env);
+  const repo = path.join(tmp, 'repo');
+  const remote = path.join(tmp, 'remote.git');
+  fs.mkdirSync(repo);
+  fs.mkdirSync(remote);
+  try {
+    await execGit(['init', '--bare', '-b', 'main'], remote);
+    await execGit(['init', '-b', 'main'], repo);
+    await execGit(['config', 'user.name', 'Security Bot'], repo);
+    await execGit(['config', 'user.email', 'bot@example.com'], repo);
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({
+      name: 'fixture-app', version: '1.0.0', dependencies: { [fixturePackage]: '1.0.0' },
+      scripts: { prepare: `node -e "require('fs').writeFileSync('${path.join(tmp, 'unexpected-script')}', 'ran')"` },
+    }));
+    fs.writeFileSync(path.join(repo, 'package-lock.json'), JSON.stringify(registry.packageLock()));
+    await execGit(['add', '.'], repo);
+    await execGit(['commit', '-m', 'Vulnerable dependency'], repo);
+    await execGit(['remote', 'add', 'origin', 'https://github.com/fixture/app.git'], repo);
+    await execGit(['config', `url.file://${remote}.insteadOf`, 'https://github.com/fixture/app.git'], repo);
+    await execGit(['push', '-u', 'origin', 'main'], repo);
+    const { stdout: base } = await execGit(['rev-parse', 'main'], repo);
+    const options = {
+      noConfigFile: true, collectors: 'npm-audit', githubToken: '', branches: 'main',
+      githubApiUrl: `${registry.url}/github`, reportsDir: path.join(tmp, 'reports'),
+    };
+    const scanned = await scanRepository(repo, options);
+    const executeOptions = { ...options, plan: scanned.remediationPlanPath, createPr: true, githubToken: 'fixture-token',
+      prTitleTemplate: '{targetBranch}: fix {targetPackages} — {summary}' };
+    const dry = await remediateRepository(repo, { ...executeOptions, dryRun: true });
+    assert.equal(dry.results.branches[0].verified, false);
+    assert.equal(registry.state.pullRequests.length, 0);
+    assert.equal((await execGit(['rev-parse', 'main'], repo)).stdout, base);
+
+    const published = await remediateRepository(repo, executeOptions);
+    const result = published.results.branches[0];
+    assert.equal(result.status, 'published');
+    assert.equal(result.execution.verified, true);
+    assert.deepEqual(result.execution.resolved[0].installedVersions, ['1.0.1']);
+    assert.equal((await execGit(['rev-parse', 'main'], remote)).stdout, base);
+    const headManifest = JSON.parse((await execGit(['show', `${result.head}:package.json`], remote)).stdout);
+    const headLock = JSON.parse((await execGit(['show', `${result.head}:package-lock.json`], remote)).stdout);
+    assert.equal(headManifest.dependencies[fixturePackage], '1.0.1');
+    assert.equal(headLock.packages[`node_modules/${fixturePackage}`].version, '1.0.1');
+    assert.equal(registry.state.pullRequests[0].base.ref, 'main');
+    assert.ok(registry.state.pullRequests[0].title.startsWith(`main: fix ${fixturePackage}`));
+    assert.ok(registry.state.pullRequests[0].body.includes('CVE-2026-12345'));
+    assert.ok(registry.state.pullRequests[0].body.includes('GHSA-2345-6789-CFGH'));
+    assert.equal(fs.existsSync(path.join(tmp, 'unexpected-script')), false);
+
+    const repeated = await remediateRepository(repo, {
+      ...executeOptions, prTitleTemplate: 'Reviewed {targetBranch}: {targetPackages}',
+    });
+    assert.equal(registry.state.pullRequests.length, 1);
+    assert.equal(registry.state.pullRequests[0].title, `Reviewed main: ${fixturePackage}`);
+    assert.equal(repeated.results.branches[0].pullRequest.created, false);
+    assert.equal(repeated.results.branches[0].commit.commitHash, result.commit.commitHash);
+
+    // An ownership trailer is not permission to publish unrelated edits in the same manifest.
+    await execGit(['checkout', result.head], repo);
+    const ownedMessage = (await execGit(['log', '-1', '--format=%B'], repo)).stdout;
+    const changedManifest = JSON.parse(fs.readFileSync(path.join(repo, 'package.json')));
+    changedManifest.description = 'Unplanned user edits';
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify(changedManifest));
+    await execGit(['add', 'package.json'], repo);
+    await execGit(['commit', '-m', ownedMessage], repo);
+    const tamperedCommit = (await execGit(['rev-parse', 'HEAD'], repo)).stdout;
+    await execGit(['checkout', '--detach'], repo);
+    await assert.rejects(() => remediateRepository(repo, executeOptions), /unplanned manifest changes/);
+    assert.equal(registry.state.pullRequests[0].title, `Reviewed main: ${fixturePackage}`);
+    await execGit(['update-ref', `refs/heads/${result.head}`, result.commit.commitHash, tamperedCommit], repo);
+
+    await execGit(['checkout', 'main'], repo);
+    fs.writeFileSync(path.join(repo, 'README.md'), 'New upstream commit');
+    await execGit(['add', 'README.md'], repo);
+    await execGit(['commit', '-m', 'Upstream changed'], repo);
+    await execGit(['push', 'origin', 'main'], repo);
+    await assert.rejects(() => remediateRepository(repo, executeOptions), /Stale remediation plan/);
+    assert.equal(registry.state.pullRequests.length, 1);
+    const fresh = await scanRepository(repo, options);
+    registry.state.failAudit = true;
+    await assert.rejects(() => remediateRepository(repo, {
+      ...executeOptions, plan: fresh.remediationPlanPath,
+    }), /audit/i);
+    const failure = JSON.parse(fs.readFileSync(path.join(tmp, 'reports/security-remediation-results.json')));
+    assert.equal(failure.branches[0].status, 'failed');
+    assert.ok(fs.existsSync(failure.branches[0].worktreeDir));
+    assert.equal(registry.state.pullRequests.length, 1);
   } finally {
     for (const [key, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;

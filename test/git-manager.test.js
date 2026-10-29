@@ -114,7 +114,7 @@ test('Git Worktree and commit lifecycle', async () => {
   }
 });
 
-test('createWorktree: resets local branch to latest fetched remote origin/branch HEAD', async () => {
+test('snapshot worktrees follow fetched origin without resetting local branches', async () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'git-sync-test-'));
   const remoteDir = path.join(tmpBase, 'remote');
   const cloneDir = path.join(tmpBase, 'clone');
@@ -133,6 +133,7 @@ test('createWorktree: resets local branch to latest fetched remote origin/branch
     // 2. Clone to local cloneDir
     await execGit(['clone', remoteDir, cloneDir], tmpBase);
     await execGit(['checkout', '--detach'], cloneDir);
+    const { stdout: localBefore } = await execGit(['rev-parse', 'main'], cloneDir);
 
     // 3. Push new commit on remote
     fs.writeFileSync(path.join(remoteDir, 'file.txt'), 'v2');
@@ -143,14 +144,15 @@ test('createWorktree: resets local branch to latest fetched remote origin/branch
     // 4. Fetch in cloneDir
     await execGit(['fetch', '--all', '--prune'], cloneDir);
 
-    // 5. Create worktree on main
+    // A reporting snapshot follows origin, but leaves the local branch untouched.
     await withWorktree(cloneDir, 'main', async (wtPath) => {
       const content = fs.readFileSync(path.join(wtPath, 'file.txt'), 'utf8');
       assert.equal(content, 'v2');
 
       const { stdout: wtHead } = await execGit(['rev-parse', 'HEAD'], wtPath);
       assert.equal(wtHead.trim(), remoteHead.trim());
-    });
+    }, { snapshot: true });
+    assert.equal((await execGit(['rev-parse', 'main'], cloneDir)).stdout, localBefore);
   } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
@@ -231,6 +233,9 @@ test('withWorktree: retains the worktree when requested and when the callback th
       fs.writeFileSync(path.join(wtPath, 'applied.txt'), 'remediated');
     }, { keepWorktree: true });
     assert.ok(fs.existsSync(path.join(worktreeDir, 'applied.txt')));
+    await assert.rejects(() => createWorktree(tmpDir, 'feature/update'), /Refusing to overwrite retained worktree/);
+    assert.equal(fs.readFileSync(path.join(worktreeDir, 'applied.txt'), 'utf8'), 'remediated');
+    await removeWorktree(tmpDir, worktreeDir);
 
     await assert.rejects(() =>
       withWorktree(tmpDir, 'feature/update', async (wtPath) => {

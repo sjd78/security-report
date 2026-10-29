@@ -174,6 +174,8 @@ export function loadConfig(options = {}) {
     gitProtocol: options.gitProtocol || process.env.GIT_PROTOCOL || fileConfig.gitProtocol || 'https',
     githubToken,
     githubApiUrl: options.githubApiUrl || process.env.GITHUB_API_URL || fileConfig.githubApiUrl || 'https://api.github.com',
+    prTitleTemplate: options.prTitleTemplate ?? process.env.SEC_PR_TITLE_TEMPLATE ?? fileConfig.prTitleTemplate
+      ?? 'fix(deps): {summary} ({targetBranch})',
     jira,
     branchMap: parseBranchMap(rawBranchMap),
     defaultBranches: options.branches || fileConfig.branches || ['main'],

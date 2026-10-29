@@ -5,8 +5,6 @@ import {
   ensureRepo,
   listBranches,
   withWorktree,
-  stageAndCommit,
-  pushBranch,
   execGit,
 } from './core/git-manager.js';
 import { readPackageJson, readPackageLock, runNpmLs, findWorkspacePackageJsons, loadArboristTree } from './core/dependency-graph.js';
@@ -15,10 +13,9 @@ import { fetchJiraCveTickets, groupJiraTicketsByBranch } from './collectors/jira
 import { fetchDependabotAlerts, groupDependabotAlertsByBranch } from './collectors/dependabot.js';
 import { blendVulnerabilitySources } from './core/blender.js';
 import { generateJsonReport, writeJsonReport } from './report/json-reporter.js';
-import { generateMarkdownReport, writeMarkdownReport } from './report/markdown-reporter.js';
+import { writeMarkdownReport } from './report/markdown-reporter.js';
 import { generateRemediationPlan, writeRemediationPlan } from './report/remediation-reporter.js';
-import { remediateBranch } from './core/remediator.js';
-import { generateCommitMessage } from './core/commit-generator.js';
+import { readRemediationPlan, executeRemediationPlan } from './core/plan-executor.js';
 
 export function saveDebugCollection(collectorName, data, reportsDir) {
   fs.mkdirSync(reportsDir, { recursive: true });
@@ -181,91 +178,12 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
 }
 
 export async function remediateRepository(repoSpec, cliOptions = {}) {
-  const initialConfig = loadConfig(cliOptions);
-  const targetRepo = repoSpec || initialConfig.repo;
-  if (!targetRepo) {
-    throw new Error('No target repository specified. Please provide a repository (e.g. "org/repo") or define "repo" in .security-report.json');
-  }
-
-  // Step 1: Scan and create intermediate report
-  const scanResult = await scanRepository(targetRepo, cliOptions);
-  const { config, repository, report } = scanResult;
-
-  const isDryRun = Boolean(cliOptions.dryRun);
-  const shouldCommit = Boolean(cliOptions.commit);
-  const shouldPush = Boolean(cliOptions.push);
-
-  console.log(`\n🛠️ [Remediate] Starting remediation (Mode: ${isDryRun ? 'DRY-RUN' : shouldCommit ? 'COMMIT' : 'APPLY-ONLY'})...`);
-
-  const remediationSummary = [];
-
-  for (const branchReport of report.branches) {
-    const branch = branchReport.branch;
-    const vulnCount = (branchReport.vulnerabilities || []).length;
-
-    if (vulnCount === 0) {
-      console.log(`✨ [Remediate] Branch \`${branch}\` is clean. Skipping.`);
-      continue;
-    }
-
-    console.log(`\n🚀 [Remediate] Processing branch \`${branch}\` (${vulnCount} vulnerabilities)...`);
-
-    // Without --commit the worktree is the only place the fix exists: keep it.
-    const keepWorktree = !isDryRun && !shouldCommit;
-
-    await withWorktree(repository.repoPath, branch, async (worktreeDir) => {
-      // Step 2: Apply package.json and lockfile remediations
-      const remResult = await remediateBranch(worktreeDir, branchReport, {
-        dryRun: isDryRun,
-        allowOverrides: config.allowOverrides,
-      });
-
-      console.log(`   - Applied changes: ${remResult.appliedChanges.length}`);
-      console.log(`   - Lockfile updates: ${(remResult.lockfileUpdates || []).length}`);
-      console.log(`   - Resolved vulnerabilities: ${remResult.resolved.length}`);
-      console.log(`   - Remaining vulnerabilities: ${remResult.remaining.length}`);
-
-      // Step 3: Generate commit message
-      const commitMessage = generateCommitMessage(branch, remResult);
-
-      if (isDryRun) {
-        console.log(`\n[DRY RUN] Would commit with message:\n--------------------\n${commitMessage}\n--------------------`);
-        remediationSummary.push({ branch, remResult, committed: false, commitMessage });
-        return;
-      }
-
-      if (!shouldCommit) {
-        console.log(`📂 [Remediate] Worktree retained for review (no --commit): ${worktreeDir}`);
-        remediationSummary.push({ branch, remResult, committed: false, commitMessage, worktreeDir });
-        return;
-      }
-
-      console.log(`📝 [Commit] Creating Git commit on branch \`${branch}\`...`);
-      const commitRes = await stageAndCommit(worktreeDir, {
-        message: commitMessage,
-        files: ['package-lock.json', ...(remResult.touchedFiles?.length ? remResult.touchedFiles : ['package.json'])],
-        branch,
-      });
-
-      if (commitRes.committed) {
-        console.log(`✅ [Commit] Created commit ${commitRes.commitHash.substring(0, 7)} on \`${branch}\``);
-
-        if (shouldPush) {
-          console.log(`⬆️ [Push] Pushing \`${branch}\` to remote...`);
-          await pushBranch(worktreeDir, branch);
-          console.log(`✅ [Push] Successfully pushed \`${branch}\``);
-        }
-      } else {
-        console.log(`ℹ️ [Commit] Nothing to commit on \`${branch}\`: ${commitRes.reason}`);
-      }
-
-      remediationSummary.push({ branch, remResult, commit: commitRes, commitMessage });
-    }, { keepWorktree });
-  }
-
-  console.log(`\n🎉 [Remediate] Completed remediation across all branches!`);
-  return {
-    scanResult,
-    remediationSummary,
-  };
+  const config = loadConfig(cliOptions);
+  const planPath = cliOptions.plan;
+  if (!planPath) throw new Error('A saved remediation plan is required. Run scan, review the plan, then use --plan <path>.');
+  const plan = readRemediationPlan(planPath);
+  return executeRemediationPlan(plan, {
+    ...config,
+    repo: repoSpec || config.repo || plan.repository.path,
+  });
 }

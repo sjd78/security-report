@@ -326,6 +326,93 @@ test('calculateOptimalSafeVersion: picks highest patched version satisfying all 
   const optimal = calculateOptimalSafeVersion('1.6.0', advisories);
   assert.equal(optimal, '1.7.4');
 });
+
+test('calculateOptimalSafeVersion: excludes fixes that remain vulnerable to another advisory', () => {
+  const advisories = [
+    { vulnerableVersionRange: '<1.2.0', patchedVersions: ['1.2.0'] },
+    { vulnerableVersionRange: '<2.0.0', targetSafeVersion: '2.0.0' },
+  ];
+  assert.equal(calculateOptimalSafeVersion('1.0.0', advisories), '2.0.0');
+  assert.equal(calculateOptimalSafeVersion('1.0.0', [
+    advisories[0], { vulnerableVersionRange: '*', targetSafeVersion: '2.0.0' },
+  ]), null);
+});
+
+test('calculateOptimalSafeVersion: retains a safe in-major fix across advisory version lines', () => {
+  const advisories = [
+    { vulnerableVersionRange: '<1.2.0 || >=2.0.0 <2.1.0', patchedVersions: ['1.2.0', '2.1.0'] },
+    { vulnerableVersionRange: '<1.3.0 || >=2.0.0 <2.2.0', patchedVersions: ['1.3.0', '2.2.0'] },
+  ];
+  assert.equal(calculateOptimalSafeVersion('1.0.0', advisories), '1.3.0');
+  assert.equal(calculateOptimalSafeVersion('2.0.0', advisories), '2.2.0');
+});
+
+test('consolidation never retains a target or executable edits vulnerable to a merged advisory', () => {
+  const firstFinding = {
+    id: 'GHSA-first',
+    packageName: 'example',
+    currentVersion: '1.0.0',
+    isDirect: true,
+    vulnerableVersionRange: '<1.2.0',
+    targetSafeVersion: '1.2.0',
+    remediation: {
+      strategy: 'bump-direct',
+      targetPackage: 'example',
+      targetVersion: '1.2.0',
+      packageJsonChanges: [{ package: 'example', from: '^1.0.0', to: '^1.2.0' }],
+      lockfileUpdates: ['example'],
+    },
+  };
+  const secondFinding = {
+    id: 'GHSA-second',
+    packageName: 'example',
+    currentVersion: '1.0.0',
+    vulnerableVersionRange: '<2.0.0',
+    targetSafeVersion: '2.0.0',
+  };
+  const [fixed] = consolidateVulnerabilitiesByPackage([firstFinding, secondFinding]);
+  assert.equal(fixed.targetSafeVersion, '2.0.0');
+  assert.equal(fixed.remediation.targetVersion, '2.0.0');
+  assert.equal(fixed.remediation.packageJsonChanges[0].to, '^2.0.0');
+  assert.equal(fixed.status, 'open');
+
+  const [unfixable] = consolidateVulnerabilitiesByPackage([
+    firstFinding, { ...secondFinding, vulnerableVersionRange: '*', targetSafeVersion: null },
+  ]);
+  assert.equal(unfixable.targetSafeVersion, null);
+  assert.equal(unfixable.remediation.targetVersion, null);
+  assert.equal(unfixable.remediation.strategy, 'none');
+  assert.deepEqual(unfixable.remediation.packageJsonChanges, []);
+  assert.deepEqual(unfixable.remediation.lockfileUpdates, []);
+  assert.equal(unfixable.advisories.length, 2);
+  assert.equal(unfixable.status, 'open');
+});
+
+test('consolidation retains package-level candidate metadata absent from enriched advisories', () => {
+  for (const candidate of [
+    { patchedVersions: ['1.3.0'] },
+    { patchedVersions: [], targetSafeVersion: '1.3.0' },
+    { patchedVersions: [], targetSafeVersions: ['1.3.0'] },
+  ]) {
+    const [pkg] = consolidateVulnerabilitiesByPackage([
+      {
+        packageName: 'example',
+        currentVersion: '1.0.0',
+        advisories: [{ id: 'first', vulnerableVersionRange: '<1.2.0' }],
+      },
+      {
+        packageName: 'example',
+        currentVersion: '1.0.0',
+        ...candidate,
+        advisories: [{ id: 'second', vulnerableVersionRange: '<1.3.0' }],
+        remediation: { strategy: 'bump-direct', targetVersion: '1.3.0' },
+      },
+    ]);
+    assert.equal(pkg.targetSafeVersion, '1.3.0');
+    assert.equal(pkg.remediation.targetVersion, '1.3.0');
+    assert.equal(pkg.remediation.strategy, 'bump-direct');
+  }
+});
 test('lookupPackageInstalledInfo: detects dual Direct & Indirect dependency (like js-yaml)', () => {
   const pkgJson = {
     dependencies: {
@@ -499,4 +586,27 @@ test('sortVulnerabilities: sorts by severity descending and package name ascendi
   assert.equal(items[2].packageName, 'axios');
   assert.equal(items[3].packageName, 'qs');
   assert.equal(items[4].packageName, 'zebra');
+});
+
+test('PR title templates use CLI over environment over config-file text', () => {
+  const cwd = process.cwd();
+  const oldTemplate = process.env.SEC_PR_TITLE_TEMPLATE;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-title-config-'));
+  try {
+    process.chdir(tmp);
+    fs.writeFileSync('security-report.config.json', JSON.stringify({
+      collectors: [], prTitleTemplate: 'file: {targetPackages} for {targetBranch}',
+    }));
+    delete process.env.SEC_PR_TITLE_TEMPLATE;
+    assert.equal(loadConfig({ silent: true }).prTitleTemplate, 'file: {targetPackages} for {targetBranch}');
+    process.env.SEC_PR_TITLE_TEMPLATE = 'env: {summary}';
+    assert.equal(loadConfig({ noConfigFile: true, silent: true }).prTitleTemplate, 'env: {summary}');
+    assert.equal(loadConfig({ noConfigFile: true, silent: true, prTitleTemplate: 'cli: {targetBranch}' }).prTitleTemplate, 'cli: {targetBranch}');
+    assert.equal(loadConfig({ noConfigFile: true, silent: true, prTitleTemplate: '' }).prTitleTemplate, '');
+  } finally {
+    if (oldTemplate === undefined) delete process.env.SEC_PR_TITLE_TEMPLATE;
+    else process.env.SEC_PR_TITLE_TEMPLATE = oldTemplate;
+    process.chdir(cwd);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
