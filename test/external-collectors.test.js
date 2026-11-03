@@ -551,6 +551,9 @@ test('loadConfig: --no-overrides disables overrides, and noConfigFile ignores on
   // commander maps `--no-overrides` to options.overrides === false
   assert.equal(loadConfig({ noConfigFile: true, overrides: false }).allowOverrides, false);
   assert.equal(loadConfig({ noConfigFile: true, allowOverrides: false }).allowOverrides, false);
+  assert.equal(loadConfig({ noConfigFile: true, breaking: false }).allowBreaking, false);
+  assert.equal(loadConfig({ noConfigFile: true, allowBreaking: false }).allowBreaking, false);
+  assert.equal(loadConfig({ noConfigFile: true, breaking: false, allowBreaking: true }).allowBreaking, false);
 
   // A config file in the working directory must not leak into the loaded config.
   const cwd = process.cwd();
@@ -558,13 +561,16 @@ test('loadConfig: --no-overrides disables overrides, and noConfigFile ignores on
   try {
     fs.writeFileSync(
       path.join(tmpDir, '.security-report.json'),
-      JSON.stringify({ repo: 'from/file', githubToken: 'file-token', allowOverrides: false })
+      JSON.stringify({ repo: 'from/file', githubToken: 'file-token', allowOverrides: false, allowBreaking: false })
     );
     process.chdir(tmpDir);
     assert.equal(loadConfig({ noConfigFile: true, silent: true }).repo, null);
     assert.equal(loadConfig({ noConfigFile: true, silent: true }).githubToken, '');
     assert.equal(loadConfig({ noConfigFile: true, silent: true }).allowOverrides, true);
     assert.equal(loadConfig({ silent: true }).repo, 'from/file');
+    assert.equal(loadConfig({ silent: true }).allowBreaking, false);
+    assert.equal(loadConfig({ noConfigFile: true, silent: true }).allowBreaking, true);
+    assert.equal(loadConfig({ silent: true, allowBreaking: true }).allowBreaking, true);
   } finally {
     process.chdir(cwd);
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -606,6 +612,31 @@ test('PR title templates use CLI over environment over config-file text', () => 
   } finally {
     if (oldTemplate === undefined) delete process.env.SEC_PR_TITLE_TEMPLATE;
     else process.env.SEC_PR_TITLE_TEMPLATE = oldTemplate;
+    process.chdir(cwd);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('fork publication destination uses CLI over environment over config without altering scan repository', () => {
+  const cwd = process.cwd();
+  const oldFork = process.env.SEC_FORK_REPO;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-fork-config-'));
+  try {
+    process.chdir(tmp);
+    fs.writeFileSync('security-report.config.json', JSON.stringify({
+      collectors: [], repo: 'konveyor/tackle2-ui', forkRepo: 'sjd78/tackle2-ui',
+    }));
+    delete process.env.SEC_FORK_REPO;
+    assert.equal(loadConfig({ silent: true }).forkRepo, 'sjd78/tackle2-ui');
+    assert.equal(loadConfig({ silent: true }).repo, 'konveyor/tackle2-ui');
+    assert.equal(loadConfig({ noConfigFile: true, silent: true }).forkRepo, null);
+    process.env.SEC_FORK_REPO = 'environment/tackle2-ui';
+    assert.equal(loadConfig({ silent: true }).forkRepo, 'environment/tackle2-ui');
+    assert.equal(loadConfig({ noConfigFile: true, silent: true, forkRepo: 'cli/tackle2-ui' }).forkRepo, 'cli/tackle2-ui');
+    assert.equal(loadConfig({ noConfigFile: true, silent: true, forkRepo: '' }).forkRepo, '');
+  } finally {
+    if (oldFork === undefined) delete process.env.SEC_FORK_REPO;
+    else process.env.SEC_FORK_REPO = oldFork;
     process.chdir(cwd);
     fs.rmSync(tmp, { recursive: true, force: true });
   }

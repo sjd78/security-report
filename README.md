@@ -88,6 +88,7 @@ Precedence is **CLI option > environment variable > config file**, except for `g
 | `GIT_PROTOCOL` | — | Git clone protocol (`https` or `ssh`) | `https` |
 | `GITHUB_TOKEN` | `--github-token <token>` | GitHub Personal Access Token for Dependabot alerts and private repos | `""` |
 | `GITHUB_API_URL` | — | Base URL for GitHub API (for GitHub Enterprise) | `https://api.github.com` |
+| `SEC_FORK_REPO` | `--fork-repo <owner/repo>` | Existing fork to receive remediation heads; config field `forkRepo`; PRs still target upstream | unset (publish to origin) |
 | `JIRA_BASE_URL` | `--jira-base-url <url>` | Atlassian Jira instance URL (e.g., `https://my-org.atlassian.net`) | `""` |
 | `JIRA_EMAIL` | `--jira-email <email>` | Jira user email address (for Basic Auth) | `""` |
 | `JIRA_API_TOKEN` | `--jira-api-token <token>`| Jira API token or Personal Access Token (PAT) | `""` |
@@ -106,6 +107,7 @@ Precedence is **CLI option > environment variable > config file**, except for `g
 ```json
 {
   "repo": "konveyor/tackle2-ui",
+  "forkRepo": "sjd78/tackle2-ui",
   "branches": ["main", "release-0.10", "release-0.9"],
   "branchMap": {
     "main": ["8.3.x", "8.3", "mta-8.3", "MTA 8.3"],
@@ -128,6 +130,7 @@ Precedence is **CLI option > environment variable > config file**, except for `g
   "reportsDir": "reports",
   "collectors": ["npm-audit", "jira", "dependabot"],
   "allowOverrides": true,
+  "allowBreaking": false,
   "debug": false
 }
 ```
@@ -170,6 +173,7 @@ Every scan writes `security-remediation-plan.json` alongside the existing JSON a
 - Top level: `schemaVersion`, `kind: "security-remediation-plan"`, `generatedAt`, repository identity/path, summary counts, and `branches`.
 - Each branch records its `baseCommit`, a summary sentence, `packages`, reconciled `actions`, and any `blockers`. Its status is `ready`, `blocked`, or `no-op`; `no-op` means no executable actions, not necessarily no findings.
 - Every package keeps installed versions, dependency paths, all advisory/CVE/Jira/Dependabot motivations, and a disposition: `ready`, `resolved`, `manual-review`, `no-fix`, or `not-installed`.
+- Each package also records `risk: { fixType, breaking, reasons }` from its canonical actions. `fixType` is `safe-fix`, `override-required`, `parent-upgrade`, `breaking-upgrade`, or `unknown`; `breaking` is independently `true`, `false`, or `null` when compatibility cannot be established.
 - Actions are structured data: `update-dependency` identifies a manifest, dependency section, package, `expectedRange`, and `targetRange`; `set-override` identifies the nested override scope, expected value, and target version; `update-lockfile` requests re-resolution within the declared constraints.
 - Branch actions deduplicate shared edits and retain their motivating package/finding references. Conflicting edits, missing snapshots, and scan failures block execution rather than silently selecting a target.
 - Targets must satisfy every known advisory. Workspace declarations can retain different safe major lines. Missing evidence and unsupported ranges remain explicit manual-review items rather than speculative edits.
@@ -185,9 +189,13 @@ Executes a saved remediation plan; it does **not** scan or regenerate the plan. 
 **Options:**
 - `--plan <path>`: Required saved `security-remediation-plan.json`.
 - `-b, --branches <branches>`: Select branches already present in the plan; omitted means all saved branches.
+- `--packages <names>`: Select comma-separated vulnerable package names, not their carrier/parent packages; combine with a single `--branches <branch>` to target one release.
+- `--fix-types <types>`: Select comma-separated `safe-fix`, `override-required`, `parent-upgrade`, or `breaking-upgrade` categories.
+- `--no-breaking`: Exclude breaking and unknown-risk remediations, then verify that npm's actual selected-package resolutions stay on compatible scanned version lines before publishing.
 - `--dry-run`: Validate branch snapshots, manifest preconditions, policy, and title text; print actions without applying changes, running post-change verification, committing, pushing, or creating PRs.
 - `--commit`: Commit verified changes on a separate remediation branch.
 - `--push`: Push the remediation branch; requires `--commit`.
+- `--fork-repo <owner/repo>`: Push remediation branches to an existing fork instead of origin; the scanned origin remains the PR base repository.
 - `--no-overrides`: Reject a plan requiring overrides rather than silently skipping its actions.
 - `--pr-title-template <text>`, `--github-token <token>`, `--repos-dir <path>`, `--reports-dir <path>`.
 
@@ -195,11 +203,58 @@ Without `--commit`, the verified worktree is retained and its path printed. Fail
 
 ### `sec-remediate pr [repo] --plan <path>`
 
-Executes the same saved plan, commits and pushes verified remediation branches, then creates or updates an open GitHub PR for each base/head pair. Accepts the `fix` options above except `--commit` and `--push`, which are implicit. Requires an origin URL identifying the GitHub owner/repository, Git push access, and a GitHub token with repository-content and pull-request write permissions. SSH origins still use SSH authentication; HTTPS Git operations receive the configured token per invocation. `GITHUB_API_URL` supports GitHub Enterprise.
+Executes the same saved plan, commits and pushes verified remediation branches, then creates or updates an open GitHub PR for each base/head pair. Accepts the `fix` options above except `--commit` and `--push`, which are implicit. Requires an origin URL identifying the upstream GitHub owner/repository, push access to the selected publication destination, and a GitHub token able to open pull requests against upstream. SSH origins still use SSH authentication; HTTPS Git operations receive the configured token per invocation. `GITHUB_API_URL` supports GitHub Enterprise.
 
 Existing remediation branches are reused only when their commit identifies the same saved plan and their changed files remain within that plan. They are re-audited before publication. Target branch changes require a fresh scan and review; the executor never rebases or force-pushes stale plans.
 
 Execution writes `security-remediation-results.json` under the configured reports directory, including dry-run/unverified state, observed verification results, commit/PR details, or error and retained-worktree information. Unreadable or unsupported plan files are rejected before execution. Audit failure or a still-vulnerable planned package prevents publication. Manual/no-fix findings are disclosed rather than counted as fixed. `npm-shrinkwrap.json` repositories require manual review because the plan targets `package-lock.json`.
+
+#### Publishing from a fork
+
+Keep `repo` pointed at the upstream repository and set `forkRepo` to the existing fork receiving your changes. For example, the configuration above scans `konveyor/tackle2-ui`, pushes only the remediation head to `sjd78/tackle2-ui`, and opens the PR against the original upstream target branch.
+
+Precedence: `--fork-repo` > `SEC_FORK_REPO` > config-file `forkRepo`. Omit the setting to retain same-repository publication. Empty, invalid, or upstream-identical fork identities are rejected rather than silently switching the push destination.
+
+```bash
+sec-remediate pr --plan reports/security-remediation-plan.json \
+  --fork-repo sjd78/tackle2-ui \
+  --branches release-0.11 --no-breaking
+```
+
+`fix --commit --push` honors the same destination. `fix --commit` still creates only a local commit. The upstream repository remains `origin` for scanning, stale-plan checks, and the PR base; fork configuration never changes existing Git remotes.
+
+Fork URLs retain the upstream origin's HTTPS/SSH transport and host, including GitHub Enterprise hosts. The fork must already exist on that host and belong to the upstream repository's fork network for GitHub to accept the PR. The tool does not create a fork, reset/synchronize its default branch, or push remediation heads to upstream. A fork behind upstream is fine: the new remediation branch starts at the scanned upstream commit.
+
+PR lookup and creation use the fork owner's qualified head (`sjd78:<remediation-branch>`), with an explicit head repository for cross-repository requests. Replays read the fork's head in an isolated local tracking namespace, even if upstream has a different branch of the same name. Results and dry-run output identify both the base and head repositories.
+
+Access failures, rejected pushes, and conflicting fork heads fail explicitly; there is **no fallback push to origin** and no force push. A failed applied/committed run keeps its worktree for inspection. Dry runs skip fork-specific lookups, fetches, pushes, and configuration changes; normal repository preparation can still fetch remotes already configured by the user.
+
+#### Selecting fixes
+
+The selectors apply to both `fix` and `pr`. Multiple fix types are ORed; branch, package, type, and no-breaking restrictions intersect. Unknown branch/package/type names and empty lists fail before applying changes.
+
+```bash
+# Only safe fixes
+sec-remediate fix --plan reports/security-remediation-plan.json --fix-types safe-fix --dry-run
+
+# Only required overrides that do not cross incompatible version lines
+sec-remediate pr --plan reports/security-remediation-plan.json --fix-types override-required --no-breaking
+
+# One branch and an explicit package list; allow either category, but not breaking upgrades
+sec-remediate pr --plan reports/security-remediation-plan.json \
+  --branches release-0.11 --packages axios,js-yaml \
+  --fix-types safe-fix,override-required --no-breaking
+```
+
+`safe-fix` means a known semver-compatible fix with neither a persistent override nor a direct-parent upgrade. Override classification takes precedence: an override that crosses a major is still `override-required`, but its independent `breaking: true` flag makes `--no-breaking` exclude it. Parent upgrades have their own category even when nonbreaking.
+
+Compatibility follows npm's caret version lines: major for stable releases, minor for `0.x`, and patch for `0.0.x`. Downgrades, incompatible prerelease transitions, widened incompatible ranges, and missing evidence are not treated as safe. This is a semver policy, not proof of application/API compatibility.
+
+Without filters, all ready package actions remain eligible. Set `"allowBreaking": false` in the config file to enable the no-breaking policy by default (`allowBreaking` otherwise defaults to `true`); `--no-breaking` also enforces it explicitly.
+
+Execution never rewrites the reviewed plan. It selects whole package fixes, keeps required shared actions intact, and records excluded ready packages as `skipped` with reasons in results and PR descriptions. Shared parent edits and npm lockfile resolution may incidentally affect other dependencies, but excluded packages are not counted as fixed. Changing the effective selection produces a separate remediation head/PR; repeating the same selection reuses its existing head.
+
+If nothing matches, the result is an explicit unverified `no-op`, not a clean audit or a successful fix. No npm changes or PR publishing occurs.
 
 #### PR title templates
 

@@ -43,6 +43,15 @@ async function createApi(t, handler) {
   return { githubApiUrl: `http://127.0.0.1:${server.address().port}/api/v3/`, requests };
 }
 
+function pullRequestMetadata(options = {}) {
+  const { org, name, headOwner = org, headRepo = name, head, base } = { ...publishOptions, ...options };
+  const side = (ref, owner, repo) => ({
+    ref, label: `${owner}:${ref}`, user: { login: owner },
+    repo: { name: repo, full_name: `${owner}/${repo}`, owner: { login: owner } },
+  });
+  return { number: 42, html_url: prUrl, state: 'open', head: side(head, headOwner, headRepo), base: side(base, org, name) };
+}
+
 function branchPlan() {
   return {
     branch: 'release/1.0', baseCommit: 'a'.repeat(40), status: 'ready',
@@ -247,6 +256,158 @@ test('publishPullRequest creates once then updates the matching open PR through 
   assert.deepEqual(api.requests.map(({ method }) => method), ['GET', 'POST', 'GET', 'PATCH']);
 });
 
+test('publishPullRequest creates and upserts cross-fork heads only through the upstream Enterprise repository', async (t) => {
+  for (const fork of [
+    { headOwner: 'fork-owner', headRepo: 'project' },
+    { headOwner: 'fork-owner', headRepo: 'renamed-project' },
+    { headOwner: publishOptions.org, headRepo: 'renamed-project', head: publishOptions.base },
+  ]) {
+    await t.test(`${fork.headOwner}/${fork.headRepo}`, async (t) => {
+      const options = { ...publishOptions, ...fork };
+      let stored;
+      const api = await createApi(t, ({ method, url, headers, body }) => {
+        assert.equal(headers.authorization, `Bearer ${token}`);
+        if (method === 'GET') {
+          assert.equal(url.pathname, '/api/v3/repos/example-org/project/pulls');
+          assert.equal(url.searchParams.get('head'), `${options.headOwner}:${options.head}`);
+          assert.equal(url.searchParams.get('base'), options.base);
+          assert.equal(url.searchParams.get('state'), 'open');
+          return { body: stored ? [stored] : [] };
+        }
+        if (method === 'POST') {
+          assert.equal(url.pathname, '/api/v3/repos/example-org/project/pulls');
+          assert.equal(stored, undefined, 'must not create a second fork PR');
+          assert.deepEqual(body, {
+            head: `${options.headOwner}:${options.head}`, head_repo: options.headRepo,
+            base: options.base, title: options.title, body: options.body,
+          });
+          stored = pullRequestMetadata(options);
+          return { status: 201, body: stored };
+        }
+        assert.equal(method, 'PATCH');
+        assert.equal(url.pathname, '/api/v3/repos/example-org/project/pulls/42');
+        assert.deepEqual(body, { title: 'Updated fork remediation', body: 'Updated fork findings.' });
+        return { body: stored };
+      });
+      assert.deepEqual(await publishPullRequest({ ...options, githubApiUrl: api.githubApiUrl }), { number: 42, url: prUrl, created: true });
+      assert.deepEqual(await publishPullRequest({
+        ...options, title: 'Updated fork remediation', body: 'Updated fork findings.', githubApiUrl: api.githubApiUrl,
+      }), { number: 42, url: prUrl, created: false });
+      assert.deepEqual(api.requests.map(({ method }) => method), ['GET', 'POST', 'GET', 'PATCH']);
+    });
+  }
+});
+
+test('publishPullRequest keeps explicit same-repository heads unqualified with case-insensitive repository identities', async (t) => {
+  const api = await createApi(t, ({ method, body }) => {
+    if (method === 'GET') return { body: [] };
+    assert.equal(method, 'POST');
+    assert.deepEqual(body, { head: publishOptions.head, base: publishOptions.base, title: publishOptions.title, body: publishOptions.body });
+    return { body: pullRequestMetadata({ headOwner: 'EXAMPLE-ORG', headRepo: 'PROJECT' }) };
+  });
+  assert.deepEqual(await publishPullRequest({
+    ...publishOptions, headOwner: 'EXAMPLE-ORG', headRepo: 'PROJECT', githubApiUrl: api.githubApiUrl,
+  }), { number: 42, url: prUrl, created: true });
+  assert.deepEqual(api.requests.map(({ method }) => method), ['GET', 'POST']);
+});
+
+test('publishPullRequest rejects malformed or wrong source identities before any unrelated PR mutation', async (t) => {
+  const options = { ...publishOptions, headOwner: 'fork-owner', headRepo: 'renamed-project' };
+  const cases = [
+    ['head user owner', (pr) => { pr.head.user.login = 'unrelated-owner'; }],
+    ['head repo owner', (pr) => { pr.head.repo.owner.login = 'unrelated-owner'; }],
+    ['head repo full name owner', (pr) => { pr.head.repo.full_name = 'unrelated-owner/renamed-project'; }],
+    ['head repo full name repository', (pr) => { pr.head.repo.full_name = 'fork-owner/unrelated-project'; }],
+    ['head repo name', (pr) => { pr.head.repo.name = 'unrelated-project'; }],
+    ['head label owner', (pr) => { pr.head.label = `unrelated-owner:${options.head}`; }],
+    ['head label branch', (pr) => { pr.head.label = 'fork-owner:other-branch'; }],
+    ['head ref', (pr) => { pr.head.ref = 'other-branch'; }],
+    ['deleted head repo', (pr) => { pr.head.repo = null; }],
+    ['malformed head repo', (pr) => { pr.head.repo = []; }],
+    ['empty head repo', (pr) => { pr.head.repo = {}; }],
+    ['empty head user', (pr) => { pr.head.user = {}; }],
+    ['malformed repo owner', (pr) => { pr.head.repo.owner = null; }],
+    ['malformed repo name', (pr) => { pr.head.repo.name = 42; }],
+    ['base repo owner', (pr) => { pr.base.repo.owner.login = 'fork-owner'; }],
+    ['base repo name', (pr) => { pr.base.repo.name = 'renamed-project'; }],
+    ['base repo full name', (pr) => { pr.base.repo.full_name = 'fork-owner/renamed-project'; }],
+    ['base user owner', (pr) => { pr.base.user.login = 'fork-owner'; }],
+    ['base ref', (pr) => { pr.base.ref = 'unrelated-base'; }],
+    ['ambiguous exact matches', null],
+  ];
+  for (const [label, change] of cases) {
+    await t.test(label, async (t) => {
+      const pr = pullRequestMetadata(options);
+      if (change) change(pr);
+      const api = await createApi(t, ({ method, url }) => {
+        assert.equal(method, 'GET', 'wrong source metadata must not trigger POST or PATCH');
+        assert.equal(url.searchParams.get('head'), `${options.headOwner}:${options.head}`);
+        return { body: change ? [pr] : [pr, { ...pr, number: 43 }] };
+      });
+      await assert.rejects(publishPullRequest({ ...options, githubApiUrl: api.githubApiUrl }), (error) => {
+        assert.match(error.message, /malformed|multiple matching/);
+        assert.ok(!String(error.stack).includes(token));
+        return true;
+      });
+      assert.deepEqual(api.requests.map(({ method }) => method), ['GET']);
+    });
+  }
+});
+
+test('publishPullRequest validates fork identity on both creation and update responses', async (t) => {
+  const options = { ...publishOptions, headOwner: 'fork-owner', headRepo: 'renamed-project' };
+  for (const method of ['POST', 'PATCH']) {
+    for (const field of ['headOwner', 'headRepo', 'baseRepo']) {
+      await t.test(`${method} ${field}`, async (t) => {
+        const stored = pullRequestMetadata(options);
+        const result = pullRequestMetadata(options);
+        if (field === 'headOwner') result.head.repo.owner.login = 'wrong-owner';
+        if (field === 'headRepo') result.head.repo.full_name = 'fork-owner/wrong-repo';
+        if (field === 'baseRepo') result.base.repo.name = 'wrong-upstream';
+        const api = await createApi(t, (request) => {
+          if (request.method === 'GET') return { body: method === 'POST' ? [] : [stored] };
+          assert.equal(request.method, method);
+          assert.equal(request.url.pathname, `/api/v3/repos/example-org/project/pulls${method === 'PATCH' ? '/42' : ''}`);
+          return { body: result };
+        });
+        await assert.rejects(publishPullRequest({ ...options, githubApiUrl: api.githubApiUrl }), /publishing returned a malformed response/);
+        assert.deepEqual(api.requests.map((request) => request.method), ['GET', method]);
+      });
+    }
+  }
+});
+
+test('publishPullRequest never updates an upstream head mistaken for a same-owner renamed fork', async (t) => {
+  const api = await createApi(t, ({ method }) => {
+    assert.equal(method, 'GET');
+    return { body: [pullRequestMetadata()] };
+  });
+  await assert.rejects(publishPullRequest({
+    ...publishOptions, headOwner: publishOptions.org, headRepo: 'renamed-project', githubApiUrl: api.githubApiUrl,
+  }), /lookup returned a malformed response/);
+  assert.deepEqual(api.requests.map(({ method }) => method), ['GET']);
+});
+
+test('publishPullRequest preserves redacted fork authentication and mutation failures without retrying elsewhere', async (t) => {
+  const options = { ...publishOptions, headOwner: 'fork-owner', headRepo: 'renamed-project' };
+  for (const phase of ['lookup', 'creation', 'update']) {
+    await t.test(phase, async (t) => {
+      const api = await createApi(t, ({ method, url }, response) => {
+        assert.ok(url.pathname.startsWith('/api/v3/repos/example-org/project/pulls'));
+        if (method === 'GET' && phase !== 'lookup') return { body: phase === 'update' ? [pullRequestMetadata(options)] : [] };
+        response.statusMessage = `Credential ${token}`;
+        return { status: 403, body: { message: `Authorization: Bearer ${token}` } };
+      });
+      await assert.rejects(publishPullRequest({ ...options, githubApiUrl: api.githubApiUrl }), (error) => {
+        assert.equal(error.message, `GitHub pull request ${phase} failed (HTTP 403).`);
+        assert.ok(!String(error.stack).includes(token));
+        return true;
+      });
+      assert.deepEqual(api.requests.map(({ method }) => method), phase === 'lookup' ? ['GET'] : ['GET', phase === 'creation' ? 'POST' : 'PATCH']);
+    });
+  }
+});
+
 test('publishPullRequest rejects HTTP failures without including response contents, status text, or credentials', async (t) => {
   for (const phase of ['lookup', 'creation', 'update']) {
     await t.test(phase, async (t) => {
@@ -324,6 +485,14 @@ test('publishPullRequest validates inputs before any API request', async (t) => 
   const api = await createApi(t, () => ({ body: [] }));
   for (const overrides of [
     { org: '' }, { org: '../escape' }, { name: '..' }, { name: 'repo/escape' },
+    { headOwner: '' }, { headOwner: null }, { headOwner: 42 }, { headOwner: '-option' },
+    { headOwner: '.owner' }, { headOwner: 'owner-' }, { headOwner: 'owner_name' }, { headOwner: 'owner.name' },
+    { headOwner: 'owner/repo' }, { headOwner: 'owner:branch' }, { headOwner: ' owner' },
+    { headOwner: 'https://github.example.test/owner' }, { headOwner: `owner\n${token}` },
+    { headRepo: '' }, { headRepo: null }, { headRepo: [] }, { headRepo: '..' }, { headRepo: '-option' },
+    { headRepo: 'repo/extra' }, { headRepo: 'repo.git?token=secret' }, { headRepo: 'owner@host:repo' },
+    { headRepo: 'repo name' }, { headRepo: `repo\n${token}` },
+    { headOwner: 'EXAMPLE-ORG', headRepo: 'PROJECT', base: publishOptions.head },
     { head: '' }, { head: 'bad\nbranch' }, { head: 'bad:branch' }, { head: '../escape' }, { head: 'branch.lock' },
     { base: 'bad branch' }, { base: publishOptions.head }, { title: '' }, { title: 'line\none' },
     { body: '' }, { githubToken: '' }, { githubToken: 'secret\nheader' },

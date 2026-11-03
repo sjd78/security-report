@@ -4,6 +4,7 @@ import semver from 'semver';
 import { isVulnerabilityResolved, selectBestRemediationVersion } from '../core/blender.js';
 import { getDirectDependencies, lookupPackageInstalledInfo } from '../core/dependency-graph.js';
 import { canBeResolvedInLockfile } from '../collectors/npm-audit.js';
+import { classifyPackageFix } from '../core/remediation-policy.js';
 
 const dependencySections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
 const unique = (values) => [...new Set(values.filter((value) => value !== null && value !== undefined && value !== ''))];
@@ -445,6 +446,10 @@ export function generateRemediationPlan(report, options = {}) {
     const snapshot = groups.size ? snapshotFor(branch, blockers) : { manifests: new Map(), workspaces: [], arboristTree: null, direct: new Map() };
     const packages = [...groups.values()].map((rows) => buildPackage(rows, branch, snapshot, options, blockers)).sort((a, b) => a.packageName.localeCompare(b.packageName));
     const actions = reconcileActions(packages.flatMap((pkg) => pkg.actions), blockers);
+    for (const pkg of packages) {
+      const canonicalActions = blockers.length ? [] : actions.filter((action) => action.packageNames.includes(pkg.packageName));
+      pkg.risk = classifyPackageFix(pkg, canonicalActions, branch);
+    }
     const ready = packages.filter((pkg) => pkg.status === 'ready').length;
     const manual = packages.filter((pkg) => pkg.status === 'manual-review').length;
     const noFix = packages.filter((pkg) => pkg.status === 'no-fix').length;

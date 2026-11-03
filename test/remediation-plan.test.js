@@ -128,6 +128,8 @@ test('ready direct plan has the standalone canonical contract and stable timesta
   }]);
   assert.deepEqual(planned.packages[0].installedVersions, ['1.0.0']);
   assert.equal(planned.packages[0].status, 'ready');
+  assert.equal(planned.packages[0].risk.fixType, 'safe-fix');
+  assert.equal(planned.packages[0].risk.breaking, false);
   assert.deepEqual(JSON.parse(JSON.stringify(plan)), plan);
   assert.deepEqual(generateRemediationPlan(input), plan);
 });
@@ -300,6 +302,8 @@ test('forbidden incoming ranges require persistent scoped overrides with snapsho
     targetVersion: '1.2.0', packageNames: ['widget'], findingIds: ['GHSA-widget'],
   });
   assert.ok(planned.actions.some((action) => action.type === 'update-lockfile'));
+  assert.equal(planned.packages[0].risk.fixType, 'override-required');
+  assert.equal(planned.packages[0].risk.breaking, false);
 });
 
 test('disabled overrides leave an override-only package explicit manual-review', () => {
@@ -486,4 +490,64 @@ test('writer creates only the requested standalone plan artifact using reporter 
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('reporter persists the actual shared parent upgrade risk for every motivating package', () => {
+  const input = parentBranch();
+  for (const vulnerability of input.vulnerabilities) {
+    vulnerability.risk = { fixType: 'safe-fix', breaking: false };
+    vulnerability.remediation.isMajorBreaking = false;
+  }
+  const planned = generateRemediationPlan(report([input])).branches[0];
+  assert.equal(planned.status, 'ready');
+  for (const pkg of planned.packages) {
+    assert.equal(pkg.risk.fixType, 'breaking-upgrade');
+    assert.equal(pkg.risk.breaking, true);
+    assert.ok(pkg.risk.reasons.some((reason) => reason.includes('Parent dependency parent')));
+  }
+  const safeParent = parentBranch();
+  safeParent.vulnerabilities = [parentFinding('leaf-a', '1.2.0'), parentFinding('leaf-b', '1.2.0')];
+  for (const pkg of generateRemediationPlan(report([safeParent])).branches[0].packages) {
+    assert.equal(pkg.risk.fixType, 'parent-upgrade');
+    assert.equal(pkg.risk.breaking, false);
+  }
+});
+
+test('reporter retains precise nonbreaking scoped override proof with mixed installed majors', () => {
+  const input = branch({
+    pkgJson: { dependencies: { 'parent-a': '^1.0.0', 'parent-b': '^1.0.0' } },
+    pkgLock: { packages: {
+      '': { dependencies: { 'parent-a': '^1.0.0', 'parent-b': '^1.0.0' } },
+      'node_modules/parent-a': { version: '1.0.0', dependencies: { widget: '~1.0.0' } },
+      'node_modules/parent-b': { version: '1.0.0', dependencies: { widget: '^2.0.0' } },
+      'node_modules/widget': { version: '1.0.0' },
+      'node_modules/parent-b/node_modules/widget': { version: '2.0.0' },
+    } },
+    vulnerabilities: [finding({
+      isDirect: false, isIndirect: true, currentVersion: '1.0.0, 2.0.0',
+      vulnerableVersionRange: '<1.2.0 || >=2.0.0 <2.2.0', patchedVersions: ['1.2.0', '2.2.0'],
+      dependencyChains: [
+        [{ name: 'parent-a', version: '1.0.0' }, { name: 'widget', version: '1.0.0', requiredRange: '~1.0.0' }],
+        [{ name: 'parent-b', version: '1.0.0' }, { name: 'widget', version: '2.0.0', requiredRange: '^2.0.0' }],
+      ],
+      remediation: { strategy: 'lockfile-update', packageJsonChanges: [], lockfileUpdates: ['widget'] },
+    })],
+  });
+  const plan = generateRemediationPlan(report([input]));
+  const planned = plan.branches[0];
+  assert.equal(planned.status, 'ready');
+  assert.deepEqual(planned.actions.find((action) => action.type === 'set-override').scope, ['parent-a']);
+  assert.equal(planned.packages[0].risk.fixType, 'override-required');
+  assert.equal(planned.packages[0].risk.breaking, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(plan)), plan);
+});
+
+test('non-executable packages persist unknown safety rather than pretending they are safe fixes', () => {
+  const input = branch();
+  input.vulnerabilities[0].targetSafeVersion = null;
+  input.vulnerabilities[0].patchedVersions = [];
+  const pkg = generateRemediationPlan(report([input])).branches[0].packages[0];
+  assert.equal(pkg.status, 'no-fix');
+  assert.equal(pkg.risk.fixType, 'unknown');
+  assert.equal(pkg.risk.breaking, null);
 });

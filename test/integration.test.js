@@ -274,3 +274,224 @@ test('saved plans publish verified PRs idempotently, reject stale bases, and ret
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('branch/package/type filters publish only selected fixes and disclose excluded packages', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-selected-e2e-'));
+  const otherPackage = 'security-report-other-fixture';
+  const registry = await startRegistry(path.join(tmp, 'registry'), { packageNames: [fixturePackage, otherPackage] });
+  const previousEnv = Object.fromEntries(Object.keys(registry.env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, registry.env);
+  const repo = path.join(tmp, 'repo');
+  const remote = path.join(tmp, 'remote.git');
+  fs.mkdirSync(repo);
+  fs.mkdirSync(remote);
+  try {
+    await execGit(['init', '--bare', '-b', 'main'], remote);
+    await execGit(['init', '-b', 'main'], repo);
+    await execGit(['config', 'user.name', 'Security Bot'], repo);
+    await execGit(['config', 'user.email', 'bot@example.com'], repo);
+    const lock = registry.packageLock();
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify(lock.packages['']));
+    fs.writeFileSync(path.join(repo, 'package-lock.json'), JSON.stringify(lock));
+    await execGit(['add', '.'], repo);
+    await execGit(['commit', '-m', 'Two vulnerable dependencies'], repo);
+    await execGit(['branch', 'release/1.0'], repo);
+    await execGit(['remote', 'add', 'origin', 'https://github.com/fixture/app.git'], repo);
+    await execGit(['config', `url.file://${remote}.insteadOf`, 'https://github.com/fixture/app.git'], repo);
+    await execGit(['push', 'origin', 'main', 'release/1.0'], repo);
+    const base = (await execGit(['rev-parse', 'main'], repo)).stdout;
+    const options = {
+      noConfigFile: true, collectors: 'npm-audit', githubToken: '',
+      githubApiUrl: `${registry.url}/github`, branches: 'main,release/1.0', reportsDir: path.join(tmp, 'reports'),
+    };
+    const scanned = await scanRepository(repo, options);
+    const savedBytes = fs.readFileSync(scanned.remediationPlanPath, 'utf8');
+    const executionOptions = { ...options, plan: scanned.remediationPlanPath, branches: 'release/1.0' };
+    await assert.rejects(() => remediateRepository(repo, {
+      ...executionOptions, packages: 'misspelled-package', dryRun: true,
+    }), /package/i);
+    const noMatches = await remediateRepository(repo, {
+      ...executionOptions, createPr: true, fixTypes: 'override-required',
+    });
+    assert.equal(noMatches.results.branches[0].status, 'no-op');
+    assert.equal(noMatches.results.branches[0].verified, false);
+    assert.ok(noMatches.results.branches[0].unresolved.every((pkg) => pkg.status === 'skipped'));
+    assert.equal(registry.state.pullRequests.length, 0);
+
+    const published = await remediateRepository(repo, {
+      ...executionOptions, createPr: true, githubToken: 'fixture-token',
+      packages: fixturePackage, fixTypes: 'safe-fix', allowBreaking: false,
+      prTitleTemplate: '{targetBranch}: {targetPackages}',
+    });
+    assert.equal(published.results.branches.length, 1);
+    const result = published.results.branches[0];
+    assert.equal(result.branch, 'release/1.0');
+    assert.deepEqual(result.selection.selectedPackages, [fixturePackage]);
+    assert.deepEqual(result.execution.resolved.map((pkg) => pkg.packageName), [fixturePackage]);
+    assert.equal(result.execution.unresolved.find((pkg) => pkg.packageName === otherPackage).status, 'skipped');
+    assert.equal(result.execution.isClean, false);
+    assert.ok(result.execution.remaining.some((pkg) => pkg.packageName === otherPackage));
+    const headManifest = JSON.parse((await execGit(['show', `${result.head}:package.json`], remote)).stdout);
+    const headLock = JSON.parse((await execGit(['show', `${result.head}:package-lock.json`], remote)).stdout);
+    assert.equal(headManifest.dependencies[fixturePackage], '1.0.1');
+    assert.equal(headManifest.dependencies[otherPackage], '1.0.0');
+    assert.equal(headLock.packages[`node_modules/${otherPackage}`].version, '1.0.0');
+    assert.equal(registry.state.pullRequests.length, 1);
+    assert.equal(registry.state.pullRequests[0].title, `release/1.0: ${fixturePackage}`);
+    assert.ok(registry.state.pullRequests[0].body.includes(otherPackage));
+    assert.ok(registry.state.pullRequests[0].body.includes('skipped'));
+    assert.equal((await execGit(['rev-parse', 'main'], remote)).stdout, base);
+    assert.equal((await execGit(['rev-parse', 'release/1.0'], remote)).stdout, base);
+    assert.equal(fs.readFileSync(scanned.remediationPlanPath, 'utf8'), savedBytes);
+  } finally {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await registry.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('override-only selection fixes a range-forbidden transitive package without editing an excluded safe fix', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-override-selected-'));
+  const otherPackage = 'security-report-other-fixture';
+  const holder = 'fixture-holder';
+  const registry = await startRegistry(path.join(tmp, 'registry'), {
+    packageNames: [fixturePackage, otherPackage, holder],
+    vulnerablePackages: [fixturePackage, otherPackage],
+    dependenciesByPackage: { [holder]: { [fixturePackage]: '1.0.0' } },
+  });
+  const previousEnv = Object.fromEntries(Object.keys(registry.env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, registry.env);
+  const repo = path.join(tmp, 'repo');
+  fs.mkdirSync(repo);
+  try {
+    await execGit(['init', '-b', 'main'], repo);
+    await execGit(['config', 'user.name', 'Security Bot'], repo);
+    await execGit(['config', 'user.email', 'bot@example.com'], repo);
+    const lock = registry.packageLock();
+    delete lock.packages[''].dependencies[fixturePackage];
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify(lock.packages['']));
+    fs.writeFileSync(path.join(repo, 'package-lock.json'), JSON.stringify(lock));
+    await execGit(['add', '.'], repo);
+    await execGit(['commit', '-m', 'Transitive and direct findings'], repo);
+    const options = {
+      noConfigFile: true, collectors: 'npm-audit', githubToken: '', branches: 'main',
+      githubApiUrl: `${registry.url}/github`, reportsDir: path.join(tmp, 'reports'),
+    };
+    const scanned = await scanRepository(repo, options);
+    const executed = await remediateRepository(repo, {
+      ...options, plan: scanned.remediationPlanPath,
+      fixTypes: 'override-required', allowBreaking: false, commit: true,
+    });
+    const result = executed.results.branches[0];
+    assert.equal(result.status, 'committed');
+    assert.deepEqual(result.selection.selectedPackages, [fixturePackage]);
+    const manifest = JSON.parse((await execGit(['show', `${result.head}:package.json`], repo)).stdout);
+    const fixedLock = JSON.parse((await execGit(['show', `${result.head}:package-lock.json`], repo)).stdout);
+    assert.equal(manifest.overrides[holder][fixturePackage], '1.0.1');
+    assert.equal(manifest.dependencies[fixturePackage], undefined);
+    assert.equal(manifest.dependencies[otherPackage], '1.0.0');
+    assert.equal(fixedLock.packages[`node_modules/${fixturePackage}`].version, '1.0.1');
+    assert.equal(fixedLock.packages[`node_modules/${otherPackage}`].version, '1.0.0');
+    assert.equal(result.execution.unresolved.find((pkg) => pkg.packageName === otherPackage).status, 'skipped');
+  } finally {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await registry.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('fork publishing keeps upstream refs untouched and reuses only the fork head', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-fork-e2e-'));
+  const registry = await startRegistry(path.join(tmp, 'registry'));
+  const previousEnv = Object.fromEntries(Object.keys(registry.env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, registry.env);
+  const repo = path.join(tmp, 'repo');
+  const upstream = path.join(tmp, 'upstream.git');
+  const fork = path.join(tmp, 'fork.git');
+  for (const directory of [repo, upstream, fork]) fs.mkdirSync(directory);
+  try {
+    await execGit(['init', '--bare', '-b', 'main'], upstream);
+    await execGit(['init', '--bare', '-b', 'main'], fork);
+    await execGit(['init', '-b', 'main'], repo);
+    await execGit(['config', 'user.name', 'Security Bot'], repo);
+    await execGit(['config', 'user.email', 'bot@example.com'], repo);
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify(registry.packageLock().packages['']));
+    fs.writeFileSync(path.join(repo, 'package-lock.json'), JSON.stringify(registry.packageLock()));
+    await execGit(['add', '.'], repo);
+    await execGit(['commit', '-m', 'Shared fork base'], repo);
+    const forkBase = (await execGit(['rev-parse', 'main'], repo)).stdout;
+    await execGit(['remote', 'add', 'origin', 'https://github.com/fixture/app.git'], repo);
+    await execGit(['config', `url.file://${upstream}.insteadOf`, 'https://github.com/fixture/app.git'], repo);
+    await execGit(['config', `url.file://${fork}.insteadOf`, 'https://github.com/sjd78/app.git'], repo);
+    await execGit(['push', 'origin', 'main'], repo);
+    await execGit(['push', 'https://github.com/sjd78/app.git', 'main'], repo);
+    fs.writeFileSync(path.join(repo, 'README.md'), 'Upstream is ahead of the fork');
+    await execGit(['add', 'README.md'], repo);
+    await execGit(['commit', '-m', 'Upstream advanced'], repo);
+    await execGit(['branch', 'release/1.0'], repo);
+    await execGit(['push', 'origin', 'main', 'release/1.0'], repo);
+    const base = (await execGit(['rev-parse', 'main'], repo)).stdout;
+    const upstreamRefs = (await execGit(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads'], upstream)).stdout;
+    const originalRemotes = (await execGit(['remote', '-v'], repo)).stdout;
+    const options = {
+      noConfigFile: true, collectors: 'npm-audit', githubToken: '', branches: 'main,release/1.0',
+      githubApiUrl: `${registry.url}/github`, reportsDir: path.join(tmp, 'reports'),
+    };
+    const scanned = await scanRepository(repo, options);
+    const executeOptions = { ...options, plan: scanned.remediationPlanPath, createPr: true,
+      githubToken: 'fixture-token', forkRepo: 'sjd78/app', branches: 'main' };
+    const dry = await remediateRepository(repo, { ...executeOptions, dryRun: true });
+    assert.equal(dry.results.branches[0].publication.headRepository, 'sjd78/app');
+    assert.equal(dry.results.branches[0].publication.baseRepository, 'fixture/app');
+    assert.equal((await execGit(['for-each-ref', '--format=%(refname)', 'refs/heads'], fork)).stdout, 'refs/heads/main');
+
+    const published = await remediateRepository(repo, executeOptions);
+    const result = published.results.branches[0];
+    const forkHead = (await execGit(['rev-parse', result.head], fork)).stdout;
+    assert.equal(result.status, 'published');
+    assert.equal(result.publication.headRef, `sjd78:${result.head}`);
+    assert.equal(result.commit.commitHash, forkHead);
+    assert.equal((await execGit(['rev-parse', 'main'], fork)).stdout, forkBase);
+    assert.equal((await execGit(['rev-parse', 'main'], upstream)).stdout, base);
+    assert.equal((await execGit(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads'], upstream)).stdout, upstreamRefs);
+    assert.equal((await execGit(['remote', '-v'], repo)).stdout, originalRemotes);
+    const fixed = JSON.parse((await execGit(['show', `${result.head}:package.json`], fork)).stdout);
+    assert.equal(fixed.dependencies[fixturePackage], '1.0.1');
+    assert.equal(registry.state.pullRequests[0].head.repo.full_name, 'sjd78/app');
+    assert.equal(registry.state.pullRequests[0].base.repo.full_name, 'fixture/app');
+    assert.ok(registry.state.pullRequests[0].body.includes('CVE-2026-12345'));
+
+    // Upstream has an unrelated branch with the same name; fork replay must ignore it.
+    await execGit(['update-ref', `refs/heads/${result.head}`, base], upstream);
+    await execGit(['branch', '-D', result.head], repo);
+    const repeated = await remediateRepository(repo, { ...executeOptions, prTitleTemplate: 'Reviewed {targetBranch}: {targetPackages}' });
+    assert.equal(repeated.results.branches[0].commit.commitHash, forkHead);
+    assert.equal(repeated.results.branches[0].pullRequest.created, false);
+    assert.equal(registry.state.pullRequests.length, 1);
+    assert.equal((await execGit(['rev-parse', result.head], upstream)).stdout, base);
+    assert.equal((await execGit(['rev-parse', result.head], fork)).stdout, forkHead);
+    assert.equal((await execGit(['remote', '-v'], repo)).stdout, originalRemotes);
+
+    // Fork write failures must not cause a fallback push or PR from origin.
+    fs.writeFileSync(path.join(fork, 'hooks', 'pre-receive'), ['#!/bin/sh', 'echo "Fork write denied" >&2', 'exit 1', ''].join('\n'));
+    fs.chmodSync(path.join(fork, 'hooks', 'pre-receive'), 0o755);
+    const beforeFailure = (await execGit(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads'], upstream)).stdout;
+    await assert.rejects(() => remediateRepository(repo, { ...executeOptions, branches: 'release/1.0' }), /Fork write denied|hook declined|rejected/);
+    const failure = JSON.parse(fs.readFileSync(path.join(tmp, 'reports/security-remediation-results.json')));
+    assert.equal(failure.branches[0].status, 'failed');
+    assert.ok(fs.existsSync(failure.branches[0].worktreeDir));
+    await assert.rejects(() => execGit(['rev-parse', '--verify', `refs/heads/${failure.branches[0].head}`], fork));
+    assert.equal((await execGit(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads'], upstream)).stdout, beforeFailure);
+    assert.equal(registry.state.pullRequests.length, 1);
+  } finally {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await registry.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

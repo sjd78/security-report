@@ -12,6 +12,7 @@ import {
   removeWorktree,
   withWorktree,
   stageAndCommit,
+  pushBranch,
 } from '../src/core/git-manager.js';
 
 test('parseRepoSpec: GitHub org/repo shorthand', () => {
@@ -248,4 +249,69 @@ test('withWorktree: retains the worktree when requested and when the callback th
     await removeWorktree(tmpDir, worktreeDir);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('pushBranch authenticates an explicit fork URL and resolves a named remote push URL, never origin', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'git-push-destination-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const repo = path.join(root, 'repo');
+  const origin = path.join(root, 'origin.git');
+  const fork = path.join(root, 'fork.git');
+  fs.mkdirSync(repo);
+  await initRepo(repo);
+  await execGit(['init', '--bare', '-b', 'main', origin], root);
+  await execGit(['init', '--bare', '-b', 'main', fork], root);
+  await execGit(['remote', 'add', 'origin', 'https://upstream.example/upstream/repo.git'], repo);
+  await execGit(['config', `url.${origin}.insteadOf`, 'https://upstream.example/upstream/repo.git'], repo);
+  const forkUrl = 'https://fork.example:8443/owner/repo.git';
+  await execGit(['config', `url.${fork}.insteadOf`, forkUrl], repo);
+  await execGit(['remote', 'add', 'fork', 'https://fetch.example/owner/repo.git'], repo);
+  await execGit(['config', 'remote.fork.pushurl', forkUrl], repo);
+  const capture = path.join(root, 'push-env.json');
+  const hook = path.join(repo, '.git', 'hooks', 'pre-push');
+  fs.writeFileSync(hook, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(capture)}, JSON.stringify({ key: process.env.GIT_CONFIG_KEY_0, value: process.env.GIT_CONFIG_VALUE_0, argv: process.argv.slice(2) }));\n`, { mode: 0o755 });
+  const token = 'test-destination-token';
+  const config = fs.readFileSync(path.join(repo, '.git', 'config'), 'utf8');
+
+  for (const [remote, branch] of [[forkUrl, 'security/direct'], ['fork', 'security/named']]) {
+    await execGit(['branch', branch], repo);
+    await pushBranch(repo, branch, { remote, githubToken: token });
+    const env = JSON.parse(fs.readFileSync(capture, 'utf8'));
+    if (remote === forkUrl) {
+      assert.equal(env.key, 'http.https://fork.example:8443/.extraHeader');
+      assert.equal(env.value, `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`);
+    } else {
+      // get-url resolves the named push URL rewrite to a local destination.
+      assert.equal(env.key, undefined);
+      assert.equal(env.value, undefined);
+    }
+    assert.equal((await execGit(['rev-parse', `refs/heads/${branch}`], fork)).stdout,
+      (await execGit(['rev-parse', `refs/heads/${branch}`], repo)).stdout);
+  }
+  assert.equal((await execGit(['for-each-ref', '--format=%(refname)'], origin)).stdout, '');
+  assert.equal((await execGit(['for-each-ref', '--format=%(refname)', 'refs/heads'], fork)).stdout,
+    'refs/heads/security/direct\nrefs/heads/security/named');
+  assert.equal(fs.readFileSync(path.join(repo, '.git', 'config'), 'utf8'), config);
+  assert.ok(!config.includes(token));
+});
+
+test('pushBranch rejects non-fast-forward fork updates and never pushes another local head', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'git-push-no-force-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const repo = path.join(root, 'repo');
+  const fork = path.join(root, 'fork.git');
+  fs.mkdirSync(repo);
+  await initRepo(repo);
+  await execGit(['init', '--bare', '-b', 'main', fork], root);
+  await execGit(['branch', 'security/fix'], repo);
+  const base = (await execGit(['rev-parse', 'HEAD'], repo)).stdout;
+  await pushBranch(repo, 'security/fix', { remote: fork });
+  fs.writeFileSync(path.join(repo, 'package.json'), '{"name":"app","version":"2.0.0"}\n');
+  await execGit(['commit', '-am', 'fork advance'], repo);
+  const advanced = (await execGit(['rev-parse', 'HEAD'], repo)).stdout;
+  await execGit(['push', fork, 'refs/heads/main:refs/heads/security/fix'], repo);
+  await assert.rejects(() => pushBranch(repo, 'security/fix', { remote: fork }), /rejected|non-fast-forward|fetch first/);
+  assert.equal((await execGit(['rev-parse', 'refs/heads/security/fix'], fork)).stdout, advanced);
+  assert.equal((await execGit(['rev-parse', 'refs/heads/security/fix'], repo)).stdout, base);
+  assert.equal((await execGit(['for-each-ref', '--format=%(refname)', 'refs/heads'], fork)).stdout, 'refs/heads/security/fix');
 });

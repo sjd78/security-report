@@ -47,11 +47,15 @@ export function createCli() {
         : 'Execute a reviewed remediation plan in isolated remediation branches')
       .requiredOption('--plan <path>', 'Saved security-remediation-plan.json to execute; never rescans')
       .option('-b, --branches <branches>', 'Select comma-separated branches from the saved plan')
+      .option('--packages <packages>', 'Select comma-separated vulnerable package names within the selected branches')
+      .option('--fix-types <types>', 'Select safe-fix, override-required, parent-upgrade, or breaking-upgrade (comma-separated)')
+      .option('--no-breaking', 'Exclude breaking or unknown-risk upgrades; verify actual versions before publishing')
       .option('--dry-run', 'Validate the plan and preview actions without applying or publishing', false)
       .option('--no-overrides', 'Reject a plan that requires npm overrides')
       .option('--repos-dir <path>', 'Directory for cloned repositories')
       .option('--reports-dir <path>', 'Directory for execution results')
       .option('--github-token <token>', 'GitHub token for private Git access and PR publishing')
+      .option('--fork-repo <owner/repo>', 'Push remediation branches to this fork; keep PRs targeted at the scanned upstream repository')
       .option('--pr-title-template <text>', 'Title using {targetBranch}, {targetPackages}, and {summary}')
       .action(async (repo, options) => {
         try {

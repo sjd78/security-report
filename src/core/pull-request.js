@@ -195,17 +195,42 @@ function validateBranch(value) {
   return typeof value === 'string' && value.length > 0 && !/[\s\x00-\x1f\x7f~^:?*\[\\]/.test(value) && !value.includes('..') && !value.includes('@{') && value !== '@' && !value.startsWith('/') && !value.endsWith('/') && !value.endsWith('.') && value.split('/').every((part) => part && !part.startsWith('.') && !part.endsWith('.lock'));
 }
 
-function validPullRequest(value, head, base) {
+function matchesIdentity(value, expected) {
+  return typeof value === 'string' && value.toLowerCase() === expected.toLowerCase();
+}
+
+function validRepositoryIdentity(value, owner, name) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && (value.name !== undefined || value.full_name !== undefined)
+    && (value.name === undefined || matchesIdentity(value.name, name))
+    && (value.full_name === undefined || matchesIdentity(value.full_name, `${owner}/${name}`))
+    && (value.owner === undefined || (value.owner && !Array.isArray(value.owner) && matchesIdentity(value.owner.login, owner)));
+}
+
+function validPullRequestSide(value, ref, owner, name) {
+  return value === undefined || (value && typeof value === 'object' && !Array.isArray(value)
+    && value.ref === ref
+    && (value.label === undefined || (typeof value.label === 'string' && value.label.includes(':')
+      && matchesIdentity(value.label.slice(0, value.label.indexOf(':')), owner)
+      && value.label.slice(value.label.indexOf(':') + 1) === ref))
+    && (value.user === undefined || (value.user && !Array.isArray(value.user) && matchesIdentity(value.user.login, owner)))
+    && (value.repo === undefined || validRepositoryIdentity(value.repo, owner, name)));
+}
+
+function validPullRequest(value, { head, base, org, name, headOwner, headRepo }) {
   return value && typeof value === 'object' && !Array.isArray(value)
     && Number.isSafeInteger(value.number) && value.number > 0 && httpUrl(value.html_url)
     && (value.state === undefined || value.state === 'open')
-    && (value.head === undefined || value.head?.ref === head)
-    && (value.base === undefined || value.base?.ref === base);
+    && validPullRequestSide(value.head, head, headOwner, headRepo)
+    && validPullRequestSide(value.base, base, org, name);
 }
 
-export async function publishPullRequest({ org, name, head, base, title, body, githubToken, githubApiUrl = 'https://api.github.com' } = {}) {
-  if (![org, name].every((value) => typeof value === 'string' && /^[a-z0-9_.-]+$/i.test(value) && !['.', '..'].includes(value))) throw new Error('A valid GitHub repository owner and name are required.');
-  if (!validateBranch(head) || !validateBranch(base) || head === base) throw new Error('Distinct valid pull request head and base branches are required.');
+export async function publishPullRequest({ org, name, headOwner = org, headRepo = name, head, base, title, body, githubToken, githubApiUrl = 'https://api.github.com' } = {}) {
+  if (![org, headOwner].every((value) => typeof value === 'string' && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(value))
+    || ![name, headRepo].every((value) => typeof value === 'string' && /^[a-z0-9_.-]+$/i.test(value) && !value.startsWith('-') && !['.', '..'].includes(value))) throw new Error('A valid GitHub repository owner and name are required.');
+  const crossRepository = !matchesIdentity(headOwner, org) || !matchesIdentity(headRepo, name);
+  if (!validateBranch(head) || !validateBranch(base) || (!crossRepository && head === base)) throw new Error('Distinct valid pull request head and base branches are required unless using different repositories.');
+  const identity = { head, base, org, name, headOwner, headRepo };
   title = validateTitle(title);
   if (typeof body !== 'string' || !body.trim()) throw new Error('A non-empty pull request body is required.');
   if (typeof githubToken !== 'string' || !githubToken || /\s|[\x00-\x1f\x7f]/.test(githubToken)) throw new Error('A non-empty GitHub token is required to publish a pull request.');
@@ -231,13 +256,14 @@ export async function publishPullRequest({ org, name, head, base, title, body, g
     }
   };
   const query = new URL(endpoint);
-  query.search = new URLSearchParams({ state: 'open', head: `${org}:${head}`, base, per_page: '100' }).toString();
+  query.search = new URLSearchParams({ state: 'open', head: `${headOwner}:${head}`, base, per_page: '100' }).toString();
   const existing = await request(query, 'GET', null, 'lookup');
-  if (!Array.isArray(existing) || existing.some((pr) => !validPullRequest(pr, head, base))) throw new Error('GitHub pull request lookup returned a malformed response.');
+  if (!Array.isArray(existing) || existing.some((pr) => !validPullRequest(pr, identity))) throw new Error('GitHub pull request lookup returned a malformed response.');
   if (existing.length > 1) throw new Error('GitHub returned multiple matching open pull requests.');
   const current = existing[0];
   const created = !current;
-  const result = await request(current ? `${endpoint}/${current.number}` : endpoint, current ? 'PATCH' : 'POST', current ? { title, body } : { head, base, title, body }, current ? 'update' : 'creation');
-  if (!validPullRequest(result, head, base) || (current && result.number !== current.number)) throw new Error('GitHub pull request publishing returned a malformed response.');
+  const creation = { head: crossRepository ? `${headOwner}:${head}` : head, ...(crossRepository ? { head_repo: headRepo } : {}), base, title, body };
+  const result = await request(current ? `${endpoint}/${current.number}` : endpoint, current ? 'PATCH' : 'POST', current ? { title, body } : creation, current ? 'update' : 'creation');
+  if (!validPullRequest(result, identity) || (current && result.number !== current.number)) throw new Error('GitHub pull request publishing returned a malformed response.');
   return { number: result.number, url: result.html_url, created };
 }

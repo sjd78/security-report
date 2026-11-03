@@ -5,6 +5,8 @@ import { isDeepStrictEqual } from 'node:util';
 import { ensureRepo, execGit, getOriginUrl, gitAuthEnv, createWorktree, removeWorktree, sanitizeBranchName, stageAndCommit, pushBranch } from './git-manager.js';
 import { executeBranchPlan, validateBranchActions } from './remediator.js';
 import { renderPrTitle, generatePullRequestBody, publishPullRequest } from './pull-request.js';
+import { selectRemediationBranches } from './plan-selection.js';
+import { resolvePublicationTarget, refreshPublicationHead } from './publication-target.js';
 
 export function readRemediationPlan(filename) {
   let plan;
@@ -45,20 +47,6 @@ async function assertBase(repo, branch) {
   }
 }
 
-function githubRepository(remoteUrl) {
-  if (!remoteUrl) throw new Error('PR publishing requires an origin remote identifying the GitHub owner/repository.');
-  let pathname;
-  if (/^[^/@]+@[^:]+:/.test(remoteUrl)) pathname = remoteUrl.slice(remoteUrl.indexOf(':') + 1);
-  else {
-    try { pathname = new URL(remoteUrl).pathname; }
-    catch { throw new Error('Cannot determine GitHub owner/repository from origin. Use a GitHub HTTPS or SSH origin URL.'); }
-  }
-  const parts = pathname.replace(/\.git\/?$/, '').split('/').filter(Boolean);
-  if (parts.length !== 2 || parts.some((part) => !/^[a-zA-Z0-9_.-]+$/.test(part))) {
-    throw new Error('Cannot determine GitHub owner/repository from origin.');
-  }
-  return { org: parts[0], name: parts[1] };
-}
 
 function allowedFiles(branch) {
   return new Set(['package-lock.json', ...branch.actions.filter((action) => action.file).map((action) => action.file)]);
@@ -83,7 +71,7 @@ async function assertOwnedHead(repo, ref, branch, identity, expectedManifests) {
   }
 }
 
-async function prepareHead(repo, branch, head, identity, expectedManifests) {
+async function prepareHead(repo, branch, head, identity, expectedManifests, trackingNamespace) {
   const { stdout: worktrees } = await execGit(['worktree', 'list', '--porcelain'], repo);
   let holdingPath;
   for (const line of worktrees.split('\n')) {
@@ -93,7 +81,7 @@ async function prepareHead(repo, branch, head, identity, expectedManifests) {
     }
   }
   const localRef = `refs/heads/${head}`;
-  const remoteRef = `refs/remotes/origin/${head}`;
+  const remoteRef = `refs/remotes/${trackingNamespace}/${head}`;
   const local = await resolveRef(repo, localRef);
   const remote = await resolveRef(repo, remoteRef);
   if (local) await assertOwnedHead(repo, localRef, branch, identity, expectedManifests);
@@ -103,7 +91,7 @@ async function prepareHead(repo, branch, head, identity, expectedManifests) {
     if (localBehind) await execGit(['update-ref', localRef, remote, local], repo);
     else await execGit(['merge-base', '--is-ancestor', remote, local], repo);
   } else if (!local && remote) {
-    await execGit(['branch', head, remoteRef], repo);
+    await execGit(['branch', '--no-track', head, remoteRef], repo);
   }
   return Boolean(local || remote);
 }
@@ -121,14 +109,7 @@ export async function executeRemediationPlan(plan, config = {}) {
   const save = () => { fs.mkdirSync(reportsDir, { recursive: true }); fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2) + '\n'); };
   try {
     if (config.push && !config.commit && !config.createPr) throw new Error('--push requires --commit.');
-    const requested = config.branches
-      ? (Array.isArray(config.branches) ? config.branches : String(config.branches).split(',')).map((branch) => branch.trim()).filter(Boolean)
-      : null;
-    if (requested?.some((name) => !plan.branches.some((branch) => branch.branch === name))) {
-      throw new Error('Requested branches must exist in the saved remediation plan.');
-    }
-    const branches = plan.branches.filter((branch) => !requested || requested.includes(branch.branch));
-    if (!branches.length) throw new Error('No branches selected from the remediation plan.');
+    const branches = selectRemediationBranches(plan, config);
     const blocked = branches.filter((branch) => branch.status === 'blocked' || branch.blockers.length);
     if (blocked.length) throw new Error(blocked.map((branch) => `${branch.branch}: ${branch.blockers.join(' ') || 'plan is blocked'}`).join('\n'));
     const target = config.repo || plan.repository.path;
@@ -139,19 +120,37 @@ export async function executeRemediationPlan(plan, config = {}) {
     if (plan.repository.remoteUrl && plan.repository.remoteUrl !== remoteUrl) {
       throw new Error('Repository origin differs from the origin recorded in the remediation plan.');
     }
-    const shouldCommit = Boolean(config.commit || config.createPr);
-    const shouldPush = Boolean(config.push || config.createPr);
+    const upstreamTarget = resolvePublicationTarget(remoteUrl);
+    const publicationTarget = resolvePublicationTarget(remoteUrl, config.forkRepo);
+    const fullName = (identity) => identity ? `${identity.org}/${identity.name}` : plan.repository.fullName;
+    const publication = {
+      baseRepository: fullName(upstreamTarget.repository),
+      headRepository: fullName(publicationTarget.repository),
+      headOwner: publicationTarget.repository?.org || null,
+      pushUrl: publicationTarget.remoteUrl,
+      isFork: publicationTarget.isFork,
+    };
+    results.publication = publication;
+    const hasActions = branches.some((branch) => branch.status === 'ready' && branch.actions.length);
+    const shouldCommit = hasActions && Boolean(config.commit || config.createPr);
+    const shouldPush = hasActions && Boolean(config.push || config.createPr);
     if (shouldPush && !remoteUrl) throw new Error('Publishing requires an origin remote.');
-    if (config.createPr && !config.dryRun && !config.githubToken) throw new Error('PR publishing requires githubToken or GITHUB_TOKEN.');
-    const github = config.createPr ? githubRepository(remoteUrl) : null;
+    if (config.createPr && hasActions && !config.dryRun && !config.githubToken) throw new Error('PR publishing requires githubToken or GITHUB_TOKEN.');
+    const github = upstreamTarget.repository;
+    if (config.createPr && hasActions && !github) throw new Error('PR publishing requires an origin URL identifying the upstream GitHub owner/repository.');
     const prepared = [];
     // Check every selected base before applying anything to any branch.
     for (const branch of branches) {
       await assertBase(repo, branch);
+      for (const skipped of branch.selection?.skippedPackages || []) {
+        console.log(`[Skipped] ${branch.branch}: ${skipped.packageName}: ${skipped.reasons.join(' ')}`);
+      }
       if (branch.status === 'no-op') {
         if (branch.actions.length) throw new Error(`No-op branch ${branch.branch} unexpectedly contains actions.`);
-        results.branches.push({ branch: branch.branch, status: 'no-op', summary: branch.summary,
-          unresolved: branch.packages.filter((pkg) => ['manual-review', 'no-fix'].includes(pkg.status)) });
+        results.branches.push({ branch: branch.branch, status: 'no-op', verified: false, summary: branch.summary,
+          selection: branch.selection,
+          unresolved: branch.packages.filter((pkg) => ['manual-review', 'no-fix', 'skipped'].includes(pkg.status)) });
+        console.log(`[No actions] ${branch.branch}: ${branch.summary}`);
         continue;
       }
       if (!branch.actions.length || !branch.packages.some((pkg) => pkg.status === 'ready')) throw new Error(`Ready branch ${branch.branch} has no executable package actions.`);
@@ -170,19 +169,23 @@ export async function executeRemediationPlan(plan, config = {}) {
         expectedManifests = new Map([...manifests].map(([file, entry]) => [file, entry.json]));
       }
       finally { await removeWorktree(repo, snapshot); }
+      if (publicationTarget.isFork && !config.dryRun) {
+        await refreshPublicationHead(repo, publicationTarget, head, config.githubToken);
+      }
       prepared.push({ branch, identity, head, title, expectedManifests });
     }
     for (const { branch, identity, head, title, expectedManifests } of prepared) {
-      const item = { branch: branch.branch, head, title, status: config.dryRun ? 'planned' : 'applying' };
+      const item = { branch: branch.branch, head, title, publication: { ...publication, headRef: publication.headOwner ? `${publication.headOwner}:${head}` : head },
+        selection: branch.selection, status: config.dryRun ? 'planned' : 'applying' };
       results.branches.push(item);
       if (config.dryRun) {
         Object.assign(item, { verified: false, actions: branch.actions, summary: branch.summary });
-        console.log(`[DRY RUN] ${branch.branch} -> ${head}: ${title}\n${JSON.stringify(branch.actions, null, 2)}`);
+        console.log(`[DRY RUN] ${publication.baseRepository}:${branch.branch} <- ${publication.headRepository}:${head}: ${title}\n${JSON.stringify(branch.actions, null, 2)}`);
         continue;
       }
       let worktreeDir;
       try {
-        const reuse = await prepareHead(repo, branch, head, identity, expectedManifests);
+        const reuse = await prepareHead(repo, branch, head, identity, expectedManifests, publicationTarget.trackingNamespace);
         worktreeDir = path.resolve(repo, '.worktrees', sanitizeBranchName(head));
         if (fs.existsSync(worktreeDir)) throw new Error(`Refusing to overwrite retained worktree ${worktreeDir}.`);
         fs.mkdirSync(path.dirname(worktreeDir), { recursive: true });
@@ -209,10 +212,19 @@ export async function executeRemediationPlan(plan, config = {}) {
           item.status = 'committed';
           if (shouldPush) {
             await refreshBeforePublish(repo, branch, remoteUrl, config.githubToken);
-            await pushBranch(worktreeDir, head, { githubToken: config.githubToken });
+            if (publicationTarget.isFork) {
+              await refreshPublicationHead(repo, publicationTarget, head, config.githubToken);
+              const remoteHead = `refs/remotes/${publicationTarget.trackingNamespace}/${head}`;
+              if (await resolveRef(repo, remoteHead)) {
+                await assertOwnedHead(repo, remoteHead, branch, identity, expectedManifests);
+                await execGit(['merge-base', '--is-ancestor', remoteHead, `refs/heads/${head}`], repo);
+              }
+            }
+            await pushBranch(worktreeDir, head, { remote: publicationTarget.remote, githubToken: config.githubToken });
             item.status = 'pushed';
             if (config.createPr) {
               item.pullRequest = await publishPullRequest({ ...github, head, base: branch.branch,
+                headOwner: publicationTarget.repository.org, headRepo: publicationTarget.repository.name,
                 title, body, githubToken: config.githubToken, githubApiUrl: config.githubApiUrl });
               item.status = 'published';
               console.log(`PR for ${branch.branch}: ${item.pullRequest.url}`);

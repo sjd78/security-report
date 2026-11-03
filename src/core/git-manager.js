@@ -361,6 +361,7 @@ export async function stageAndCommit(worktreeDir, { message, files = ['.'], allo
 }
 
 export async function pushBranch(worktreeDir, branch, { remote = 'origin', githubToken = '' } = {}) {
-  const remoteUrl = await getOriginUrl(worktreeDir);
+  const { stdout: remoteUrl } = await execGit(['remote', 'get-url', '--push', remote], worktreeDir)
+    .catch(() => ({ stdout: remote }));
   return execGit(['push', remote, `refs/heads/${branch}:refs/heads/${branch}`], worktreeDir, gitAuthEnv(remoteUrl, githubToken));
 }

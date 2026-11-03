@@ -339,3 +339,29 @@ test('all installed instances and every finding major-line patch floor must veri
     await registry.close();
   }
 });
+
+test('no-breaking guard rejects an incompatible npm resolution even when the intended patch is safe', async (t) => {
+  const directory = temporary(t);
+  const registry = await startRegistry(path.join(directory, 'registry'), { versions: ['1.0.0', '1.0.1', '2.0.0'] });
+  const previous = Object.fromEntries(Object.keys(registry.env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, registry.env);
+  try {
+    const repo = path.join(directory, 'repo');
+    const raw = writeJson(repo, 'package.json', manifest({ dependencies: { [fixturePackage]: '*' } }));
+    const lock = registry.packageLock();
+    lock.packages[''].dependencies[fixturePackage] = '*';
+    writeJson(repo, 'package-lock.json', lock);
+    const plan = branchPlan([{ type: 'update-lockfile', package: fixturePackage, ...motivation }]);
+    await assert.rejects(
+      executeBranchPlan(repo, plan, { allowBreaking: false, githubApiUrl: `${registry.url}/github` }),
+      /No-breaking verification failed/,
+    );
+    assert.equal(JSON.parse(fs.readFileSync(path.join(repo, 'package-lock.json'))).packages[`node_modules/${fixturePackage}`].version, '2.0.0');
+    assert.equal(fs.readFileSync(path.join(repo, 'package.json'), 'utf8'), raw);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await registry.close();
+  }
+});

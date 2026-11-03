@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import semver from 'semver';
 import { collectNpmAudit } from '../collectors/npm-audit.js';
 import { findWorkspacePackageJsons, getArboristClass } from './dependency-graph.js';
+import { reconcilePackageRisk, isCompatibleUpgrade } from './remediation-policy.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -301,7 +302,7 @@ export function validateBranchActions(worktreeDir, branchPlan, options = {}) {
   const ready = new Map();
   for (const pkg of branchPlan.packages) {
     if (!isObject(pkg) || !packageName(pkg.packageName)
-      || !['ready', 'resolved', 'manual-review', 'no-fix', 'not-installed'].includes(pkg.status)) {
+      || !['ready', 'resolved', 'manual-review', 'no-fix', 'not-installed', 'skipped'].includes(pkg.status)) {
       throw new Error('Invalid package entry in branch plan');
     }
     if (pkg.status !== 'ready') continue;
@@ -408,6 +409,12 @@ export function validateBranchActions(worktreeDir, branchPlan, options = {}) {
       entry.modified = true;
     }
   }
+  if (options.allowBreaking === false) {
+    for (const pkg of ready.values()) {
+      const risk = reconcilePackageRisk(pkg, branchPlan.actions.filter((action) => action.packageNames.includes(pkg.packageName)));
+      if (risk.breaking !== false) throw new Error(`No-breaking policy rejects ${pkg.packageName}: ${risk.reasons.join(' ') || 'breaking or unknown compatibility'}`);
+    }
+  }
   for (const name of ready.keys()) {
     if (!motivated.has(name)) throw new Error(`Ready package has no executable branch action: ${name}`);
   }
@@ -428,7 +435,7 @@ export function validateBranchActions(worktreeDir, branchPlan, options = {}) {
 export async function executeBranchPlan(worktreeDir, branchPlan, options = {}) {
   const { manifests, lockfileUpdates } = validateBranchActions(worktreeDir, branchPlan, options);
   const ready = branchPlan.packages.filter((pkg) => pkg.status === 'ready');
-  const unresolved = branchPlan.packages.filter((pkg) => ['manual-review', 'no-fix', 'not-installed'].includes(pkg.status));
+  const unresolved = branchPlan.packages.filter((pkg) => ['manual-review', 'no-fix', 'not-installed', 'skipped'].includes(pkg.status));
   const appliedChanges = branchPlan.actions.filter((action) => action.type !== 'update-lockfile').map((action) => ({
     package: action.package,
     section: action.type === 'set-override' ? 'overrides' : action.section,
@@ -451,6 +458,17 @@ export async function executeBranchPlan(worktreeDir, branchPlan, options = {}) {
     postAuditSummary: null,
   };
   if (options.dryRun) return result;
+  let beforeInstances;
+  if (options.allowBreaking === false && ready.length && !options.reuse) {
+    const Arborist = getArboristClass();
+    if (!Arborist) throw new Error('Arborist is required to establish non-breaking upgrade baselines');
+    const beforeTree = await new Arborist({ path: worktreeDir, offline: true }).loadVirtual();
+    beforeInstances = new Map(ready.map((pkg) => [pkg.packageName, new Map()]));
+    for (const node of beforeTree.inventory.values()) {
+      const instances = beforeInstances.get(node.package?.name || node.name);
+      if (instances && !node.isProjectRoot) instances.set(node.location, node.package?.version || node.version);
+    }
+  }
   if (!options.reuse) {
     for (const entry of manifests.values()) {
       if (!entry.modified) continue;
@@ -484,6 +502,19 @@ export async function executeBranchPlan(worktreeDir, branchPlan, options = {}) {
       const version = node.package?.version || node.version;
       if (!pkg.findings.every((finding) => safeForFinding(version, finding))) {
         throw new Error(`Verification failed: ${pkg.packageName}@${version || 'unknown'} at ${node.location} remains vulnerable or lacks a safe patched major line`);
+      }
+      if (options.allowBreaking === false) {
+        const instances = beforeInstances?.get(pkg.packageName);
+        const locationBaseline = instances?.get(node.location);
+        const before = locationBaseline ? [locationBaseline] : instances ? [...instances.values()]
+          : pkg.installedVersions?.length ? pkg.installedVersions : String(pkg.currentVersion || '').split(',').map((value) => value.trim());
+        // A newly hoisted instance has no exact location baseline: do not guess which major it replaced.
+        const compatible = before.length > 0 && (instances && !locationBaseline
+          ? before.every((baseline) => isCompatibleUpgrade(baseline, version))
+          : before.some((baseline) => isCompatibleUpgrade(baseline, version)));
+        if (!compatible) {
+          throw new Error(`No-breaking verification failed: ${pkg.packageName}@${version || 'unknown'} crosses its scanned compatible version line; refusing to publish.`);
+        }
       }
     }
     resolved.push({ ...pkg, installedVersions: [...new Set(nodes.map((node) => node.package?.version || node.version))].sort(semver.compare) });

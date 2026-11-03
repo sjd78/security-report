@@ -11,7 +11,10 @@ export const fixturePackage = 'security-report-fixture';
 export const fixtureGhsa = 'GHSA-2345-6789-CFGH';
 
 // Real npm uses this loopback registry; neither package resolution nor advisory enrichment uses the internet.
-export async function startRegistry(directory) {
+export async function startRegistry(directory, {
+  packageNames = [fixturePackage], versions = ['1.0.0', '1.0.1'],
+  dependenciesByPackage = {}, vulnerablePackages = packageNames,
+} = {}) {
   fs.mkdirSync(directory, { recursive: true });
   const userConfig = path.join(directory, 'npmrc');
   fs.writeFileSync(userConfig, '');
@@ -25,17 +28,23 @@ export async function startRegistry(directory) {
   };
   fs.writeFileSync(env.npm_config_globalconfig, '');
   const tarballs = new Map();
-  for (const version of ['1.0.0', '1.0.1']) {
-    const dir = path.join(directory, version);
-    fs.mkdirSync(dir);
-    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: fixturePackage, version }));
-    fs.writeFileSync(path.join(dir, 'index.js'), `module.exports = '${version}';\n`);
-    const { stdout } = await exec('npm', ['pack', '--json', '--ignore-scripts'], {
-      cwd: dir, env: { ...process.env, ...env },
-    });
-    const [packed] = JSON.parse(stdout);
-    const bytes = fs.readFileSync(path.join(dir, packed.filename));
-    tarballs.set(version, { bytes, integrity: `sha512-${createHash('sha512').update(bytes).digest('base64')}` });
+  for (const name of packageNames) {
+    const releases = new Map();
+    for (const version of versions) {
+      const dir = path.join(directory, name.replaceAll('/', '_'), version);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({
+        name, version, ...(dependenciesByPackage[name] ? { dependencies: dependenciesByPackage[name] } : {}),
+      }));
+      fs.writeFileSync(path.join(dir, 'index.js'), `module.exports = '${version}';\n`);
+      const { stdout } = await exec('npm', ['pack', '--json', '--ignore-scripts'], {
+        cwd: dir, env: { ...process.env, ...env },
+      });
+      const [packed] = JSON.parse(stdout);
+      const bytes = fs.readFileSync(path.join(dir, packed.filename));
+      releases.set(version, { bytes, integrity: `sha512-${createHash('sha512').update(bytes).digest('base64')}` });
+    }
+    tarballs.set(name, releases);
   }
   let url;
   const requests = [];
@@ -50,32 +59,47 @@ export async function startRegistry(directory) {
     const send = (value, status = 200) => { res.writeHead(status); res.end(JSON.stringify(value)); };
     if (req.url === '/-/npm/v1/security/advisories/bulk' || req.url === '/-/npm/v1/security/audits/quick') {
       if (state.failAudit) return send({ error: 'Registry unavailable' }, 503);
-      return send({ [fixturePackage]: [{ id: 1234, name: fixturePackage,
-        url: `${url}/github/advisories/${fixtureGhsa}`, title: 'Fixture denial of service', severity: 'high',
-        vulnerable_versions: '<1.0.1', cwe: ['CWE-400'], cvss: { score: 7.5, vectorString: null } }] });
+      return send(Object.fromEntries(vulnerablePackages.filter((name) => body?.[name]).map((name, index) => [name, [{
+        id: 1234 + index, name, url: `${url}/github/advisories/${fixtureGhsa}`,
+        title: 'Fixture denial of service', severity: 'high', vulnerable_versions: '<1.0.1',
+        cwe: ['CWE-400'], cvss: { score: 7.5, vectorString: null },
+      }]])));
     }
-    if (req.url === `/${fixturePackage}`) {
-      return send({ name: fixturePackage, 'dist-tags': { latest: '1.0.1' }, versions: Object.fromEntries(
-        [...tarballs].map(([version, packed]) => [version, { name: fixturePackage, version,
-          dist: { tarball: `${url}/${fixturePackage}/-/${version}.tgz`, integrity: packed.integrity } }]),
+    const packageName = packageNames.find((name) => req.url === `/${name}`);
+    if (packageName) {
+      return send({ name: packageName, 'dist-tags': { latest: versions.at(-1) }, versions: Object.fromEntries(
+        [...tarballs.get(packageName)].map(([version, packed]) => [version, { name: packageName, version,
+          ...(dependenciesByPackage[packageName] ? { dependencies: dependenciesByPackage[packageName] } : {}),
+          dist: { tarball: `${url}/${packageName}/-/${version}.tgz`, integrity: packed.integrity } }]),
       ) });
     }
-    const tarball = req.url.match(/\/-\/(1\.0\.[01])\.tgz$/);
-    if (tarball) { res.setHeader('content-type', 'application/octet-stream'); return res.end(tarballs.get(tarball[1]).bytes); }
+    for (const name of packageNames) {
+      const version = versions.find((release) => req.url === `/${name}/-/${release}.tgz`);
+      if (version) { res.setHeader('content-type', 'application/octet-stream'); return res.end(tarballs.get(name).get(version).bytes); }
+    }
     if (req.url === `/github/advisories/${fixtureGhsa}`) {
       return send({ ghsa_id: fixtureGhsa, cve_id: 'CVE-2026-12345', severity: 'high',
         summary: 'Fixture denial of service', html_url: `https://github.com/advisories/${fixtureGhsa}`,
-        vulnerabilities: [{ package: { name: fixturePackage, ecosystem: 'npm' }, vulnerable_version_range: '<1.0.1', first_patched_version: '1.0.1' }] });
+        vulnerabilities: vulnerablePackages.map((name) => ({ package: { name, ecosystem: 'npm' }, vulnerable_version_range: '<1.0.1', first_patched_version: '1.0.1' })) });
     }
     const parsedUrl = new URL(req.url, url);
-    if (/\/repos\/[^/]+\/[^/]+\/pulls$/.test(parsedUrl.pathname)) {
+    const pullRoute = parsedUrl.pathname.match(/\/repos\/([^/]+)\/([^/]+)\/pulls$/);
+    if (pullRoute) {
       if (state.failPr) return send({ message: 'Publishing denied' }, 403);
       if (req.method === 'GET') return send(state.pullRequests.filter((pr) =>
         `${pr.head.repo.owner.login}:${pr.head.ref}` === parsedUrl.searchParams.get('head')
-        && pr.base.ref === parsedUrl.searchParams.get('base')));
+        && pr.base.ref === parsedUrl.searchParams.get('base')
+        && pr.base.repo.full_name === `${pullRoute[1]}/${pullRoute[2]}`));
       if (req.method === 'POST') {
-        const pr = { number: state.pullRequests.length + 1, html_url: `${url}/pull/${state.pullRequests.length + 1}`,
-          title: body.title, body: body.body, head: { ref: body.head, repo: { owner: { login: 'fixture' } } }, base: { ref: body.base } };
+        const [baseOwner, baseName] = pullRoute.slice(1);
+        const separator = body.head.indexOf(':');
+        const headOwner = separator === -1 ? baseOwner : body.head.slice(0, separator);
+        const head = separator === -1 ? body.head : body.head.slice(separator + 1);
+        const headName = body.head_repo || baseName;
+        const pr = { number: state.pullRequests.length + 1, html_url: `${url}/pull/${state.pullRequests.length + 1}`, state: 'open',
+          title: body.title, body: body.body,
+          head: { ref: head, label: `${headOwner}:${head}`, repo: { owner: { login: headOwner }, name: headName, full_name: `${headOwner}/${headName}` } },
+          base: { ref: body.base, repo: { owner: { login: baseOwner }, name: baseName, full_name: `${baseOwner}/${baseName}` } } };
         state.pullRequests.push(pr);
         return send(pr, 201);
       }
@@ -95,8 +119,11 @@ export async function startRegistry(directory) {
     url, env, requests, state,
     packageLock() {
       return { name: 'fixture-app', version: '1.0.0', lockfileVersion: 3, requires: true, packages: {
-        '': { name: 'fixture-app', version: '1.0.0', dependencies: { [fixturePackage]: '1.0.0' } },
-        [`node_modules/${fixturePackage}`]: { version: '1.0.0', resolved: `${url}/${fixturePackage}/-/1.0.0.tgz`, integrity: tarballs.get('1.0.0').integrity },
+        '': { name: 'fixture-app', version: '1.0.0', dependencies: Object.fromEntries(packageNames.map((name) => [name, '1.0.0'])) },
+        ...Object.fromEntries(packageNames.map((name) => [`node_modules/${name}`, {
+          version: '1.0.0', resolved: `${url}/${name}/-/1.0.0.tgz`, integrity: tarballs.get(name).get('1.0.0').integrity,
+          ...(dependenciesByPackage[name] ? { dependencies: dependenciesByPackage[name] } : {}),
+        }])),
       } };
     },
     close: () => new Promise((resolve) => server.close(resolve)),
