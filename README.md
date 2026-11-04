@@ -102,6 +102,8 @@ Precedence is **CLI option > environment variable > config file**, except for `g
 
 > **Note on Configuration Validation:** If the Jira collector is enabled but its configuration is incomplete (missing `JIRA_BASE_URL` or `JIRA_API_TOKEN`), the tool automatically disables the Jira collector, logs a warning notice, and continues scanning with the remaining active collectors without failing.
 
+If Jira authentication/access fails (HTTP 401/403), search fails, or a network error prevents collection, the collector explicitly warns that results will not include any Jira data. Authentication failures are not retried against the fallback search endpoint; other search failures report the final HTTP status. Scanning continues with the remaining sources. A successful search returning no matching tickets is not reported as an access failure.
+
 ### Example Configuration File (`.security-report.json`)
 
 ```json

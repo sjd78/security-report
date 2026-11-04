@@ -147,7 +147,7 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
 
   const authHeader = createJiraAuthHeader(config);
   if (!authHeader) {
-    console.warn('[Jira] Warning: Jira API token not configured. Skipping Jira ticket lookup.');
+    console.warn('[Jira] Could not access Jira: API token not configured. Results will not include any data from Jira.');
     return groupJiraTicketsByBranch([], branches, branchMap);
   }
 
@@ -174,6 +174,8 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
     if (res.ok) {
       const data = await res.json();
       rawTickets = parseJiraIssues(data, cleanBase);
+    } else if (res.status === 401 || res.status === 403) {
+      throw new Error(`HTTP ${res.status}: authentication failed or access denied; check the Jira API token and permissions`);
     } else {
       // Fallback 2: Legacy POST /rest/api/3/search
       const searchUrl = `${cleanBase}/rest/api/3/search`;
@@ -194,11 +196,11 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
       if (postRes.ok) {
         rawTickets = parseJiraIssues(await postRes.json(), cleanBase);
       } else {
-        console.warn(`[Jira] Jira search returned HTTP ${res.status}: ${res.statusText}`);
+        throw new Error(`HTTP ${postRes.status}: Jira search failed (initial request: HTTP ${res.status})`);
       }
     }
   } catch (err) {
-    console.warn(`[Jira] Error fetching Jira CVE tickets: ${err.message}`);
+    console.warn(`[Jira] Could not access Jira: ${err.message}. Results will not include any data from Jira.`);
   }
 
   // Enrich tickets with remote links and matching GitHub Security Advisories
