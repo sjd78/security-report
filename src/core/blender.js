@@ -1,6 +1,8 @@
 import semver from 'semver';
 import { lookupPackageInstalledInfo } from './dependency-graph.js';
 import { buildRemediationSuggestion, isBreakingChange, isOutOfRangeChange } from '../collectors/npm-audit.js';
+import { getBranchFindings } from '../collectors/collection.js';
+import { normalizePlanFindings } from './advisory-evidence.js';
 
 export function isVersionCompatible(ticketVersions = [], targetVersions = []) {
   if (!targetVersions || targetVersions.length === 0) return true;
@@ -12,7 +14,7 @@ export function isVersionCompatible(ticketVersions = [], targetVersions = []) {
     for (const target of targetVersions) {
       const cleanTarget = String(target).toLowerCase().replace(/^mta\s*|-/g, '').replace(/\.x$/i, '').trim();
 
-      if (cleanTv === cleanTarget || cleanTv.startsWith(cleanTarget) || cleanTarget.startsWith(cleanTv)) {
+      if (cleanTv === cleanTarget || cleanTv.startsWith(`${cleanTarget}.`) || cleanTarget.startsWith(`${cleanTv}.`)) {
         return true;
       }
     }
@@ -187,6 +189,8 @@ export function matchJiraTicket(vuln, jiraTickets, branchName = null, branchMap 
     : [];
 
   for (const ticket of jiraTickets) {
+    if (ticket.packageName && vuln.packageName
+      && ticket.packageName.toLowerCase() !== vuln.packageName.toLowerCase()) continue;
     if (targetVersions.length > 0) {
       const compatible = isVersionCompatible(ticket.affectsVersions, targetVersions);
       if (!compatible) continue;
@@ -215,6 +219,8 @@ export function matchDependabotAlert(vuln, dependabotAlerts) {
   if (!dependabotAlerts || dependabotAlerts.length === 0) return null;
 
   for (const alert of dependabotAlerts) {
+    if (alert.packageName && vuln.packageName
+      && alert.packageName.toLowerCase() !== vuln.packageName.toLowerCase()) continue;
     // GHSA match
     if (vuln.id && alert.ghsaId && vuln.id.toUpperCase() === alert.ghsaId.toUpperCase()) {
       return alert;
@@ -234,11 +240,32 @@ export function matchDependabotAlert(vuln, dependabotAlerts) {
   return null;
 }
 
+function mergeAffectedVersions(...lists) {
+  return [...new Map(lists.flat().filter((item) => item && (item.vulnerableRange || item.vulnerableVersionRange || item.firstPatchedVersion))
+    .map((item) => {
+      const normalized = {
+        vulnerableRange: item.vulnerableRange ?? item.vulnerableVersionRange ?? null,
+        firstPatchedVersion: item.firstPatchedVersion ?? null,
+      };
+      return [JSON.stringify(normalized), normalized];
+    })).values()];
+}
+
+function attachSourceAdvisory(vulnerability, advisory) {
+  // Retain each source's intervals until canonical evidence is merged, rather
+  // than replacing a range-only record with another source's partial intervals.
+  vulnerability.advisories ||= [];
+  vulnerability.advisories.push(advisory);
+}
+
 export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
   const packageMap = new Map();
+  const evidenceRows = new Map();
 
   for (const v of rawVulnerabilities) {
     const pkgKey = (v.packageName || 'unknown').toLowerCase();
+    if (!evidenceRows.has(pkgKey)) evidenceRows.set(pkgKey, []);
+    evidenceRows.get(pkgKey).push(v);
 
     if (!packageMap.has(pkgKey)) {
       const cves = v.cve ? [v.cve] : [];
@@ -270,7 +297,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         url: v.url || null,
         workspaceDeclarations: [...(v.workspaceDeclarations || [])],
         advisories: Array.isArray(v.advisories) && v.advisories.length > 0
-          ? [...v.advisories]
+          ? v.advisories.map((advisory) => ({ ...advisory, affectedVersions: mergeAffectedVersions(advisory.affectedVersions) }))
           : [
               {
                 id: v.id,
@@ -279,6 +306,7 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
                 severity: v.severity,
                 url: v.url,
                 vulnerableVersionRange: v.vulnerableVersionRange,
+                affectedVersions: mergeAffectedVersions(v.affectedVersions),
                 targetSafeVersion: v.targetSafeVersion,
                 sources: v.sources,
               },
@@ -368,24 +396,33 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
         existing.dependencyChains.push(dc);
       }
 
-      // 6. Add advisory entry / entries
       if (Array.isArray(v.advisories) && v.advisories.length > 0) {
-        for (const adv of v.advisories) {
-          if (!existing.advisories.some((ea) => (ea.id && ea.id === adv.id) || (ea.url && ea.url === adv.url))) {
-            existing.advisories.push(adv);
+        for (const advisory of v.advisories) {
+          const prior = existing.advisories.find((item) =>
+            (item.id && advisory.id && String(item.id).toUpperCase() === String(advisory.id).toUpperCase())
+            || (item.url && item.url === advisory.url));
+          if (!prior) existing.advisories.push({ ...advisory, affectedVersions: mergeAffectedVersions(advisory.affectedVersions) });
+          else {
+            prior.affectedVersions = mergeAffectedVersions(prior.affectedVersions, advisory.affectedVersions);
+            if (compareSeverities(prior.severity, advisory.severity) > 0) prior.severity = advisory.severity;
+            for (const key of ['cve', 'title', 'url', 'vulnerableVersionRange']) if (!prior[key] && advisory[key]) prior[key] = advisory[key];
           }
         }
       } else {
-        existing.advisories.push({
+        const advisory = {
           id: v.id,
           cve: v.cve || null,
           title: v.title,
           severity: v.severity,
           url: v.url,
           vulnerableVersionRange: v.vulnerableVersionRange,
+          affectedVersions: mergeAffectedVersions(v.affectedVersions),
           targetSafeVersion: v.targetSafeVersion,
           sources: v.sources,
-        });
+        };
+        const prior = existing.advisories.find((item) => (item.id && item.id === advisory.id) || (item.url && item.url === advisory.url));
+        if (prior) prior.affectedVersions = mergeAffectedVersions(prior.affectedVersions, advisory.affectedVersions);
+        else existing.advisories.push(advisory);
       }
 
       // 7. Merge dependency paths
@@ -474,6 +511,9 @@ export function consolidateVulnerabilitiesByPackage(rawVulnerabilities = []) {
 
   // Optimize target safe versions across all advisories for each package
   for (const pkg of packageMap.values()) {
+    pkg.findings = normalizePlanFindings(evidenceRows.get(pkg.packageName?.toLowerCase() || 'unknown'), pkg.packageName);
+    pkg.affectedVersions = mergeAffectedVersions(...pkg.findings.map((finding) => finding.constraints))
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
     // Consolidate all patched versions across all advisories
     const allPatched = [...new Set([
       ...(pkg.patchedVersions || []),
@@ -587,19 +627,19 @@ export function blendVulnerabilitySources(
   const jiraBranchMap = new Map();
   if (jiraTickets && typeof jiraTickets === 'object' && Array.isArray(jiraTickets.branches)) {
     for (const bg of jiraTickets.branches) {
-      jiraBranchMap.set(bg.branch, bg.tickets || []);
+      jiraBranchMap.set(bg.branch, getBranchFindings(jiraTickets, bg.branch));
     }
   }
 
   const dependabotBranchMap = new Map();
   if (dependabotAlerts && typeof dependabotAlerts === 'object' && Array.isArray(dependabotAlerts.branches)) {
     for (const bg of dependabotAlerts.branches) {
-      dependabotBranchMap.set(bg.branch, bg.alerts || []);
+      dependabotBranchMap.set(bg.branch, getBranchFindings(dependabotAlerts, bg.branch));
     }
   }
 
-  const allJiraList = Array.isArray(jiraTickets) ? jiraTickets : (jiraTickets?.allTickets || []);
-  const allDependabotList = Array.isArray(dependabotAlerts) ? dependabotAlerts : (dependabotAlerts?.allAlerts || []);
+  const allJiraList = Array.isArray(jiraTickets) ? jiraTickets : [];
+  const allDependabotList = Array.isArray(dependabotAlerts) ? dependabotAlerts : [];
 
   for (const branchReport of branchReports) {
     const branchName = branchReport.branch;
@@ -616,7 +656,11 @@ export function blendVulnerabilitySources(
     const matchedDependabotNumbers = new Set();
 
     const rawVulns = (branchReport.vulnerabilities || []).map((v) => {
-      const copy = { ...v, sources: { ...(v.sources || {}) } };
+      const copy = {
+        ...v,
+        sources: { ...(v.sources || {}) },
+        advisories: (v.advisories || []).map((advisory) => ({ ...advisory })),
+      };
 
       const matchedJira = matchJiraTicket(copy, branchJiraTickets, branchName, branchMap);
       if (matchedJira) {
@@ -624,16 +668,24 @@ export function blendVulnerabilitySources(
         copy.sources.jira = {
           ticketKey: matchedJira.ticketKey,
           url: matchedJira.url,
+          advisoryUrl: matchedJira.advisoryUrl,
           summary: matchedJira.summary,
           status: matchedJira.status,
           affectsVersions: matchedJira.affectsVersions || [],
         };
-        if (!copy.cve && matchedJira.cve) {
-          copy.cve = matchedJira.cve;
-        }
-        if (!copy.targetSafeVersion && matchedJira.targetSafeVersion) {
-          copy.targetSafeVersion = matchedJira.targetSafeVersion;
-        }
+        if (!copy.cve && matchedJira.cve) copy.cve = matchedJira.cve;
+        if (!copy.targetSafeVersion && matchedJira.targetSafeVersion) copy.targetSafeVersion = matchedJira.targetSafeVersion;
+        attachSourceAdvisory(copy, {
+          id: matchedJira.ghsaId || matchedJira.cve || matchedJira.ticketKey,
+          ghsaId: matchedJira.ghsaId,
+          cve: matchedJira.cve,
+          title: matchedJira.summary,
+          severity: 'high',
+          url: matchedJira.advisoryUrl || matchedJira.url,
+          vulnerableVersionRange: matchedJira.vulnerableVersionRange || null,
+          affectedVersions: matchedJira.affectedVersions || [],
+          targetSafeVersion: matchedJira.targetSafeVersion || null,
+        });
       }
 
       const matchedDependabot = matchDependabotAlert(copy, branchDependabotAlerts);
@@ -643,14 +695,25 @@ export function blendVulnerabilitySources(
           alertNumber: matchedDependabot.alertNumber,
           url: matchedDependabot.url,
           ghsaId: matchedDependabot.ghsaId,
+          cve: matchedDependabot.cve,
           severity: matchedDependabot.severity,
         };
-        if (!copy.cve && matchedDependabot.cve) {
-          copy.cve = matchedDependabot.cve;
-        }
-        if (!copy.targetSafeVersion && matchedDependabot.targetSafeVersion) {
-          copy.targetSafeVersion = matchedDependabot.targetSafeVersion;
-        }
+        if (!copy.cve && matchedDependabot.cve) copy.cve = matchedDependabot.cve;
+        if (!copy.targetSafeVersion && matchedDependabot.targetSafeVersion) copy.targetSafeVersion = matchedDependabot.targetSafeVersion;
+        attachSourceAdvisory(copy, {
+          id: matchedDependabot.ghsaId || matchedDependabot.cve || `DEP-${matchedDependabot.alertNumber}`,
+          ghsaId: matchedDependabot.ghsaId,
+          cve: matchedDependabot.cve,
+          title: matchedDependabot.summary,
+          severity: matchedDependabot.severity,
+          url: matchedDependabot.advisoryUrl || matchedDependabot.url,
+          vulnerableVersionRange: matchedDependabot.vulnerableVersionRange || null,
+          targetSafeVersion: matchedDependabot.targetSafeVersion || null,
+          affectedVersions: matchedDependabot.affectedVersions || [{
+            vulnerableRange: matchedDependabot.vulnerableVersionRange || null,
+            firstPatchedVersion: matchedDependabot.targetSafeVersion || null,
+          }],
+        });
       }
 
       return copy;
@@ -711,6 +774,17 @@ export function blendVulnerabilitySources(
           isIndirect,
           dependencyType,
           workspaceDeclarations: pkgInfo.workspaceDeclarations,
+          advisories: [{
+            id: ticket.ghsaId || ticket.cve || ticket.ticketKey,
+            ghsaId: ticket.ghsaId || null,
+            cve: ticket.cve || null,
+            title: ticket.summary,
+            severity: 'high',
+            url: ticket.advisoryUrl || ticket.url,
+            vulnerableVersionRange: ticket.vulnerableVersionRange || null,
+            affectedVersions: ticket.affectedVersions || [],
+            targetSafeVersion: ticket.targetSafeVersion || null,
+          }],
           vulnerableVersionRange: ticket.vulnerableVersionRange || null,
           currentVersion,
           targetSafeVersion: targetSafe,
@@ -783,7 +857,20 @@ export function blendVulnerabilitySources(
           isDirect,
           isIndirect,
           dependencyType,
-          workspaceDeclarations: pkgInfo.workspaceDeclarations,
+          advisories: [{
+            id: alert.ghsaId || alert.cve || `DEP-${alert.alertNumber}`,
+            ghsaId: alert.ghsaId || null,
+            cve: alert.cve || null,
+            title: alert.summary,
+            severity: alert.severity || 'moderate',
+            url: alert.advisoryUrl || alert.url,
+            vulnerableVersionRange: alert.vulnerableVersionRange || null,
+            targetSafeVersion: alert.targetSafeVersion || null,
+            affectedVersions: alert.affectedVersions || [{
+              vulnerableRange: alert.vulnerableVersionRange || null,
+              firstPatchedVersion: alert.targetSafeVersion || null,
+            }],
+          }],
           vulnerableVersionRange: alert.vulnerableVersionRange,
           currentVersion,
           targetSafeVersion: alert.targetSafeVersion,

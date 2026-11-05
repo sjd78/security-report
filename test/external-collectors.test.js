@@ -72,35 +72,43 @@ test('parseDependabotAlerts: parses GitHub Dependabot alert structure', () => {
   assert.equal(parsed[0].targetSafeVersion, '4.17.21');
 });
 
-test('groupJiraTicketsByBranch: groups tickets into branch sections', () => {
+test('grouped Jira collections feed only the matching branch/package into the report', () => {
   const tickets = [
-    { ticketKey: 'MTA-1', affectsVersions: ['8.2', 'mta-8.2'] },
-    { ticketKey: 'MTA-2', affectsVersions: ['8.1', 'mta-8.1'] },
-    { ticketKey: 'MTA-3', affectsVersions: ['9.0'] },
+    { ticketKey: 'MTA-1', packageName: 'lodash', cve: 'CVE-2026-10001', affectsVersions: ['8.2', 'mta-8.2'] },
+    { ticketKey: 'MTA-2', packageName: 'lodash', cve: 'CVE-2026-10002', affectsVersions: ['8.1', 'mta-8.1'] },
+    { ticketKey: 'MTA-3', packageName: 'other', affectsVersions: ['9.0'] },
   ];
-  const branchMap = {
-    'release-0.11': ['8.2'],
-    'release-0.10': ['8.1'],
-  };
-  const grouped = groupJiraTicketsByBranch(tickets, ['release-0.11', 'release-0.10'], branchMap);
-  assert.equal(grouped.branches.length, 2);
-  assert.equal(grouped.branches[0].branch, 'release-0.11');
-  assert.equal(grouped.branches[0].tickets.length, 1);
-  assert.equal(grouped.branches[0].tickets[0].ticketKey, 'MTA-1');
-  assert.equal(grouped.branches[1].tickets[0].ticketKey, 'MTA-2');
-  assert.equal(grouped.unassigned.length, 1);
-  assert.equal(grouped.unassigned[0].ticketKey, 'MTA-3');
+  const branchMap = { 'release-0.11': ['8.2'], 'release-0.10': ['8.1'] };
+  const jiraTickets = groupJiraTicketsByBranch(tickets, ['release-0.11', 'release-0.10'], branchMap);
+  const reports = blendVulnerabilitySources(
+    ['release-0.11', 'release-0.10', 'unmapped'].map((branch) => ({ branch, vulnerabilities: [] })),
+    { jiraTickets, branchMap });
+  assert.deepEqual(reports[0].vulnerabilities.map((item) => [item.packageName, item.sources.jira.ticketKey]),
+    [['lodash', 'MTA-1']]);
+  assert.deepEqual(reports[1].vulnerabilities.map((item) => [item.packageName, item.sources.jira.ticketKey]),
+    [['lodash', 'MTA-2']]);
+  assert.deepEqual(reports[2].vulnerabilities, []);
+  assert.equal(jiraTickets.unassigned[0].packageName, 'other');
+  assert.equal(jiraTickets.unassigned[0].findings[0].ticketKey, 'MTA-3');
 });
 
-test('groupDependabotAlertsByBranch: assigns alerts to default branch and notes others', () => {
-  const alerts = [{ alertNumber: 1, packageName: 'lodash' }];
-  const grouped = groupDependabotAlertsByBranch(alerts, ['main', 'release-0.11'], 'main');
-  assert.equal(grouped.branches.length, 2);
-  assert.equal(grouped.branches[0].branch, 'main');
-  assert.equal(grouped.branches[0].alerts.length, 1);
-  assert.equal(grouped.branches[1].branch, 'release-0.11');
-  assert.equal(grouped.branches[1].alerts.length, 0);
-  assert.ok(grouped.branches[1].note);
+test('grouped Dependabot findings never attach to requested release branches', () => {
+  const dependabotAlerts = groupDependabotAlertsByBranch([
+    { alertNumber: 1, packageName: 'lodash', cve: 'CVE-2026-10001' },
+  ], ['release-0.11', 'main'], 'main');
+  const reports = blendVulnerabilitySources(
+    ['release-0.11', 'main', 'other-release'].map((branch) => ({ branch, vulnerabilities: [] })),
+    { dependabotAlerts });
+  assert.deepEqual(reports[0].vulnerabilities, []);
+  assert.equal(reports[1].vulnerabilities[0].packageName, 'lodash');
+  assert.equal(reports[1].vulnerabilities[0].sources.dependabot.alertNumber, 1);
+  assert.deepEqual(reports[2].vulnerabilities, []);
+});
+
+test('a shared CVE or advisory cannot correlate issues from a different known package', () => {
+  const vulnerability = { id: 'GHSA-1234-5678-9abc', cve: 'CVE-2026-10001', packageName: 'first' };
+  assert.equal(matchJiraTicket(vulnerability, [{ ticketKey: 'MTA-1', packageName: 'second', cve: vulnerability.cve }]), null);
+  assert.equal(matchDependabotAlert(vulnerability, [{ alertNumber: 1, packageName: 'second', ghsaId: vulnerability.id }]), null);
 });
 
 test('blendVulnerabilitySources: enriches npm audit with Jira and Dependabot', () => {
@@ -164,6 +172,7 @@ test('isVersionCompatible: matches version strings correctly', () => {
   assert.equal(isVersionCompatible(['MTA 8.2.0', 'mta-8.2'], ['8.2.x', '8.2']), true);
   assert.equal(isVersionCompatible(['MTA 8.1.0'], ['8.2.x', '8.2']), false);
   assert.equal(isVersionCompatible(['MTA 8.1.0'], ['8.1']), true);
+  assert.equal(isVersionCompatible(['MTA 8.10.0'], ['8.1']), false);
 });
 
 test('blendVulnerabilitySources: filters Jira tickets based on branch translation table', () => {
@@ -240,24 +249,15 @@ test('blendVulnerabilitySources: Jira-only run populates branch findings', () =>
     },
   ];
 
-  const jiraTickets = {
-    branches: [
-      {
-        branch: 'release-0.11',
-        tickets: [
-          {
-            ticketKey: 'MTA-7680',
-            summary: 'CVE-2026-82417 qs vulnerability [mta-8.2]',
-            cve: 'CVE-2026-82417',
-            packageName: 'qs',
-            status: 'New',
-            affectsVersions: ['8.2'],
-            url: 'https://jira.example.com/browse/MTA-7680',
-          },
-        ],
-      },
-    ],
-  };
+  const jiraTickets = groupJiraTicketsByBranch([{
+    ticketKey: 'MTA-7680',
+    summary: 'CVE-2026-82417 qs vulnerability [mta-8.2]',
+    cve: 'CVE-2026-82417',
+    packageName: 'qs',
+    status: 'New',
+    affectsVersions: ['8.2'],
+    url: 'https://jira.example.com/browse/MTA-7680',
+  }], ['release-0.11'], { 'release-0.11': ['8.2'] });
 
   const blended = blendVulnerabilitySources(branchReports, { jiraTickets, dependabotAlerts: [] });
   assert.equal(blended[0].vulnerabilities.length, 1);
@@ -482,25 +482,16 @@ test('blendVulnerabilitySources: Jira findings assess actual lockfile versions a
     },
   ];
 
-  const jiraTickets = {
-    branches: [
-      {
-        branch: 'release-0.10',
-        tickets: [
-          {
-            ticketKey: 'MTA-7652',
-            summary: 'CVE-2026-84375 js-yaml DoS [mta-8.2]',
-            cve: 'CVE-2026-84375',
-            packageName: 'js-yaml',
-            status: 'POST',
-            affectsVersions: ['8.2'],
-            targetSafeVersion: '4.3.2',
-            url: 'https://jira.example.com/browse/MTA-7652',
-          },
-        ],
-      },
-    ],
-  };
+  const jiraTickets = groupJiraTicketsByBranch([{
+    ticketKey: 'MTA-7652',
+    summary: 'CVE-2026-84375 js-yaml DoS [mta-8.2]',
+    cve: 'CVE-2026-84375',
+    packageName: 'js-yaml',
+    status: 'POST',
+    affectsVersions: ['8.2'],
+    targetSafeVersion: '4.3.2',
+    url: 'https://jira.example.com/browse/MTA-7652',
+  }], ['release-0.10'], { 'release-0.10': ['8.2'] });
 
   const blended = blendVulnerabilitySources(branchReports, { jiraTickets, dependabotAlerts: [] });
   assert.equal(blended[0].vulnerabilities.length, 1);

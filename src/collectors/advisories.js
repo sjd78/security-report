@@ -12,143 +12,136 @@ export function extractCveId(text) {
   return match ? match[0].toUpperCase() : null;
 }
 
+function sortedVersions(versions) {
+  return [...new Set(versions.filter(Boolean))].sort((left, right) => {
+    const a = semver.valid(left);
+    const b = semver.valid(right);
+    if (a && b) return semver.compare(a, b);
+    return String(left).localeCompare(String(right));
+  });
+}
+
+function npmPackageCandidates(rows, packageName, packageField) {
+  const npmRows = rows.filter((row) => !row?.[packageField]?.ecosystem || row[packageField].ecosystem.toLowerCase() === 'npm');
+  const matching = packageName
+    ? npmRows.filter((row) => row?.[packageField]?.name === packageName)
+    : npmRows;
+  const names = new Set(matching.map((row) => row?.[packageField]?.name).filter(Boolean));
+  if (packageName && names.size === 0) return [];
+  if (!packageName && names.size > 1) return null;
+  return matching;
+}
+
+function osvAffectedIntervals(affected) {
+  const intervals = [];
+  for (const range of affected?.ranges || []) {
+    if (String(range.type || '').toUpperCase() !== 'SEMVER' || !Array.isArray(range.events)) continue;
+    let introduced = null;
+    for (const event of range.events) {
+      if (typeof event.introduced === 'string') {
+        introduced = event.introduced === '0' ? '0.0.0' : semver.valid(event.introduced);
+        continue;
+      }
+      if (typeof event.fixed === 'string') {
+        const fixed = semver.valid(event.fixed);
+        if (fixed) {
+          intervals.push({
+            vulnerableRange: introduced ? `>=${introduced} <${fixed}` : `<${fixed}`,
+            firstPatchedVersion: fixed,
+          });
+        }
+        introduced = null;
+        continue;
+      }
+      if (typeof event.last_affected === 'string') {
+        const last = semver.valid(event.last_affected);
+        if (last) intervals.push({ vulnerableRange: introduced ? `>=${introduced} <=${last}` : `<=${last}`, firstPatchedVersion: null });
+        introduced = null;
+      }
+    }
+    if (introduced) intervals.push({ vulnerableRange: `>=${introduced}`, firstPatchedVersion: null });
+  }
+  return intervals;
+}
+
 export async function fetchAdvisoryDetails(advisoryRef, options = {}) {
-  const { githubToken, githubApiUrl = 'https://api.github.com' } = options;
+  const { githubToken, githubApiUrl = 'https://api.github.com', packageName = null } = options;
   const ghsaId = extractGhsaId(advisoryRef);
   const cveId = extractCveId(advisoryRef);
-
   const identifier = ghsaId || cveId || advisoryRef;
   if (!identifier) return null;
 
-  // 1. Try GitHub Advisories API if GHSA is present
   if (ghsaId) {
     try {
-      const headers = {
-        Accept: 'application/vnd.github+json',
-        'User-Agent': 'security-report',
-      };
-      if (githubToken) {
-        headers.Authorization = `Bearer ${githubToken}`;
-      }
-
+      const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'security-report' };
+      if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
       const cleanApi = githubApiUrl.replace(/\/+$/, '');
-      const ghUrl = `${cleanApi}/advisories/${ghsaId}`;
-      const res = await fetch(ghUrl, { headers });
-
-      if (res.ok) {
-        const data = await res.json();
-        const npmVulns = Array.isArray(data.vulnerabilities)
-          ? data.vulnerabilities.filter((v) => !v.package?.ecosystem || v.package.ecosystem.toLowerCase() === 'npm')
-          : [];
-        const primaryVuln = npmVulns[0] || (Array.isArray(data.vulnerabilities) ? data.vulnerabilities[0] : null);
-
-        const patchedVersions = [];
-        const seenPatched = new Set();
-        const targetVulnList = npmVulns.length > 0 ? npmVulns : (Array.isArray(data.vulnerabilities) ? data.vulnerabilities : []);
-
-        for (const v of targetVulnList) {
-          const fpv = v.first_patched_version;
-          if (fpv && typeof fpv === 'string') {
-            const clean = semver.clean(fpv) || fpv.trim();
-            if (clean && !seenPatched.has(clean)) {
-              seenPatched.add(clean);
-              patchedVersions.push(clean);
-            }
-          }
+      const response = await fetch(`${cleanApi}/advisories/${ghsaId}`, { headers });
+      if (response.ok) {
+        const data = await response.json();
+        const vulnerabilities = npmPackageCandidates(data.vulnerabilities || [], packageName, 'package');
+        if (vulnerabilities === null) return null;
+        if (vulnerabilities.length) {
+          const affectedVersions = vulnerabilities.map((item) => ({
+            vulnerableRange: item.vulnerable_version_range || null,
+            firstPatchedVersion: typeof item.first_patched_version === 'string' ? item.first_patched_version : null,
+          })).filter((item) => item.vulnerableRange || item.firstPatchedVersion);
+          const patchedVersions = sortedVersions(affectedVersions.map((item) => item.firstPatchedVersion));
+          return {
+            id: extractGhsaId(data.ghsa_id) || ghsaId,
+            ghsaId: extractGhsaId(data.ghsa_id) || ghsaId,
+            cve: extractCveId(data.cve_id) || cveId || null,
+            packageName: vulnerabilities[0]?.package?.name || packageName || null,
+            ecosystem: 'npm',
+            severity: (data.severity || 'moderate').toLowerCase(),
+            vulnerableVersionRange: affectedVersions[0]?.vulnerableRange || null,
+            affectedVersions,
+            targetSafeVersion: patchedVersions[0] || null,
+            patchedVersions,
+            targetSafeVersions: patchedVersions,
+            title: data.summary || null,
+            url: data.html_url || `https://github.com/advisories/${ghsaId}`,
+            source: 'github-advisory',
+          };
         }
-        patchedVersions.sort((a, b) => {
-          const vA = semver.valid(a);
-          const vB = semver.valid(b);
-          if (vA && vB) return semver.compare(vA, vB);
-          return a.localeCompare(b);
-        });
+      }
+    } catch {
+      // Fall through to OSV.
+    }
+  }
 
+  try {
+    const response = await fetch(`https://api.osv.dev/v1/vulns/${encodeURIComponent(identifier)}`);
+    if (response.ok) {
+      const data = await response.json();
+      const affected = npmPackageCandidates(data.affected || [], packageName, 'package');
+      if (affected === null) return null;
+      if (affected.length) {
+        const affectedVersions = affected.flatMap(osvAffectedIntervals);
+        const patchedVersions = sortedVersions(affectedVersions.map((item) => item.firstPatchedVersion));
+        const foundCve = (data.aliases || []).map(extractCveId).find(Boolean) || cveId || null;
+        const foundGhsa = (data.aliases || []).map(extractGhsaId).find(Boolean) || ghsaId || null;
         return {
-          id: data.ghsa_id || ghsaId,
-          ghsaId: data.ghsa_id || ghsaId,
-          cve: data.cve_id || cveId || null,
-          packageName: primaryVuln?.package?.name || null,
-          ecosystem: primaryVuln?.package?.ecosystem || 'npm',
-          severity: (data.severity || 'moderate').toLowerCase(),
-          vulnerableVersionRange: primaryVuln?.vulnerable_version_range || null,
-          targetSafeVersion: patchedVersions[0] || primaryVuln?.first_patched_version || null,
+          id: foundGhsa || extractGhsaId(data.id) || extractCveId(data.id) || data.id,
+          ghsaId: foundGhsa || extractGhsaId(data.id) || null,
+          cve: foundCve,
+          packageName: affected[0]?.package?.name || packageName || null,
+          ecosystem: 'npm',
+          severity: 'moderate',
+          vulnerableVersionRange: affectedVersions[0]?.vulnerableRange || null,
+          affectedVersions,
+          targetSafeVersion: patchedVersions[0] || null,
           patchedVersions,
           targetSafeVersions: patchedVersions,
           title: data.summary || null,
-          url: data.html_url || `https://github.com/advisories/${ghsaId}`,
-          source: 'github-advisory',
+          url: data.references?.find((item) => item.url?.includes('github.com/advisories'))?.url
+            || `https://github.com/advisories/${foundGhsa || identifier}`,
+          source: 'osv',
         };
       }
-    } catch (err) {
-      // Fall through to OSV
     }
+  } catch {
+    // Advisory lookup is best-effort; collectors preserve their original evidence.
   }
-
-  // 2. Fallback to OSV API (Open Source Vulnerabilities database)
-  try {
-    const osvUrl = `https://api.osv.dev/v1/vulns/${encodeURIComponent(identifier)}`;
-    const res = await fetch(osvUrl);
-
-    if (res.ok) {
-      const data = await res.json();
-      const npmAffected = Array.isArray(data.affected)
-        ? data.affected.filter((a) => !a.package?.ecosystem || a.package.ecosystem.toLowerCase() === 'npm')
-        : [];
-      const primaryAffected = npmAffected[0] || (Array.isArray(data.affected) ? data.affected[0] : null);
-
-      const patchedVersions = [];
-      const seenPatched = new Set();
-      const targetAffectedList = npmAffected.length > 0 ? npmAffected : (Array.isArray(data.affected) ? data.affected : []);
-
-      for (const aff of targetAffectedList) {
-        if (Array.isArray(aff.ranges)) {
-          for (const range of aff.ranges) {
-            if (Array.isArray(range.events)) {
-              for (const event of range.events) {
-                if (event.fixed && typeof event.fixed === 'string') {
-                  const clean = semver.clean(event.fixed) || event.fixed.trim();
-                  if (clean && !seenPatched.has(clean)) {
-                    seenPatched.add(clean);
-                    patchedVersions.push(clean);
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-      patchedVersions.sort((a, b) => {
-        const vA = semver.valid(a);
-        const vB = semver.valid(b);
-        if (vA && vB) return semver.compare(vA, vB);
-        return a.localeCompare(b);
-      });
-
-      let firstPatchedVersion = patchedVersions[0] || null;
-      let vulnerableVersionRange = null;
-
-      const foundCve = data.aliases?.find((a) => a.startsWith('CVE-')) || cveId || null;
-      const foundGhsa = data.aliases?.find((a) => a.startsWith('GHSA-')) || ghsaId || null;
-
-      return {
-        id: foundGhsa || data.id,
-        ghsaId: foundGhsa || (data.id?.startsWith('GHSA-') ? data.id : null),
-        cve: foundCve,
-        packageName: primaryAffected?.package?.name || null,
-        ecosystem: primaryAffected?.package?.ecosystem || 'npm',
-        severity: 'moderate',
-        vulnerableVersionRange,
-        targetSafeVersion: firstPatchedVersion,
-        patchedVersions,
-        targetSafeVersions: patchedVersions,
-        title: data.summary || null,
-        url: data.references?.find((r) => r.url?.includes('github.com/advisories'))?.url || `https://github.com/advisories/${foundGhsa || identifier}`,
-        source: 'osv',
-      };
-    }
-  } catch (err) {
-    // ignore
-  }
-
   return null;
 }

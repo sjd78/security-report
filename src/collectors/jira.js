@@ -1,5 +1,6 @@
 import { extractCveFromText } from './npm-audit.js';
 import { extractGhsaId, extractCveId, fetchAdvisoryDetails } from './advisories.js';
+import { groupPackageFindings } from './collection.js';
 
 export function createJiraAuthHeader(config) {
   const { email, apiToken } = config.jira || {};
@@ -15,13 +16,13 @@ export function createJiraAuthHeader(config) {
 
 export function extractPackageNameFromText(text) {
   if (!text) return null;
-  // Match patterns like "in package-name", "kin-openapi:", "package: package-name"
-  const matchColon = text.match(/(?:CVE-\d{4}-\d+\s+[^:]+:\s*)([@a-zA-Z0-9._/-]+):/i);
+  // Security tracker titles put the affected package after the product-name colon.
+  const matchColon = text.match(/\bCVE-\d{4}-\d+\s+[^:\r\n]+:\s*([@a-zA-Z0-9._/-]+)(?=[:\s]|$)/i);
   if (matchColon && matchColon[1]) {
     return matchColon[1].trim();
   }
 
-  const matchIn = text.match(/(?:in|package|dependency)\s+[`"']?([@a-zA-Z0-9._/-]+)[`"']?/i);
+  const matchIn = text.match(/\b(?:in|package|dependency)\s+[`"']?([@a-zA-Z0-9._/-]+)[`"']?/i);
   if (matchIn && matchIn[1] && !matchIn[1].startsWith('CVE-') && !matchIn[1].startsWith('GHSA-')) {
     return matchIn[1].trim();
   }
@@ -53,7 +54,7 @@ export function isVersionCompatible(ticketVersions = [], targetVersions = []) {
     for (const target of targetVersions) {
       const cleanTarget = String(target).toLowerCase().replace(/^mta\s*|-/g, '').replace(/\.x$/i, '').trim();
 
-      if (cleanTv === cleanTarget || cleanTv.startsWith(cleanTarget) || cleanTarget.startsWith(cleanTv)) {
+      if (cleanTv === cleanTarget || cleanTv.startsWith(`${cleanTarget}.`) || cleanTarget.startsWith(`${cleanTv}.`)) {
         return true;
       }
     }
@@ -83,19 +84,26 @@ export function flattenAdfText(doc) {
   return texts.join(' ');
 }
 
-export function groupJiraTicketsByBranch(tickets = [], branches = [], branchMap = {}) {
+export function groupJiraTicketsByBranch(tickets = [], branches = [], branchMap = {}, repository = null) {
   const branchGroups = [];
-  const assignedKeys = new Set();
+  const assignedTickets = new Set();
 
   for (const branch of branches) {
     const rawTargets = branchMap[branch] || [];
-    const targetVersions = Array.isArray(rawTargets) ? rawTargets : [rawTargets];
+    const targetVersions = (Array.isArray(rawTargets) ? rawTargets : [rawTargets])
+      .filter((version) => version != null && String(version).trim());
 
     const matchingTickets = [];
     for (const ticket of tickets) {
-      if (isVersionCompatible(ticket.affectsVersions, targetVersions)) {
+      const ticketVersions = (ticket.affectsVersions || [])
+        .filter((version) => version != null && String(version).trim());
+      const matchesBranch = ticket.branch
+        ? ticket.branch === branch
+        : targetVersions.length > 0 && ticketVersions.length > 0
+          && isVersionCompatible(ticketVersions, targetVersions);
+      if (matchesBranch) {
         matchingTickets.push(ticket);
-        assignedKeys.add(ticket.ticketKey);
+        assignedTickets.add(ticket);
       }
     }
 
@@ -103,17 +111,17 @@ export function groupJiraTicketsByBranch(tickets = [], branches = [], branchMap 
       branch,
       mappedVersions: targetVersions,
       ticketCount: matchingTickets.length,
-      tickets: matchingTickets,
+      packages: groupPackageFindings(matchingTickets),
     });
   }
 
-  const unassigned = tickets.filter((t) => !assignedKeys.has(t.ticketKey));
+  const unassigned = tickets.filter((ticket) => !assignedTickets.has(ticket));
 
   return {
+    repository,
     branches: branchGroups,
-    unassigned,
+    unassigned: groupPackageFindings(unassigned),
     totalTickets: tickets.length,
-    allTickets: tickets,
   };
 }
 
@@ -142,13 +150,13 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
   const branchMap = config.branchMap || {};
 
   if (!baseUrl) {
-    return groupJiraTicketsByBranch([], branches, branchMap);
+    return groupJiraTicketsByBranch([], branches, branchMap, options.repository);
   }
 
   const authHeader = createJiraAuthHeader(config);
   if (!authHeader) {
     console.warn('[Jira] Could not access Jira: API token not configured. Results will not include any data from Jira.');
-    return groupJiraTicketsByBranch([], branches, branchMap);
+    return groupJiraTicketsByBranch([], branches, branchMap, options.repository);
   }
 
   const jql = customJql || `project = "${project || 'MTA'}" AND (summary ~ "CVE*" OR text ~ "CVE*" OR labels in (Security, SecurityTracking))`;
@@ -205,6 +213,17 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
 
   // Enrich tickets with remote links and matching GitHub Security Advisories
   const advisoryCache = new Map();
+  const lookupAdvisory = (ref, packageName = null) => {
+    const key = JSON.stringify([ref, packageName]);
+    if (!advisoryCache.has(key)) {
+      advisoryCache.set(key, fetchAdvisoryDetails(ref, {
+        githubToken: config.githubToken,
+        githubApiUrl: config.githubApiUrl,
+        packageName,
+      }));
+    }
+    return advisoryCache.get(key);
+  };
 
   await Promise.all(
     rawTickets.map(async (ticket) => {
@@ -213,34 +232,32 @@ export async function fetchJiraCveTickets(config = {}, options = {}) {
 
       // Find GHSA link or CVE ID
       const ghsaUrl = ticket.remoteLinks.find((url) => url.includes('github.com') && url.includes('/advisories/GHSA-'));
-      const ghsaId = extractGhsaId(ghsaUrl) || extractGhsaId(ticket.summary);
-      const cveId = ticket.cve || extractCveId(ticket.summary);
+      const ghsaId = extractGhsaId(ghsaUrl) || ticket.ghsaId || extractGhsaId(ticket.summary);
+      const cveId = ticket.remoteLinks.map(extractCveId).find(Boolean) || ticket.cve || extractCveId(ticket.summary);
 
       const lookupRef = ghsaId || cveId;
 
       if (lookupRef) {
-        if (!advisoryCache.has(lookupRef)) {
-          const advPromise = fetchAdvisoryDetails(lookupRef, {
-            githubToken: config.githubToken,
-            githubApiUrl: config.githubApiUrl,
-          });
-          advisoryCache.set(lookupRef, advPromise);
+        // A text guess must not filter out the authoritative package identity.
+        let advDetails = await lookupAdvisory(lookupRef);
+        if (!advDetails && ticket.packageName) {
+          // Multi-package advisories can still validate a matching text hint.
+          advDetails = await lookupAdvisory(lookupRef, ticket.packageName);
         }
-
-        const advDetails = await advisoryCache.get(lookupRef);
         if (advDetails) {
           if (!ticket.cve && advDetails.cve) ticket.cve = advDetails.cve;
-          if (!ticket.packageName && advDetails.packageName) ticket.packageName = advDetails.packageName;
+          if (advDetails.packageName) ticket.packageName = advDetails.packageName;
           ticket.ghsaId = advDetails.ghsaId || ghsaId;
           ticket.advisoryUrl = advDetails.url || ghsaUrl;
           ticket.vulnerableVersionRange = advDetails.vulnerableVersionRange;
+          ticket.affectedVersions = advDetails.affectedVersions || [];
           ticket.targetSafeVersion = advDetails.targetSafeVersion;
         }
       }
     })
   );
 
-  return groupJiraTicketsByBranch(rawTickets, branches, branchMap);
+  return groupJiraTicketsByBranch(rawTickets, branches, branchMap, options.repository);
 }
 
 export function parseJiraIssues(data, baseUrl) {
@@ -294,6 +311,7 @@ export function parseJiraIssues(data, baseUrl) {
       url: `${baseUrl}/browse/${key}`,
       cve,
       packageName,
+      ...(extractGhsaId(combinedText) && { ghsaId: extractGhsaId(combinedText) }),
       labels,
       affectsVersions: Array.from(versionsSet),
     });

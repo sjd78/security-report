@@ -84,10 +84,19 @@ test('Multi-branch scan writes reports and collector diagnostics', async () => {
 
     const jsonReport = JSON.parse(fs.readFileSync(scanResult.jsonPath, 'utf8'));
     assert.equal(jsonReport.branches.length, 2);
-    // Verify debug collector outputs
-    assert.ok(fs.existsSync(path.join(reportsDir, 'security-jira-collection.json')));
-    assert.ok(fs.existsSync(path.join(reportsDir, 'security-dependabot-collection.json')));
-    assert.ok(fs.existsSync(path.join(reportsDir, 'security-npm-audit-collection.json')));
+    for (const kind of ['jira', 'dependabot', 'npm-audit']) {
+      const collection = JSON.parse(fs.readFileSync(path.join(reportsDir, `debug-collection-${kind}.json`), 'utf8'));
+      assert.equal(collection.repository.fullName, 'local/my-repo');
+      assert.deepEqual(collection.branches.map(({ branch }) => branch), ['main', 'release/1.0']);
+      assert.ok(collection.branches.every(({ packages }) => packages.length === 0));
+    }
+    const blended = JSON.parse(fs.readFileSync(path.join(reportsDir, 'debug-blended.json'), 'utf8'));
+    assert.equal(blended.repository.fullName, 'local/my-repo');
+    assert.deepEqual(blended.branches.map(({ branch }) => branch), ['main', 'release/1.0']);
+    assert.ok(blended.branches.every(({ packages, baseCommit }) => packages.length === 0 && baseCommit));
+    for (const filename of ['collection-jira.json', 'collection-dependabot.json', 'collection-npm-audit.json']) {
+      assert.equal(fs.existsSync(path.join(reportsDir, filename)), false);
+    }
 
   } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
@@ -127,6 +136,9 @@ test('scan snapshots preserve retained edits and record executable-plan base com
     assert.equal(fs.readFileSync(path.join(retained, 'retained-fix.txt'), 'utf8'), 'uncommitted fix');
     assert.equal((await execGit(['rev-parse', 'main'], repo)).stdout, baseCommit);
     assert.equal((await execGit(['rev-parse', 'review'], repo)).stdout, baseCommit);
+    for (const filename of ['debug-collection-jira.json', 'debug-collection-dependabot.json', 'debug-collection-npm-audit.json', 'debug-blended.json']) {
+      assert.equal(fs.existsSync(path.join(tmp, 'reports', filename)), false);
+    }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -150,7 +162,7 @@ test('real npm scan produces actionable plans and preserves audit failures', asy
     await execGit(['commit', '-m', 'Vulnerable dependency'], repo);
     const { stdout: baseCommit } = await execGit(['rev-parse', 'HEAD'], repo);
     const options = {
-      noConfigFile: true, collectors: 'npm-audit', githubToken: '',
+      noConfigFile: true, collectors: 'npm-audit', githubToken: '', debug: true,
       githubApiUrl: `${registry.url}/github`, branches: 'main', reportsDir: path.join(tmp, 'reports'),
     };
     const result = await scanRepository(repo, options);
@@ -158,14 +170,56 @@ test('real npm scan produces actionable plans and preserves audit failures', asy
     assert.equal(branch.baseCommit, baseCommit);
     assert.equal(branch.status, 'ready');
     assert.equal(branch.packages[0].status, 'ready');
-    assert.ok(branch.packages[0].findings.some((finding) => finding.cve === 'CVE-2026-12345'));
+    assert.ok(branch.packages[0].findings.some((finding) => finding.cves.includes('CVE-2026-12345')));
     assert.ok(branch.actions.some((action) => action.type === 'update-dependency'
       && action.package === fixturePackage && action.expectedRange === '1.0.0' && action.targetRange === '1.0.1'));
+    assert.ok(registry.requests.some((request) => request.method === 'GET' && request.path.startsWith(`/${fixturePackage}`)),
+      'scan resolves the branch npm release catalog while the worktree registry config is active');
     assert.equal(JSON.parse(fs.readFileSync(path.join(repo, 'package.json'))).dependencies[fixturePackage], '1.0.0');
+    const collectionPath = path.join(options.reportsDir, 'debug-collection-npm-audit.json');
+    const collection = JSON.parse(fs.readFileSync(collectionPath, 'utf8'));
+    const collectedBranch = collection.branches[0];
+    assert.equal(collectedBranch.branch, 'main');
+    assert.equal(collectedBranch.baseCommit, baseCommit);
+    assert.equal(collection.repository.fullName, 'local/repo');
+    assert.equal(collectedBranch.packages[0].packageName, fixturePackage);
+    assert.deepEqual(collectedBranch.packages[0].installedVersions, ['1.0.0']);
+    assert.equal(collectedBranch.packages[0].instances[0].location, `node_modules/${fixturePackage}`);
+    assert.equal(collectedBranch.packages[0].instances[0].origins[0].packageJsonPath, 'package.json');
+    assert.deepEqual(collectedBranch.packages[0].findings.flatMap(({ cves }) => cves), ['CVE-2026-12345']);
+    assert.equal('pkgLock' in collectedBranch, false);
+    assert.equal('arboristTree' in collectedBranch, false);
+    const blendedPath = path.join(options.reportsDir, 'debug-blended.json');
+    const blended = JSON.parse(fs.readFileSync(blendedPath, 'utf8'));
+    assert.deepEqual(blended.repository, collection.repository);
+    const [blendedBranch] = blended.branches;
+    assert.equal(blendedBranch.branch, 'main');
+    assert.equal(blendedBranch.baseCommit, baseCommit);
+    assert.equal('pkgLock' in blendedBranch, false);
+    assert.equal('arboristTree' in blendedBranch, false);
+    const [blendedPackage] = blendedBranch.packages;
+    assert.equal(blendedPackage.packageName, fixturePackage);
+    assert.deepEqual(blendedPackage.findings, branch.packages[0].findings);
+    const reportPackage = result.report.branches[0].vulnerabilities.find(({ packageName }) => packageName === fixturePackage);
+    assert.deepEqual(blendedPackage.findings, reportPackage.findings);
+    assert.deepEqual(blendedPackage.affectedVersions, reportPackage.affectedVersions);
+    assert.ok(blendedPackage.affectedVersions.some(({ vulnerableRange, firstPatchedVersion }) =>
+      vulnerableRange && firstPatchedVersion === '1.0.1'));
+    assert.deepEqual(blendedPackage.affectedVersions, blendedPackage.findings
+      .flatMap(({ constraints }) => constraints)
+      .filter((constraint, index, all) => all.findIndex((other) =>
+        other.vulnerableRange === constraint.vulnerableRange
+        && other.firstPatchedVersion === constraint.firstPatchedVersion) === index));
     registry.state.failAudit = true;
     const failed = await scanRepository(repo, options);
     assert.equal(failed.remediationPlan.branches[0].status, 'blocked');
     assert.ok(failed.remediationPlan.branches[0].blockers.some((reason) => /audit/i.test(reason)));
+    const failedCollection = JSON.parse(fs.readFileSync(collectionPath, 'utf8'));
+    assert.deepEqual(failedCollection.branches[0].packages, []);
+    assert.match(failedCollection.branches[0].error, /audit/i);
+    const failedBlended = JSON.parse(fs.readFileSync(blendedPath, 'utf8'));
+    assert.deepEqual(failedBlended.branches[0].packages, []);
+    assert.match(failedBlended.branches[0].error, /audit/i);
   } finally {
     for (const [key, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -389,7 +443,7 @@ test('override-only selection fixes a range-forbidden transitive package without
     assert.deepEqual(result.selection.selectedPackages, [fixturePackage]);
     const manifest = JSON.parse((await execGit(['show', `${result.head}:package.json`], repo)).stdout);
     const fixedLock = JSON.parse((await execGit(['show', `${result.head}:package-lock.json`], repo)).stdout);
-    assert.equal(manifest.overrides[holder][fixturePackage], '1.0.1');
+    assert.equal(manifest.overrides[`${holder}@1.0.0`][`${fixturePackage}@1.0.x`], '1.0.1');
     assert.equal(manifest.dependencies[fixturePackage], undefined);
     assert.equal(manifest.dependencies[otherPackage], '1.0.0');
     assert.equal(fixedLock.packages[`node_modules/${fixturePackage}`].version, '1.0.1');

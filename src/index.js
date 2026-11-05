@@ -7,8 +7,10 @@ import {
   withWorktree,
   execGit,
 } from './core/git-manager.js';
-import { readPackageJson, readPackageLock, runNpmLs, findWorkspacePackageJsons, loadArboristTree } from './core/dependency-graph.js';
-import { collectNpmAudit } from './collectors/npm-audit.js';
+import { readPackageJson, readPackageLock, runNpmLs, findWorkspacePackageJsons, loadArboristTree, getPackageInstances } from './core/dependency-graph.js';
+import { isVersionSafe } from './core/advisory-evidence.js';
+import { fetchPublishedVersions } from './collectors/npm-versions.js';
+import { collectNpmAudit, groupNpmAuditByBranch } from './collectors/npm-audit.js';
 import { fetchJiraCveTickets, groupJiraTicketsByBranch } from './collectors/jira.js';
 import { fetchDependabotAlerts, groupDependabotAlertsByBranch } from './collectors/dependabot.js';
 import { blendVulnerabilitySources } from './core/blender.js';
@@ -19,10 +21,31 @@ import { readRemediationPlan, executeRemediationPlan } from './core/plan-executo
 
 export function saveDebugCollection(collectorName, data, reportsDir) {
   fs.mkdirSync(reportsDir, { recursive: true });
-  const filename = `security-${collectorName}-collection.json`;
+  const filename = `debug-collection-${collectorName}.json`;
   const filePath = path.resolve(reportsDir, filename);
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
   console.log(`🐛 [Debug] Saved ${collectorName} collection: ${filePath}`);
+  return filePath;
+}
+
+export function saveDebugBlended(repository, branches, reportsDir) {
+  const projection = {
+    repository,
+    branches: branches.map(({ branch, baseCommit, error, vulnerabilities = [] }) => ({
+      branch,
+      ...(baseCommit !== undefined ? { baseCommit } : {}),
+      ...(error !== undefined ? { error } : {}),
+      packages: vulnerabilities.map(({ packageName, findings, affectedVersions }) => ({
+        packageName,
+        findings,
+        affectedVersions,
+      })),
+    })),
+  };
+  fs.mkdirSync(reportsDir, { recursive: true });
+  const filePath = path.resolve(reportsDir, 'debug-blended.json');
+  fs.writeFileSync(filePath, JSON.stringify(projection, null, 2), 'utf8');
+  console.log(`🐛 [Debug] Saved blended evidence: ${filePath}`);
   return filePath;
 }
 
@@ -39,6 +62,7 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
   // Step 1: Ensure repository in REPOS/
   const repoInfo = await ensureRepo(targetRepo, config);
   console.log(`✅ [Scan] Local repo ready at: ${repoInfo.repoPath}`);
+  const repository = { org: repoInfo.org, name: repoInfo.name, fullName: repoInfo.fullName };
 
   // Determine branches to scan
   let branchesToScan = Array.isArray(config.defaultBranches)
@@ -60,8 +84,8 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
 
   // Fetch external sources conditionally
   const jiraPromise = config.collectors.jira
-    ? fetchJiraCveTickets(config, { maxResults: 100, branches: branchesToScan })
-    : Promise.resolve(groupJiraTicketsByBranch([], branchesToScan, config.branchMap));
+    ? fetchJiraCveTickets(config, { maxResults: 100, branches: branchesToScan, repository })
+    : Promise.resolve(groupJiraTicketsByBranch([], branchesToScan, config.branchMap, repository));
 
   const dependabotPromise = config.collectors.dependabot
     ? fetchDependabotAlerts({
@@ -70,9 +94,9 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
         githubToken: config.githubToken,
         githubApiUrl: config.githubApiUrl,
         branches: branchesToScan,
-        defaultBranch: branchesToScan[0] || 'main',
+        repository,
       })
-    : Promise.resolve(groupDependabotAlertsByBranch([], branchesToScan));
+    : Promise.resolve(groupDependabotAlertsByBranch([], branchesToScan, 'main', repository));
 
   const [jiraTickets, dependabotAlerts] = await Promise.all([jiraPromise, dependabotPromise]);
 
@@ -82,31 +106,25 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
     console.log(`📡 [Scan] Fetched ${jiraCount} Jira CVE ticket(s) and ${dependabotCount} Dependabot alert(s) across ${branchesToScan.length} branch(es)`);
   }
 
-  // Run branch inspection and audit
+  // Blend and query registries while each branch worktree and its npm configuration are live.
   const rawBranchReports = [];
+  const blendedBranches = [];
+  const publishedVersionsByBranch = new Map();
+  const blenderOptions = { jiraTickets, dependabotAlerts, branchMap: config.branchMap };
   for (const branch of branchesToScan) {
     console.log(`🔬 [Scan] Inspecting branch: ${branch}`);
     try {
-      const branchReport = await withWorktree(repoInfo.repoPath, branch, async (worktreeDir) => {
+      const result = await withWorktree(repoInfo.repoPath, branch, async (worktreeDir) => {
         const { stdout: baseCommit } = await execGit(['rev-parse', 'HEAD'], worktreeDir);
         const pkgJson = readPackageJson(worktreeDir);
         const pkgLock = readPackageLock(worktreeDir);
         const workspaces = findWorkspacePackageJsons(worktreeDir, pkgJson);
-
         let arboristTree = null;
-        try {
-          arboristTree = await loadArboristTree({ dir: worktreeDir });
-        } catch {
-          // ignore
-        }
+        try { arboristTree = await loadArboristTree({ dir: worktreeDir }); } catch { /* unavailable */ }
 
         let npmLsData = null;
         if (!arboristTree) {
-          try {
-            npmLsData = await runNpmLs(worktreeDir);
-          } catch {
-            // ignore
-          }
+          try { npmLsData = await runNpmLs(worktreeDir); } catch { /* unavailable */ }
         }
 
         const audit = config.collectors.npmAudit
@@ -116,51 +134,56 @@ export async function scanRepository(repoSpec, cliOptions = {}) {
               arboristTree,
             })
           : { summary: { critical: 0, high: 0, moderate: 0, low: 0, total: 0 }, vulnerabilities: [] };
-
-        return {
-          ...audit,
-          branch,
-          baseCommit,
-          pkgJson,
-          pkgLock,
-          npmLsData,
-          workspaces,
-          arboristTree,
-          worktreeDir,
+        const raw = {
+          ...audit, branch, baseCommit, pkgJson, pkgLock, npmLsData, workspaces, arboristTree, worktreeDir,
         };
+        const blended = blendVulnerabilitySources([raw], blenderOptions)[0];
+        const packagesNeedingCatalog = new Set();
+        for (const vulnerability of blended.vulnerabilities || []) {
+          const packageName = vulnerability.packageName;
+          if (!packageName) continue;
+          const findings = vulnerability.findings;
+          if (getPackageInstances(packageName, raw).some((instance) => isVersionSafe(instance.installedVersion, findings) !== true)) {
+            packagesNeedingCatalog.add(packageName);
+          }
+        }
+        const versions = await fetchPublishedVersions(worktreeDir, [...packagesNeedingCatalog]);
+        return { raw, blended, versions };
       }, { snapshot: true });
-      rawBranchReports.push(branchReport);
+      rawBranchReports.push(result.raw);
+      blendedBranches.push(result.blended);
+      publishedVersionsByBranch.set(branch, result.versions);
     } catch (err) {
       console.warn(`⚠️ [Scan] Failed to inspect branch ${branch}: ${err.message}`);
-      rawBranchReports.push({
+      const failed = {
         branch,
         error: err.message,
         summary: { critical: 0, high: 0, moderate: 0, low: 0, total: 0 },
         vulnerabilities: [],
-      });
+      };
+      rawBranchReports.push(failed);
+      blendedBranches.push(failed);
+      publishedVersionsByBranch.set(branch, new Map());
     }
   }
-  // Save raw collector outputs in debug mode
+
   if (config.debug) {
     saveDebugCollection('jira', jiraTickets, config.reportsDir);
     saveDebugCollection('dependabot', dependabotAlerts, config.reportsDir);
-    saveDebugCollection('npm-audit', rawBranchReports, config.reportsDir);
+    saveDebugCollection('npm-audit', groupNpmAuditByBranch(rawBranchReports, repository), config.reportsDir);
+    saveDebugBlended(repository, blendedBranches, config.reportsDir);
   }
-  // Blend sources
-  console.log(`🔄 [Scan] Blending audit findings with Jira and Dependabot...`);
-  const blendedBranches = blendVulnerabilitySources(rawBranchReports, {
-    jiraTickets,
-    dependabotAlerts,
-    branchMap: config.branchMap,
-  });
-
+  console.log(`🔄 [Scan] Blended branch findings and resolved published version catalogs.`);
   const report = generateJsonReport(repoInfo, blendedBranches);
 
-  // Write reports
   const jsonPath = writeJsonReport(report, config.reportsDir);
   const mdPath = writeMarkdownReport(report, config.reportsDir);
-  const remediationPlan = generateRemediationPlan(report, { allowOverrides: config.allowOverrides });
+  const remediationPlan = generateRemediationPlan(report, {
+    allowOverrides: config.allowOverrides,
+    publishedVersionsByBranch,
+  });
   const remediationPlanPath = writeRemediationPlan(remediationPlan, config.reportsDir);
+
 
   console.log(`\n📄 [Scan] Intermediate JSON report generated: ${jsonPath}`);
   console.log(`📝 [Scan] Human-readable Markdown report generated: ${mdPath}`);

@@ -66,27 +66,33 @@ export function selectRemediationBranches(plan, config = {}) {
       }
       if (reasons.length) {
         pkg.status = 'skipped';
-        pkg.actions = [];
         pkg.reasons = [...new Set([...(pkg.reasons || []), ...reasons])];
       }
     }
     const selected = branch.packages.filter((pkg) => pkg.status === 'ready');
     const selectedNames = new Set(selected.map((pkg) => pkg.packageName));
-    const findingsByPackage = new Map(selected.map((pkg) => [pkg.packageName, new Set(pkg.findings.map((finding) => finding.id))]));
+    const selectedFindings = new Set(selected.flatMap((pkg) => pkg.findings.map((finding) => finding.id)));
+    const selectedResolutions = new Set(selected.flatMap((pkg) => pkg.resolutions.map((resolution) => resolution.id)));
+    const excluded = branch.packages.filter((pkg) => !selectedNames.has(pkg.packageName));
+    const excludedFindings = new Set(excluded.flatMap((pkg) => pkg.findings.map((finding) => finding.id)));
+    const excludedResolutions = new Set(excluded.flatMap((pkg) => pkg.resolutions.map((resolution) => resolution.id)));
+    const pruneReferences = (references, selectedReferences, excludedReferences, kind) => references.filter((id) => {
+      if (selectedReferences.has(id)) return true;
+      if (excludedReferences.has(id)) return false;
+      throw new Error(`Canonical action on ${branch.branch} has no matching selected ${kind} references.`);
+    });
     const sharedPackages = new Set();
     branch.actions = canonicalActions.filter((action) => action.packageNames.some((name) => selectedNames.has(name))).map((action) => {
       for (const name of action.packageNames) if (!selectedNames.has(name)) sharedPackages.add(name);
-      if (!selectedNames.has(action.package)) sharedPackages.add(action.package);
       const packageNames = action.packageNames.filter((name) => selectedNames.has(name));
-      const findings = new Set(packageNames.flatMap((name) => [...findingsByPackage.get(name)]));
-      const findingIds = action.findingIds.filter((id) => findings.has(id));
+      const findingIds = pruneReferences(action.findingIds, selectedFindings, excludedFindings, 'finding');
+      const resolutionIds = pruneReferences(action.resolutionIds, selectedResolutions, excludedResolutions, 'resolution');
       if (!findingIds.length) throw new Error(`Canonical action for ${packageNames.join(', ')} on ${branch.branch} has no matching selected finding references.`);
-      return { ...action, packageNames, findingIds };
+      if (!resolutionIds.length) throw new Error(`Canonical action for ${packageNames.join(', ')} on ${branch.branch} has no matching selected resolution references.`);
+      return { ...action, packageNames, findingIds, resolutionIds };
     });
     for (const pkg of branch.packages) {
-      if (pkg.status === 'ready') {
-        pkg.actions = structuredClone(branch.actions.filter((action) => action.packageNames.includes(pkg.packageName)));
-      } else if (pkg.status === 'skipped' && sharedPackages.has(pkg.packageName)) {
+      if (pkg.status === 'skipped' && sharedPackages.has(pkg.packageName)) {
         pkg.reasons = [...new Set([...(pkg.reasons || []), 'A retained shared action may also affect this package; it remains skipped and is not counted as fixed.'])];
       }
     }

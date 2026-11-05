@@ -49,11 +49,13 @@ function findingReferences(finding) {
       for (const child of value) visit(child, label);
     } else if (value && typeof value === 'object') {
       const kind = oneLine(list(value.source || value.type).join(' '));
-      if (/jira/i.test(kind) || value.ticketKey) label = 'Jira';
-      else if (/dependabot/i.test(kind) || value.alertNumber !== undefined) label = 'Dependabot';
+      const jira = /jira/i.test(kind) || value.ticketKey !== undefined;
+      const dependabot = /dependabot/i.test(kind) || value.alertNumber !== undefined;
+      if (jira) label = 'Jira';
+      else if (dependabot) label = 'Dependabot';
       else if (/npm.?audit/i.test(kind)) label = 'npm audit';
-      const keys = list(value.ticketKey).map(oneLine).filter(Boolean);
-      const alerts = list(value.alertNumber).map(oneLine).filter(Boolean);
+      const keys = list(value.ticketKey ?? (jira ? value.id : undefined)).map(oneLine).filter(Boolean);
+      const alerts = list(value.alertNumber ?? (dependabot ? value.id : undefined)).map(oneLine).filter(Boolean);
       if (label === 'Jira' && keys.length) label += ` ${keys.join(', ')}`;
       if (label === 'Dependabot' && alerts.length) label += ` #${alerts.join(', #')}`;
       for (const [key, child] of Object.entries(value)) {
@@ -66,10 +68,9 @@ function findingReferences(finding) {
     }
   };
   visit(finding.id);
-  visit(finding.cve);
   visit(finding.cves);
   addLink(finding.url, 'Advisory');
-  visit(finding.sources);
+  visit(finding.references);
   for (const id of identifiers) addLink(id.startsWith('CVE-') ? `https://nvd.nist.gov/vuln/detail/${id}` : `https://github.com/advisories/${id}`, id);
   return [...links].map(([url, labels]) => `[${text([...labels].join(' / '))}](${url.replace(/[()<>]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)})`);
 }
@@ -79,13 +80,44 @@ function appendFindings(lines, findings, indent = '') {
     if (!finding || typeof finding !== 'object') continue;
     const id = finding.id ? ` (${code(finding.id)})` : '';
     lines.push(`${indent}- **${text(finding.severity || 'unknown').toUpperCase()}**: ${text(finding.title || 'Security finding')}${id}`);
-    if (finding.vulnerableVersionRange) lines.push(`${indent}  - Vulnerable range: ${code(finding.vulnerableVersionRange)}.`);
-    const patched = list(finding.patchedVersions).filter(Boolean);
-    if (patched.length) lines.push(`${indent}  - Advisory patched versions: ${patched.map(code).join(', ')}.`);
+    for (const constraint of list(finding.constraints)) {
+      if (!constraint || typeof constraint !== 'object') continue;
+      if (constraint.vulnerableRange) lines.push(`${indent}  - Affected range: ${code(constraint.vulnerableRange)}.`);
+      if (constraint.firstPatchedVersion) lines.push(`${indent}  - Advisory patch floor: ${code(constraint.firstPatchedVersion)}.`);
+    }
     const references = findingReferences(finding);
     if (references.length) lines.push(`${indent}  - References: ${references.join(', ')}.`);
-    const cves = [...new Set([...list(finding.cve), ...list(finding.cves)].filter(Boolean))];
-    if (cves.length) lines.push(`${indent}  - CVEs: ${cves.map(code).join(', ')}.`);
+    if (list(finding.cves).length) lines.push(`${indent}  - CVEs: ${list(finding.cves).map(code).join(', ')}.`);
+  }
+}
+
+function appendResolutions(lines, pkg, indent = '') {
+  const resolutions = list(pkg.resolutions).filter((resolution) => resolution && typeof resolution === 'object');
+  if (!resolutions.length) {
+    lines.push(`${indent}- No installed-version resolution details were recorded.`);
+    return;
+  }
+  lines.push(`${indent}- Per-installed-version resolutions:`);
+  for (const resolution of resolutions) {
+    const installed = code(resolution.installedVersion || 'unknown');
+    const line = resolution.line ? ` (${code(`${resolution.line}.x`)})` : '';
+    const target = resolution.targetVersion ? code(resolution.targetVersion) : 'no safe target recorded';
+    const outcome = resolution.status === 'ready'
+      ? `→ ${target} via ${code(resolution.strategy || 'unknown strategy')}`
+      : resolution.status === 'resolved' ? 'already safe; no update planned'
+        : `${text(resolution.status || 'unresolved')}${resolution.targetVersion ? `; candidate target ${target}` : ''}`;
+    lines.push(`${indent}  - ${installed}${line}: ${outcome}.`);
+    for (const reason of list(resolution.reasons)) lines.push(`${indent}    - ${text(reason)}`);
+    for (const instance of list(resolution.instances)) {
+      if (!instance || typeof instance !== 'object') continue;
+      lines.push(`${indent}    - Installed at ${code(instance.location || 'location not recorded')}.`);
+      for (const origin of list(instance.origins)) {
+        if (!origin || typeof origin !== 'object') continue;
+        const source = `${origin.workspace ? `${origin.workspace} (` : ''}${origin.packageJsonPath || 'package.json'}${origin.workspace ? ')' : ''} / ${origin.section || 'dependency'}`;
+        const chain = list(origin.chain).map((link) => link?.name && link?.version ? `${link.name}@${link.version}` : null).filter(Boolean).join(' → ');
+        lines.push(`${indent}      - Origin: ${code(source)}${chain ? `: ${code(chain)}` : ''}.`);
+      }
+    }
   }
 }
 
@@ -117,9 +149,8 @@ export function generatePullRequestBody(branchPlan, executionResult = {}) {
   for (const pkg of ready) {
     lines.push(`### ${code(pkg.packageName)}`, '');
     const before = list(pkg.installedVersions).filter(Boolean);
-    lines.push(`- Scanned installed versions: ${before.length ? before.map(code).join(', ') : pkg.currentVersion ? code(pkg.currentVersion) : 'not recorded'}.`);
-    lines.push(`- Planned safe target: ${pkg.targetSafeVersion ? code(pkg.targetSafeVersion) : 'see individual actions'}.`);
-    for (const dependencyPath of list(pkg.dependencyPaths)) lines.push(`- Dependency path: ${code(dependencyPath)}.`);
+    lines.push(`- Scanned installed versions: ${before.length ? before.map(code).join(', ') : 'not recorded'}.`);
+    appendResolutions(lines, pkg);
     appendFindings(lines, pkg.findings);
     lines.push('');
   }
@@ -130,6 +161,7 @@ export function generatePullRequestBody(branchPlan, executionResult = {}) {
     lines.push(`- ${actionDescription(action)}`);
     if (action.packageNames?.length) lines.push(`  - Motivating packages: ${action.packageNames.map(code).join(', ')}.`);
     if (action.findingIds?.length) lines.push(`  - Motivating findings: ${action.findingIds.map(code).join(', ')}.`);
+    if (action.resolutionIds?.length) lines.push(`  - Covered installed resolutions: ${action.resolutionIds.map(code).join(', ')}.`);
   }
   lines.push('', '## Execution and verification', '');
   if (executionResult.dryRun === true) {
@@ -185,6 +217,7 @@ export function generatePullRequestBody(branchPlan, executionResult = {}) {
     for (const reason of list(pkg.reasons)) lines.push(`- ${text(reason)}`);
     if (pkg.status === 'resolved') lines.push('- Already marked resolved in the saved scan; no new fix is claimed here.');
     if (pkg.status === 'not-installed') lines.push('- Not installed in the saved scan; no remediation was planned.');
+    if (list(pkg.resolutions).length) appendResolutions(lines, pkg);
     appendFindings(lines, pkg.findings);
     lines.push('');
   }

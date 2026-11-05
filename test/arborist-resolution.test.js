@@ -9,6 +9,9 @@ import {
   lookupPackageInstalledInfo,
   traceArboristChains,
   findDirectRootsFromArborist,
+  getPackageInstances,
+  buildDependencyInventory,
+
 } from '../src/core/dependency-graph.js';
 import {
   canBeResolvedInLockfile,
@@ -783,4 +786,192 @@ test('generateMarkdownReport: renders Remediation Plan section heading', () => {
   });
   assert.ok(md.includes('##### Remediation Plan'));
   assert.ok(md.includes('- **Fix Strategy:** bump-direct'));
+});
+
+test('getPackageInstances: keeps physical versions, incoming edges, and every root/workspace origin', async () => {
+  const pkgJson = {
+    name: 'mono-root',
+    workspaces: ['packages/*'],
+    dependencies: { 'parent-a': '^1.0.0', 'parent-b': '^2.0.0' },
+  };
+  const workspaceManifest = { name: '@mono/app', version: '1.0.0', dependencies: { 'parent-a': '^1.0.0' } };
+  const pkgLock = {
+    name: 'mono-root', lockfileVersion: 3,
+    packages: {
+      '': { dependencies: pkgJson.dependencies },
+      'node_modules/@mono/app': { resolved: 'packages/app', link: true },
+      'packages/app': { name: '@mono/app', version: '1.0.0', dependencies: workspaceManifest.dependencies },
+      'node_modules/parent-a': { version: '1.0.0', dependencies: { widget: '^1.0.0' } },
+      'node_modules/parent-b': { version: '2.0.0', dependencies: { widget: '^2.0.0' } },
+      'node_modules/widget': { version: '1.0.1' },
+      'node_modules/parent-b/node_modules/widget': { version: '2.0.1' },
+    },
+  };
+  const tree = await loadArboristTree({ pkgJson, pkgLock });
+  assert.ok(tree);
+  const branch = {
+    pkgJson, pkgLock, arboristTree: tree,
+    workspaces: [{ name: '@mono/app', relativePath: 'packages/app/package.json', pkgJson: workspaceManifest }],
+  };
+  const instances = getPackageInstances('widget', branch);
+  assert.deepEqual(instances.map(({ installedVersion }) => installedVersion), ['1.0.1', '2.0.1']);
+  const first = instances.find((instance) => instance.installedVersion === '1.0.1');
+  assert.equal(first.incoming.length, 1);
+  assert.deepEqual(first.incoming[0], {
+    parentName: 'parent-a', parentVersion: '1.0.0', parentLocation: 'node_modules/parent-a',
+    requestedRange: '^1.0.0', effectiveRange: '^1.0.0', type: 'prod',
+  });
+  assert.deepEqual(new Set(first.origins.map((origin) => origin.packageJsonPath)), new Set(['package.json', 'packages/app/package.json']));
+  assert.ok(first.origins.every((origin) => origin.chain.at(-1).name === 'widget'));
+  assert.equal(instances.find((instance) => instance.installedVersion === '2.0.1').origins[0].chain[0].requiredRange, '^2.0.0');
+
+  const fallback = getPackageInstances('widget', { pkgJson, pkgLock, workspaces: branch.workspaces });
+  assert.deepEqual(fallback.map((instance) => [instance.installedVersion, instance.location]), instances.map((instance) => [instance.installedVersion, instance.location]));
+  const inventory = buildDependencyInventory(branch);
+  assert.equal(inventory.raw, true);
+});
+
+test('lookupPackageInstalledInfo: preserves hoisted origins, scoped roots, physical parent copies, and numeric version order', async () => {
+  const pkgJson = {
+    name: 'multi-origin-root',
+    workspaces: ['packages/*'],
+    dependencies: { '@scope/tool': '^1.0.0', entry: '^1.0.0', collector: '^1.0.0' },
+  };
+  const workspaceManifest = {
+    name: '@scope/app',
+    version: '1.0.0',
+    devDependencies: { '@scope/tool': '^2.0.0', entry: '^1.0.0' },
+  };
+  const workspaces = [{
+    name: workspaceManifest.name,
+    relativePath: 'packages/app/package.json',
+    pkgJson: workspaceManifest,
+    isRoot: false,
+  }];
+  for (const lockfileVersion of [2, 3]) {
+    const pkgLock = {
+      name: pkgJson.name,
+      lockfileVersion,
+      packages: {
+        '': { ...pkgJson },
+        'node_modules/@scope/app': { resolved: 'packages/app', link: true },
+        'packages/app': { ...workspaceManifest },
+        'node_modules/@scope/tool': { version: '1.0.0', dependencies: { bridge: '^1.0.0' } },
+        'packages/app/node_modules/@scope/tool': { version: '2.0.0', dependencies: { bridge: '^2.0.0' } },
+        'node_modules/entry': { version: '1.0.0', dependencies: { shared: '^1.0.0' } },
+        'node_modules/shared': { version: '1.0.0', dependencies: { bridge: '^1.0.0' } },
+        'node_modules/bridge': { version: '1.0.0', dependencies: { widget: '^3.4.0', entry: '^1.0.0' } },
+        'packages/app/node_modules/@scope/tool/node_modules/bridge': {
+          version: '2.0.0', dependencies: { widget: '~3.4.8' },
+        },
+        'node_modules/widget': { version: '3.4.15' },
+        'packages/app/node_modules/@scope/tool/node_modules/bridge/node_modules/widget': { version: '3.4.8' },
+        'node_modules/collector': { version: '1.0.0', dependencies: { widget: '~3.4.17' } },
+        'node_modules/collector/node_modules/widget': { version: '3.4.17' },
+      },
+    };
+    const tree = await loadArboristTree({ pkgJson, pkgLock });
+    assert.ok(tree);
+    const live = lookupPackageInstalledInfo('widget', pkgJson, pkgLock, null, workspaces, tree);
+    const snapshot = lookupPackageInstalledInfo('widget', pkgJson, pkgLock, null, workspaces);
+    assert.deepEqual(snapshot.chains, live.chains);
+    for (const info of [live, snapshot]) {
+      assert.deepEqual(info.installedVersions, ['3.4.8', '3.4.15', '3.4.17']);
+      assert.equal(info.currentVersion, '3.4.8, 3.4.15, 3.4.17');
+      const hoistedChains = info.chains.filter((chain) => chain.at(-1).location === 'node_modules/widget');
+      assert.deepEqual(new Set(hoistedChains.map((chain) => JSON.stringify([
+        chain[0].packageJsonPath, chain[1].name,
+      ]))), new Set([
+        '["package.json","@scope/tool"]',
+        '["package.json","entry"]',
+        '["packages/app/package.json","entry"]',
+      ]));
+      assert.ok(info.chains.every((chain) => new Set(chain.map((link) => link.location)).size === chain.length));
+      const scopedRoots = info.directRoots.filter((root) => root.name === '@scope/tool');
+      assert.deepEqual(new Set(scopedRoots.map((root) => JSON.stringify([
+        root.packageJsonPath, root.installedVersion, root.currentRange, root.section, root.location,
+      ]))), new Set([
+        '["package.json","1.0.0","^1.0.0","dependencies","node_modules/@scope/tool"]',
+        '["packages/app/package.json","2.0.0","^2.0.0","devDependencies","packages/app/node_modules/@scope/tool"]',
+      ]));
+      const paths = formatTransitiveDependencyPaths({
+        packageName: 'widget',
+        directRoots: info.directRoots,
+        dependencyChains: info.chains,
+        dependencyPaths: info.dependencyPaths,
+      });
+      assert.ok(paths.includes('package.json/dependencies/@scope/tool/.../widget@3.4.15 (^3.4.0)'));
+      assert.ok(paths.includes('package.json/dependencies/entry/.../widget@3.4.15 (^3.4.0)'));
+      assert.ok(paths.includes('packages/app/package.json/devDependencies/entry/.../widget@3.4.15 (^3.4.0)'));
+      assert.ok(paths.includes('packages/app/package.json/devDependencies/@scope/tool/.../widget@3.4.8 (~3.4.8)'));
+    }
+    const withoutWorkspaceManifests = lookupPackageInstalledInfo('widget', pkgJson, pkgLock);
+    assert.deepEqual(withoutWorkspaceManifests.chains, snapshot.chains);
+    for (const branch of [{ pkgJson, pkgLock, workspaces }, { pkgJson, pkgLock, workspaces, arboristTree: tree }]) {
+      const instances = getPackageInstances('widget', branch);
+      assert.equal(instances.length, 3);
+      assert.equal(instances.find((instance) => instance.location === 'node_modules/widget').origins.length, 3);
+      assert.ok(instances.every((instance) => instance.origins.every((origin) => origin.chain.at(-1).location === instance.location)));
+    }
+  }
+});
+
+test('lookupPackageInstalledInfo: sorts every nested lockfile-v1 copy and traces its actual parent', () => {
+  const pkgJson = { dependencies: { first: '^1.0.0', second: '^1.0.0', widget: '3.4.17' } };
+  const pkgLock = {
+    lockfileVersion: 1,
+    dependencies: {
+      first: {
+        version: '1.0.0', requires: { widget: '^3.4.0' },
+        dependencies: { widget: { version: '3.4.15' } },
+      },
+      second: {
+        version: '1.0.0', requires: { widget: '~3.4.8' },
+        dependencies: { widget: { version: '3.4.8' } },
+      },
+      widget: { version: '3.4.17' },
+    },
+  };
+  const info = lookupPackageInstalledInfo('widget', pkgJson, pkgLock);
+  assert.deepEqual(info.installedVersions, ['3.4.8', '3.4.15', '3.4.17']);
+  assert.equal(info.currentVersion, '3.4.8, 3.4.15, 3.4.17');
+  assert.equal(info.dependencyType, 'Direct & Indirect');
+  assert.deepEqual(new Set(info.chains.map((chain) => JSON.stringify(chain.slice(1).map((link) => link.location)))), new Set([
+    '["node_modules/first","node_modules/first/node_modules/widget"]',
+    '["node_modules/second","node_modules/second/node_modules/widget"]',
+    '["node_modules/widget"]',
+  ]));
+});
+
+test('lookupPackageInstalledInfo: does not merge equal leaf versions at different physical locations', async () => {
+  const pkgJson = { name: 'physical-copies', dependencies: { parent: '^1.0.0', runner: '^1.0.0' } };
+  const pkgLock = {
+    name: pkgJson.name,
+    lockfileVersion: 3,
+    packages: {
+      '': pkgJson,
+      'node_modules/parent': { version: '1.0.0', dependencies: { widget: '^1.0.0' } },
+      'node_modules/runner': { version: '1.0.0', dependencies: { parent: '^2.0.0' } },
+      'node_modules/runner/node_modules/parent': { version: '2.0.0', dependencies: { widget: '~1.0.0' } },
+      'node_modules/widget': { version: '1.0.1' },
+      'node_modules/runner/node_modules/parent/node_modules/widget': { version: '1.0.1' },
+    },
+  };
+  const tree = await loadArboristTree({ pkgJson, pkgLock });
+  assert.ok(tree);
+  for (const arboristTree of [tree, null]) {
+    const branch = { pkgJson, pkgLock, arboristTree };
+    const instances = getPackageInstances('widget', branch);
+    assert.equal(instances.length, 2);
+    assert.deepEqual(new Set(instances.flatMap((instance) => instance.incoming.map((edge) => JSON.stringify([
+      edge.parentVersion, edge.parentLocation, edge.requestedRange,
+    ])))), new Set([
+      '["1.0.0","node_modules/parent","^1.0.0"]',
+      '["2.0.0","node_modules/runner/node_modules/parent","~1.0.0"]',
+    ]));
+    const info = lookupPackageInstalledInfo('widget', pkgJson, pkgLock, null, null, arboristTree);
+    assert.deepEqual(info.installedVersions, ['1.0.1']);
+    assert.deepEqual(new Set(info.chains.map((chain) => chain.at(-1).location)), new Set(instances.map((instance) => instance.location)));
+    assert.deepEqual(new Set(info.chains.map((chain) => chain.at(-2).version)), new Set(['1.0.0', '2.0.0']));
+  }
 });

@@ -2,8 +2,8 @@ import path from 'node:path';
 import fs from 'node:fs';
 import semver from 'semver';
 import { sortVulnerabilities, isVulnerabilityResolved } from '../core/blender.js';
-import { formatLockfileUpdate } from '../collectors/npm-audit.js';
 import { extractGhsaId } from '../collectors/advisories.js';
+import { normalizeInstalledVersionDisplay } from './json-reporter.js';
 
 export function formatCves(v) {
   const cves = [];
@@ -138,24 +138,28 @@ export function formatTargetFix(v, joiner = '<br>') {
     }
   };
 
-  if (Array.isArray(v.targetSafeVersions)) {
-    for (const ver of v.targetSafeVersions) addVer(ver);
-  }
-  if (Array.isArray(v.patchedVersions)) {
-    for (const ver of v.patchedVersions) addVer(ver);
-  }
-  if (Array.isArray(v.advisories)) {
-    for (const adv of v.advisories) {
-      if (Array.isArray(adv.patchedVersions)) {
-        for (const ver of adv.patchedVersions) addVer(ver);
-      }
-      if (Array.isArray(adv.targetSafeVersions)) {
-        for (const ver of adv.targetSafeVersions) addVer(ver);
-      }
-      if (adv.targetSafeVersion) addVer(adv.targetSafeVersion);
+  if (Array.isArray(v.affectedVersions)) {
+    for (const interval of v.affectedVersions) addVer(interval.firstPatchedVersion);
+  } else {
+    if (Array.isArray(v.targetSafeVersions)) {
+      for (const ver of v.targetSafeVersions) addVer(ver);
     }
+    if (Array.isArray(v.patchedVersions)) {
+      for (const ver of v.patchedVersions) addVer(ver);
+    }
+    if (Array.isArray(v.advisories)) {
+      for (const adv of v.advisories) {
+        if (Array.isArray(adv.patchedVersions)) {
+          for (const ver of adv.patchedVersions) addVer(ver);
+        }
+        if (Array.isArray(adv.targetSafeVersions)) {
+          for (const ver of adv.targetSafeVersions) addVer(ver);
+        }
+        if (adv.targetSafeVersion) addVer(adv.targetSafeVersion);
+      }
+    }
+    if (v.targetSafeVersion) addVer(v.targetSafeVersion);
   }
-  if (v.targetSafeVersion) addVer(v.targetSafeVersion);
 
   if (versions.length === 0) {
     return '_No fix_';
@@ -318,77 +322,57 @@ export function formatDirectDependencyPaths(v) {
   });
 }
 
+function parseDependencyPath(pathStr) {
+  if (/\s\((?:dependencies|devDependencies|optionalDependencies|peerDependencies)\)\s*->/.test(pathStr)) return [];
+  return pathStr.split(/\s*->\s*/).filter(Boolean).map((segment) => {
+    if (segment === '[root]') return { name: '[root]', isRoot: true, packageJsonPath: 'package.json' };
+    const workspace = segment.match(/^(.*?) \(([^)]+\/package\.json)\)$/);
+    if (workspace) return { name: workspace[1], isWorkspace: true, packageJsonPath: workspace[2] };
+    const match = segment.match(/^((?:@[^/\s]+\/)?[^@\s(]+)(?:@([^\s(]+))?(?: \(([^)]+)\))?$/);
+    return match ? { name: match[1], version: match[2], requiredRange: match[3] } : { name: segment };
+  });
+}
+
+function dependencyChainKey(chain) {
+  const anchor = chain[0];
+  const anchored = anchor?.isRoot || anchor?.isWorkspace || anchor?.isWorkspaceRoot;
+  const manifest = anchor?.packageJsonPath || (anchor?.folderPath ? `${anchor.folderPath}/package.json` : 'package.json');
+  return JSON.stringify([manifest, ...(anchored ? chain.slice(1) : chain).map((link) => [link.name, link.version])]);
+}
+
 export function formatTransitiveDependencyPaths(v) {
   const transitivePaths = new Set();
-  const directRootsMap = new Map();
-  for (const root of v.directRoots || []) {
-    directRootsMap.set(root.name, root);
-  }
-
-  // Pre-index chains to look up requiredRange for (directRoot, targetName, version)
   const chains = v.dependencyChains || v.chains || [];
-  const rangeLookup = new Map();
-  for (const c of chains) {
-    if (c.length < 2) continue;
-    const directRoot = c[1]?.name;
-    const target = c[c.length - 1];
-    if (directRoot && target && target.requiredRange) {
-      rangeLookup.set(`${directRoot}:${target.name}:${target.version}`, target.requiredRange);
-      rangeLookup.set(`${directRoot}:${target.name}`, target.requiredRange);
+  const structuredPaths = new Set(chains.map(dependencyChainKey));
+  const allChains = [
+    ...chains,
+    ...(v.dependencyPaths || []).map(parseDependencyPath).filter((chain) => !structuredPaths.has(dependencyChainKey(chain))),
+  ];
+  for (const chain of allChains) {
+    if (chain.length < 2) continue;
+    let anchorIndex = -1;
+    for (let index = 0; index < chain.length - 1; index += 1) {
+      if (chain[index].isRoot || chain[index].isWorkspace || chain[index].isWorkspaceRoot) anchorIndex = index;
     }
-  }
-  for (const pathStr of v.dependencyPaths || []) {
-    if (pathStr.includes(' (dependencies) -> ') || pathStr.includes(' (devDependencies) -> ')) {
-      continue;
+    const anchor = chain[anchorIndex];
+    const directRoot = chain[anchorIndex + 1];
+    const target = chain.at(-1);
+    if (!directRoot?.name || directRoot === target) continue;
+    const manifest = anchor?.packageJsonPath || (anchor?.folderPath ? `${anchor.folderPath}/package.json` : null)
+      || (anchor?.isRoot ? 'package.json' : directRoot.packageJsonPath);
+    const roots = (v.directRoots || []).filter((root) => root.name === directRoot.name
+      && (!manifest || (root.packageJsonPath || 'package.json') === manifest)
+      && (!root.installedVersion || !directRoot.version || root.installedVersion === directRoot.version)
+      && (!root.location || !directRoot.location || root.location === directRoot.location));
+    for (const root of roots.length ? roots : [null]) {
+      const pkgFile = manifest || root?.packageJsonPath || 'package.json';
+      const section = directRoot.type === 'dev' ? 'devDependencies'
+        : directRoot.type === 'optional' ? 'optionalDependencies'
+          : directRoot.type === 'peer' ? 'peerDependencies'
+            : directRoot.type === 'prod' ? 'dependencies' : root?.section || 'dependencies';
+      const targetSegment = `${target.name}@${target.version || 'unknown'}${target.requiredRange ? ` (${target.requiredRange})` : ''}`;
+      transitivePaths.add(`${pkgFile}/${section}/${directRoot.name}/.../${targetSegment}`);
     }
-
-    const segments = pathStr.split(/\s*->\s*/).filter(Boolean);
-    if (segments.length <= 1) continue;
-
-    const firstSeg = segments[0];
-    const wsMatch = firstSeg.match(/\(([^/)]+\/package\.json)\)/);
-
-    let pkgFile = 'package.json';
-    let directRootPkg = null;
-    let targetSegment = segments[segments.length - 1];
-    if (wsMatch) {
-      pkgFile = wsMatch[1];
-      if (segments.length > 1) {
-        directRootPkg = segments[1].split('@')[0];
-      }
-    } else if (firstSeg === '[root]' || firstSeg.startsWith('[root]')) {
-      pkgFile = 'package.json';
-      if (segments.length > 1) {
-        directRootPkg = segments[1].split('@')[0];
-      }
-    } else {
-      directRootPkg = firstSeg.split('@')[0];
-    }
-
-    // Direct dependencies are strictly excluded from transitive paths
-    if (!directRootPkg || directRootPkg === v.packageName || directRootPkg === '[root]') {
-      continue;
-    }
-
-    let section = 'dependencies';
-    if (directRootsMap.has(directRootPkg)) {
-      const rootMeta = directRootsMap.get(directRootPkg);
-      if (rootMeta.section) section = rootMeta.section;
-      if (rootMeta.packageJsonPath && !wsMatch) pkgFile = rootMeta.packageJsonPath;
-    }
-
-    if (!targetSegment.includes('(')) {
-      const parts = targetSegment.split('@');
-      const tName = parts[0];
-      const tVer = parts[1];
-      const lookupKey = `${directRootPkg}:${tName}:${tVer}`;
-      const foundRange = rangeLookup.get(lookupKey) || rangeLookup.get(`${directRootPkg}:${tName}`);
-      if (foundRange) {
-        targetSegment = `${tName}@${tVer} (${foundRange})`;
-      }
-    }
-
-    transitivePaths.add(`${pkgFile}/${section}/${directRootPkg}/.../${targetSegment}`);
   }
 
   return Array.from(transitivePaths).sort((a, b) => {
@@ -458,7 +442,7 @@ export function generateMarkdownReport(report) {
     lines.push(`## 🌿 Branch: \`${b.branch}\``);
     lines.push(``);
 
-    const sortedVulns = [...(b.vulnerabilities || [])].sort(sortVulnerabilities);
+    const sortedVulns = (b.vulnerabilities || []).map(normalizeInstalledVersionDisplay).sort(sortVulnerabilities);
 
     if (sortedVulns.length === 0) {
       lines.push(`✅ **No vulnerable packages found on this branch.**`);
@@ -537,16 +521,19 @@ export function generateMarkdownReport(report) {
       }
 
       // List of individual advisories for this package
-      const advisories = (v.advisories && v.advisories.length > 0) ? v.advisories : [{ title: v.title, url: v.url }];
+      const advisories = v.findings ?? ((v.advisories && v.advisories.length > 0) ? v.advisories : [{ title: v.title, url: v.url }]);
       lines.push(`- **Tracked Advisories & CVEs (${advisories.length}):**`);
       for (const adv of advisories) {
         lines.push("  - " + [
           adv.url ? `[Advisory](${adv.url}) -` : '',
           adv.sources?.jira?.ticketKey ? `[Jira ${adv.sources.jira.ticketKey}](${adv.sources.jira.url}) -` : '',
-          adv.cve ? `\`${adv.cve}\`` : '_(no CVE)_',
+          adv.cves?.length ? adv.cves.map((cve) => `\`${cve}\``).join(', ') : adv.cve ? `\`${adv.cve}\`` : '_(no CVE)_',
           " - ",
           adv.title || 'Security finding',
         ].filter(Boolean).join(' '));
+        for (const interval of adv.constraints || []) {
+          lines.push(`    - Affected: \`${interval.vulnerableRange || 'unknown'}\`; first patched: ${interval.firstPatchedVersion ? `\`${interval.firstPatchedVersion}\`` : 'unknown'}.`);
+        }
       }
       lines.push(``);
 
@@ -613,15 +600,11 @@ export function generateMarkdownReport(report) {
         }
         if (rem.lockfileUpdates && rem.lockfileUpdates.length > 0) {
           lines.push(``);
-          if (rem.strategy === 'lockfile-update' && rem.transientOverrides && rem.transientOverrides.length > 0) {
-            lines.push(`Synchronize lockfile (transient pin):`);
-          } else {
-            lines.push(`Update lockfile:`);
-          }
-          for (const pkgName of rem.lockfileUpdates) {
-            lines.push("```bash");
-            lines.push(`${formatLockfileUpdate(pkgName)}`);
-            lines.push("```");
+          lines.push(`Required lockfile resolution (not a standalone command):`);
+          lines.push(`- Packages to re-resolve: ${rem.lockfileUpdates.map((name) => `\`${name}\``).join(', ')}.`);
+          lines.push(`- Resolve the reviewed targets after approved manifest edits, then verify every affected instance against the final manifest and run the post-change audit. A standalone npm update is not sufficient proof of a transitive fix.`);
+          if (rem.strategy === 'lockfile-update' || rem.transientOverrides?.length) {
+            lines.push(`- For in-range transitive copies, the chosen policy is scoped temporary pins during resolution, followed by removal of generated pins before final verification. That execution policy is not yet implemented; no one-command fix is provided here.`);
           }
         }
       }

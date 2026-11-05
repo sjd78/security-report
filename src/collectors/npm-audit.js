@@ -9,9 +9,11 @@ import {
   findDirectRoots,
   lookupPackageInstalledInfo,
   runNpmLs,
+  getPackageInstances,
 } from '../core/dependency-graph.js';
 import { sortVulnerabilities, pickHighestSafeVersion, selectBestRemediationVersion } from '../core/blender.js';
 import { extractGhsaId, extractCveId, fetchAdvisoryDetails } from './advisories.js';
+import { normalizePlanFindings } from '../core/advisory-evidence.js';
 const execFileAsync = promisify(execFile);
 
 export async function runNpmAuditRaw(cwd) {
@@ -209,6 +211,42 @@ export function formatLockfileUpdate(packageName) {
   return `npm update ${packageName} --package-lock-only`;
 }
 
+function parentUpgradeIsForward(targetVersion, declaration, parentRoots, parentInstances, chains, parentName) {
+  if (!semver.valid(targetVersion)) return false;
+  const currentRange = declaration.range || declaration.currentRange;
+  if (typeof currentRange !== 'string' || !semver.validRange(currentRange)) return false;
+  const minimum = semver.minVersion(currentRange);
+  if (!minimum || !semver.gt(targetVersion, minimum)) return false;
+
+  const file = declaration.packageJsonPath || 'package.json';
+  const section = declaration.section || 'dependencies';
+  const versions = parentInstances.filter((instance) => instance.origins.some((origin) =>
+    origin.packageJsonPath === file && origin.section === section && origin.chain.length === 1))
+    .map((instance) => instance.installedVersion);
+  for (const root of parentRoots) {
+    if ((root.packageJsonPath || 'package.json') === file && (root.section || 'dependencies') === section
+      && root.installedVersion) versions.push(root.installedVersion);
+  }
+  // Unlocated saved chains can rule out an upgrade, but cannot prove which
+  // installed version belongs to a particular workspace declaration.
+  for (const chain of chains) {
+    const anchor = chain.find((link) => link.isRoot || link.isWorkspace);
+    const originFile = anchor?.packageJsonPath || (anchor?.isRoot ? 'package.json'
+      : anchor?.isWorkspace && anchor.location ? `${anchor.location}/package.json` : null);
+    for (const link of chain) {
+      if (link.name !== parentName || !link.version) continue;
+      if (!semver.valid(link.version) || !semver.gt(targetVersion, link.version)) return false;
+      if (originFile === file) versions.push(link.version);
+    }
+  }
+  if (versions.length) {
+    return versions.every((version) => semver.valid(version) && semver.gt(targetVersion, version));
+  }
+  // Without installed evidence, a range's minimum is not an installed version.
+  // Only a target above the entire declared range can be proven an upgrade.
+  return semver.gtr(targetVersion, currentRange);
+}
+
 export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = [], directInfo = null, worktreeDir = null, arboristTree = null) {
   const isDirect = vuln.isDirect;
   const isIndirect = vuln.isIndirect;
@@ -301,14 +339,26 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
 
   // 3. Direct Root Parent Fix Available (npm audit identified parent fix)
   if (fix && typeof fix === 'object' && fix.name && fix.version) {
-    const parentDirectInfo = directRoots.find((r) => r.name === fix.name) || getDirectDependencies(pkgJson, worktreeDir).get(fix.name);
-    const parentDecls = parentDirectInfo?.declarations || (parentDirectInfo ? [parentDirectInfo] : []);
+    const parentRoots = directRoots.filter((root) => root.name === fix.name);
+    const manifestInfo = getDirectDependencies(pkgJson, worktreeDir).get(fix.name);
+    const parentDirectInfo = parentRoots[0] || manifestInfo;
+    const declarationsByOrigin = new Map();
+    for (const info of [manifestInfo, ...parentRoots].filter(Boolean)) {
+      for (const declaration of info.declarations?.length ? info.declarations : [info]) {
+        const key = JSON.stringify([declaration.packageJsonPath || 'package.json', declaration.section || 'dependencies']);
+        if (!declarationsByOrigin.has(key)) declarationsByOrigin.set(key, declaration);
+      }
+    }
+    const parentDecls = [...declarationsByOrigin.values()];
+    const parentInstances = arboristTree ? getPackageInstances(fix.name, { arboristTree }) : [];
+    const isForwardUpgrade = parentDecls.length > 0 && parentDecls.every((declaration) =>
+      parentUpgradeIsForward(fix.version, declaration, parentRoots, parentInstances, chains, fix.name));
 
     let isBreaking = Boolean(fix.isSemVerMajor);
     let isOutOfRange = false;
     const packageJsonChanges = [];
-    for (const decl of parentDecls) {
-      const currentRange = decl.range || decl.currentRange || `^${fix.version}`;
+    for (const decl of isForwardUpgrade ? parentDecls : []) {
+      const currentRange = decl.range || decl.currentRange;
       const prefix = currentRange.startsWith('~') ? '~' : currentRange.startsWith('^') ? '^' : '';
       const targetRange = `${prefix}${fix.version}`;
       const changeIsBreaking = isBreaking || isBreakingChange(currentRange, targetRange);
@@ -434,118 +484,105 @@ export function buildRemediationSuggestion(vuln, directRoots, pkgJson, chains = 
 export async function resolveAuditAdvisories(vulnerabilities = [], options = {}) {
   const { githubToken, githubApiUrl, advisoryCache = new Map() } = options;
 
-  await Promise.all(
-    vulnerabilities.map(async (v) => {
-      const lookupRefs = new Set();
-      if (v.sources?.npmAudit?.url) lookupRefs.add(v.sources.npmAudit.url);
-      if (Array.isArray(v.sources?.npmAudit?.urls)) {
-        for (const u of v.sources.npmAudit.urls) if (u) lookupRefs.add(u);
+  await Promise.all(vulnerabilities.map(async (v) => {
+    const lookupRefs = new Set();
+    if (v.sources?.npmAudit?.url) lookupRefs.add(v.sources.npmAudit.url);
+    for (const url of v.sources?.npmAudit?.urls || []) if (url) lookupRefs.add(url);
+    for (const advisory of v.advisories || []) {
+      if (advisory.url) lookupRefs.add(advisory.url);
+      if (advisory.ghsaId) lookupRefs.add(advisory.ghsaId);
+      if (advisory.id) lookupRefs.add(advisory.id);
+    }
+    if (v.url) lookupRefs.add(v.url);
+    if (v.id) lookupRefs.add(v.id);
+
+    for (const ref of lookupRefs) {
+      const ghsaId = extractGhsaId(ref);
+      const cveId = extractCveId(ref);
+      const lookup = ghsaId || cveId;
+      if (!lookup) continue;
+      const cacheKey = JSON.stringify([lookup, v.packageName || null]);
+      if (!advisoryCache.has(cacheKey)) {
+        advisoryCache.set(cacheKey, fetchAdvisoryDetails(lookup, {
+          githubToken, githubApiUrl, packageName: v.packageName || null,
+        }));
       }
-      if (Array.isArray(v.advisories)) {
-        for (const adv of v.advisories) {
-          if (adv.url) lookupRefs.add(adv.url);
-          if (adv.ghsaId) lookupRefs.add(adv.ghsaId);
-          if (adv.id) lookupRefs.add(adv.id);
-        }
+      const details = await advisoryCache.get(cacheKey);
+      if (!details) continue;
+
+      if (details.cve) {
+        v.cves ||= [];
+        if (!v.cves.includes(details.cve)) v.cves.push(details.cve);
+        if (!v.cve) v.cve = details.cve;
       }
-      if (v.url) lookupRefs.add(v.url);
-      if (v.id) lookupRefs.add(v.id);
-
-      for (const ref of lookupRefs) {
-        const ghsaId = extractGhsaId(ref);
-        const cveId = extractCveId(ref);
-        const lookup = ghsaId || cveId;
-        if (!lookup) continue;
-
-        if (!advisoryCache.has(lookup)) {
-          const advPromise = fetchAdvisoryDetails(lookup, { githubToken, githubApiUrl });
-          advisoryCache.set(lookup, advPromise);
-        }
-
-        const details = await advisoryCache.get(lookup);
-        if (details) {
-          // 1. Populate CVE(s)
-          if (details.cve) {
-            if (!v.cves) v.cves = [];
-            if (!v.cves.includes(details.cve)) v.cves.push(details.cve);
-            if (!v.cve) v.cve = details.cve;
-          }
-
-          // 2. Populate patched versions and targetSafeVersion
-          if (Array.isArray(details.patchedVersions) && details.patchedVersions.length > 0) {
-            v.patchedVersions = v.patchedVersions || [];
-            for (const pv of details.patchedVersions) {
-              if (pv && !v.patchedVersions.includes(pv)) v.patchedVersions.push(pv);
-            }
-            v.patchedVersions.sort((a, b) => {
-              const vA = semver.valid(a);
-              const vB = semver.valid(b);
-              if (vA && vB) return semver.compare(vA, vB);
-              return a.localeCompare(b);
-            });
-            v.targetSafeVersions = [...v.patchedVersions];
-            v.targetSafeVersion = selectBestRemediationVersion(v.currentVersion, v.patchedVersions);
-          } else if (details.targetSafeVersion) {
-            v.patchedVersions = v.patchedVersions || [];
-            if (!v.patchedVersions.includes(details.targetSafeVersion)) {
-              v.patchedVersions.push(details.targetSafeVersion);
-              v.patchedVersions.sort((a, b) => {
-                const vA = semver.valid(a);
-                const vB = semver.valid(b);
-                if (vA && vB) return semver.compare(vA, vB);
-                return a.localeCompare(b);
-              });
-            }
-            v.targetSafeVersions = [...v.patchedVersions];
-            v.targetSafeVersion = selectBestRemediationVersion(v.currentVersion, v.patchedVersions);
-          }
-
-          // 3. Ensure advisory url is present
-          if (details.url) {
-            if (!v.url) v.url = details.url;
-            if (v.sources?.npmAudit) {
-              if (!v.sources.npmAudit.url) v.sources.npmAudit.url = details.url;
-              if (Array.isArray(v.sources.npmAudit.urls) && !v.sources.npmAudit.urls.includes(details.url)) {
-                v.sources.npmAudit.urls.push(details.url);
-              }
-            }
-          }
-
-          // 4. Update matching advisory in v.advisories
-          if (Array.isArray(v.advisories)) {
-            const matchedAdv = v.advisories.find(
-              (a) => (a.ghsaId && a.ghsaId === ghsaId) ||
-                     (a.id && (a.id === ghsaId || a.id === cveId)) ||
-                     (a.url && (extractGhsaId(a.url) === ghsaId || extractCveId(a.url) === cveId))
-            );
-            if (matchedAdv) {
-              if (details.cve && !matchedAdv.cve) matchedAdv.cve = details.cve;
-              if (Array.isArray(details.patchedVersions) && details.patchedVersions.length > 0) {
-                matchedAdv.patchedVersions = [...details.patchedVersions];
-                matchedAdv.targetSafeVersions = [...details.patchedVersions];
-              }
-              if (details.targetSafeVersion && !matchedAdv.targetSafeVersion) matchedAdv.targetSafeVersion = details.targetSafeVersion;
-              if (details.url && !matchedAdv.url) matchedAdv.url = details.url;
-            }
-          }
+      if (Array.isArray(details.patchedVersions) && details.patchedVersions.length) {
+        v.patchedVersions ||= [];
+        for (const version of details.patchedVersions) if (version && !v.patchedVersions.includes(version)) v.patchedVersions.push(version);
+        v.patchedVersions.sort((left, right) => semver.valid(left) && semver.valid(right) ? semver.compare(left, right) : left.localeCompare(right));
+        v.targetSafeVersions = [...v.patchedVersions];
+        v.targetSafeVersion = selectBestRemediationVersion(v.currentVersion, v.patchedVersions);
+      } else if (details.targetSafeVersion) {
+        v.patchedVersions ||= [];
+        if (!v.patchedVersions.includes(details.targetSafeVersion)) v.patchedVersions.push(details.targetSafeVersion);
+        v.targetSafeVersions = [...v.patchedVersions];
+        v.targetSafeVersion = selectBestRemediationVersion(v.currentVersion, v.patchedVersions);
+      }
+      if (details.url) {
+        if (!v.url) v.url = details.url;
+        if (v.sources?.npmAudit) {
+          v.sources.npmAudit.url ||= details.url;
+          v.sources.npmAudit.urls ||= [];
+          if (!v.sources.npmAudit.urls.includes(details.url)) v.sources.npmAudit.urls.push(details.url);
         }
       }
 
-      // Synchronize remediation target version if safe version was resolved
-      if (v.targetSafeVersion && v.remediation) {
-        v.remediation.targetVersion = v.targetSafeVersion;
-        if (v.remediation.packageJsonChanges && v.remediation.packageJsonChanges.length > 0) {
-          for (const chg of v.remediation.packageJsonChanges) {
-            if (chg.package === v.packageName) {
-              const prefix = chg.from?.startsWith('~') ? '~' : chg.from?.startsWith('^') ? '^' : '';
-              chg.to = `${prefix}${v.targetSafeVersion}`;
-            }
-          }
+      v.advisories ||= [];
+      const matches = v.advisories.filter((advisory) => {
+        const ids = [advisory.ghsaId, advisory.id, advisory.url].filter(Boolean);
+        return ids.some((id) => (ghsaId && extractGhsaId(id) === ghsaId) || (cveId && extractCveId(id) === cveId));
+      });
+      const affectedVersions = Array.isArray(details.affectedVersions) ? details.affectedVersions : [];
+      if (!matches.length) {
+        matches.push({
+          id: details.ghsaId || details.cve || lookup,
+          ghsaId: details.ghsaId || ghsaId || null,
+          cve: details.cve || cveId || null,
+          title: details.title || v.title,
+          severity: details.severity || v.severity,
+          url: details.url || null,
+          vulnerableVersionRange: details.vulnerableVersionRange || null,
+        });
+        v.advisories.push(matches[0]);
+      }
+      for (const advisory of matches) {
+        if (details.cve && !advisory.cve) advisory.cve = details.cve;
+        if (affectedVersions.length) {
+          advisory.affectedVersions = [...new Map([
+            ...(advisory.affectedVersions || []), ...affectedVersions,
+          ].map((item) => [JSON.stringify(item), item])).values()];
+        }
+        if (details.vulnerableVersionRange && !advisory.vulnerableVersionRange) {
+          advisory.vulnerableVersionRange = details.vulnerableVersionRange;
+        }
+        if (Array.isArray(details.patchedVersions) && details.patchedVersions.length) {
+          advisory.patchedVersions = [...new Set([...(advisory.patchedVersions || []), ...details.patchedVersions])];
+          advisory.targetSafeVersions = [...advisory.patchedVersions];
+        }
+        if (details.targetSafeVersion && !advisory.targetSafeVersion) advisory.targetSafeVersion = details.targetSafeVersion;
+        if (details.url && !advisory.url) advisory.url = details.url;
+      }
+    }
+
+    if (v.targetSafeVersion && v.remediation) {
+      v.remediation.targetVersion = v.targetSafeVersion;
+      for (const change of v.remediation.packageJsonChanges || []) {
+        if (change.package === v.packageName) {
+          const prefix = change.from?.startsWith('~') ? '~' : change.from?.startsWith('^') ? '^' : '';
+          change.to = `${prefix}${v.targetSafeVersion}`;
         }
       }
-    })
-  );
-
+    }
+  }));
   return vulnerabilities;
 }
 
@@ -726,6 +763,34 @@ export async function parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, npm
     branch: branchName,
     summary,
     vulnerabilities,
+  };
+}
+
+export function groupNpmAuditByBranch(branchReports = [], repository = null) {
+  return {
+    repository,
+    branches: branchReports.map((report) => {
+      const packages = new Map();
+      for (const row of report.vulnerabilities || []) {
+        if (!packages.has(row.packageName)) packages.set(row.packageName, []);
+        packages.get(row.packageName).push(row);
+      }
+      return {
+        branch: report.branch,
+        ...(report.baseCommit && { baseCommit: report.baseCommit }),
+        ...(report.error && { error: report.error }),
+        summary: report.summary,
+        packages: [...packages].sort(([a], [b]) => a.localeCompare(b)).map(([packageName, rows]) => {
+          const instances = getPackageInstances(packageName, report);
+          return {
+            packageName,
+            installedVersions: [...new Set(instances.map((instance) => instance.installedVersion))].sort(semver.compare),
+            instances,
+            findings: normalizePlanFindings(rows, packageName),
+          };
+        }),
+      };
+    }),
   };
 }
 

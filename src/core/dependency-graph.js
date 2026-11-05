@@ -247,11 +247,14 @@ export function getDirectDependencies(pkgJson, worktreeOrWorkspaces = null) {
 
   let workspaceEntries = [];
   if (Array.isArray(worktreeOrWorkspaces)) {
-    workspaceEntries = worktreeOrWorkspaces;
+    workspaceEntries = [...worktreeOrWorkspaces];
   } else if (typeof worktreeOrWorkspaces === 'string') {
     workspaceEntries = findWorkspacePackageJsons(worktreeOrWorkspaces, pkgJson);
   } else if (pkgJson) {
     workspaceEntries = [{ pkgJson, relativePath: 'package.json', name: 'root', isRoot: true }];
+  }
+  if (pkgJson && !workspaceEntries.some((workspace) => workspace.isRoot || workspace.relativePath === 'package.json')) {
+    workspaceEntries.unshift({ pkgJson, relativePath: 'package.json', name: pkgJson.name || 'root', isRoot: true });
   }
 
   for (const ws of workspaceEntries) {
@@ -288,6 +291,331 @@ export function getDirectDependencies(pkgJson, worktreeOrWorkspaces = null) {
   }
 
   return direct;
+}
+
+function compareInstalledVersions(a, b) {
+  const validA = semver.valid(a);
+  const validB = semver.valid(b);
+  if (validA && validB) return semver.compare(validA, validB) || a.localeCompare(b);
+  if (validA) return -1;
+  if (validB) return 1;
+  return a.localeCompare(b);
+}
+
+export function sortInstalledVersions(versions) {
+  return [...new Set(versions.filter((version) => typeof version === 'string').map((version) => version.trim()).filter(Boolean))]
+    .sort(compareInstalledVersions);
+}
+
+const dependencySections = [
+  ['dependencies', 'prod'],
+  ['devDependencies', 'dev'],
+  ['optionalDependencies', 'optional'],
+  ['peerDependencies', 'peer'],
+];
+
+function inventoryName(location, entry) {
+  if (entry?.name) return entry.name;
+  const marker = '/node_modules/';
+  const index = location.lastIndexOf(marker);
+  if (index >= 0) return location.slice(index + marker.length);
+  return location.startsWith('node_modules/') ? location.slice('node_modules/'.length) : null;
+}
+
+export function resolveInventoryInstalled(nodes, links, location, name) {
+  let directory = location || '.';
+  while (true) {
+    if (path.posix.basename(directory) !== 'node_modules') {
+      const candidate = path.posix.join(directory, 'node_modules', name);
+      const node = nodes.get(links.get(candidate) || candidate);
+      if (node) return node;
+    }
+    if (directory === '.') return null;
+    directory = path.posix.dirname(directory);
+  }
+}
+
+function connectInventoryEdge(parent, child, name, requestedRange, type) {
+  const edge = {
+    from: parent,
+    to: child,
+    rawSpec: requestedRange ?? null,
+    spec: requestedRange ?? null,
+    type,
+  };
+  child.incoming.push(edge);
+  child.parents.add(parent);
+}
+
+export function buildDependencyInventory(branch = {}) {
+  const nodes = new Map();
+  const links = new Map();
+  const lock = branch.pkgLock;
+  const manifests = new Map([['', branch.pkgJson || {}]]);
+  for (const workspace of branch.workspaces || []) {
+    if (!workspace.relativePath || !workspace.pkgJson) continue;
+    const location = path.posix.dirname(workspace.relativePath);
+    manifests.set(location === '.' ? '' : location, workspace.pkgJson);
+  }
+  const add = (location, entry, name = null, options = {}) => {
+    const node = {
+      location,
+      name: entry?.name || name || inventoryName(location, entry),
+      version: entry?.version,
+      entry: entry || {},
+      parents: new Set(),
+      incoming: [],
+      source: options.source || null,
+      isRoot: location === '',
+      isWorkspace: options.isWorkspace || false,
+    };
+    nodes.set(location, node);
+    return node;
+  };
+
+  if (lock?.packages && typeof lock.packages === 'object') {
+    for (const [location, entry] of Object.entries(lock.packages)) {
+      if (!entry || typeof entry !== 'object') continue;
+      if (entry.link && typeof entry.resolved === 'string') {
+        links.set(location, entry.resolved.replace(/^\.\//, ''));
+      } else {
+        add(location, entry, inventoryName(location, entry), {
+          isWorkspace: location !== '' && !location.includes('node_modules/'),
+        });
+      }
+    }
+    if (!nodes.has('')) add('', branch.pkgJson || {}, branch.pkgJson?.name);
+    for (const [location, manifest] of manifests) {
+      if (location && !nodes.has(location)) add(location, manifest, manifest.name, { isWorkspace: true });
+      else if (location && nodes.has(location)) nodes.get(location).isWorkspace = true;
+    }
+  } else if (lock?.dependencies && typeof lock.dependencies === 'object') {
+    add('', branch.pkgJson || {}, branch.pkgJson?.name);
+    const visit = (dependencies, parentLocation = '') => {
+      for (const [name, entry] of Object.entries(dependencies || {})) {
+        if (!entry || typeof entry !== 'object') continue;
+        const location = `${parentLocation ? `${parentLocation}/` : ''}node_modules/${name}`;
+        add(location, entry, name);
+        visit(entry.dependencies, location);
+      }
+    };
+    visit(lock.dependencies);
+    for (const [location, manifest] of manifests) {
+      if (location && !nodes.has(location)) add(location, manifest, manifest.name, { isWorkspace: true });
+      else if (location && nodes.has(location)) nodes.get(location).isWorkspace = true;
+    }
+  } else if (branch.arboristTree?.inventory?.values) {
+    for (const source of branch.arboristTree.inventory.values()) {
+      nodes.set(source.location, {
+        location: source.location,
+        name: source.packageName || source.name,
+        version: source.version,
+        entry: source.package || {},
+        parents: new Set(),
+        incoming: [],
+        source,
+        isRoot: Boolean(source.isProjectRoot),
+        isWorkspace: Boolean(source.isWorkspace),
+      });
+    }
+    for (const node of nodes.values()) {
+      for (const edge of node.source.edgesIn || []) {
+        const parent = nodes.get(edge.from.location);
+        if (!parent) continue;
+        node.incoming.push(edge);
+        node.parents.add(parent);
+      }
+    }
+    return { nodes, links, raw: true, scoped: true };
+  } else {
+    return { nodes, links, raw: false, scoped: false };
+  }
+
+  for (const parent of nodes.values()) {
+    const manifest = manifests.get(parent.location);
+    const declared = new Map();
+    for (const [section, type] of dependencySections) {
+      for (const [name, range] of Object.entries(parent.entry?.[section] || {})) declared.set(name, { range, type });
+      for (const [name, range] of Object.entries(manifest?.[section] || {})) declared.set(name, { range, type });
+    }
+    if (parent.location && lock?.dependencies && !manifest) {
+      for (const [name, range] of Object.entries(parent.entry?.requires || {})) {
+        if (!declared.has(name)) declared.set(name, { range, type: 'prod' });
+      }
+    }
+    for (const [name, { range, type }] of declared) {
+      const child = resolveInventoryInstalled(nodes, links, parent.location, name);
+      if (child) connectInventoryEdge(parent, child, name, range, type);
+    }
+  }
+  const chains = [
+    ...(branch.dependencyChains || []),
+    ...(branch.vulnerabilities || []).flatMap((row) => row.dependencyChains || row.chains || []),
+  ];
+  for (const chain of chains) {
+    if (!Array.isArray(chain)) continue;
+    for (let index = 1; index < chain.length; index += 1) {
+      const previous = chain[index - 1];
+      const current = chain[index];
+      const parents = [...nodes.values()].filter((node) => node.name === previous.name && node.version === previous.version);
+      const children = [...nodes.values()].filter((node) => node.name === current.name && node.version === current.version);
+      if (parents.length === 1 && children.length === 1) children[0].parents.add(parents[0]);
+    }
+  }
+  return { nodes, links, raw: true, scoped: true };
+}
+
+function instanceEdges(node) {
+  const edges = node.edgesIn || node.source?.edgesIn || node.incoming || [];
+  const incoming = edges instanceof Map ? [...edges.values()] : [...edges];
+  for (const link of node.linksIn || node.source?.linksIn || []) {
+    incoming.push(...(link.edgesIn || []));
+  }
+  return [...new Set(incoming)].flatMap((edge) => {
+    if (edge.type !== 'workspace') return [edge];
+    // Arborist's workspace membership edges are not dependency declarations.
+    const manifest = edge.from?.package || {};
+    const declaration = dependencySections.find(([section]) => Object.hasOwn(manifest[section] || {}, edge.name));
+    if (!declaration) return [];
+    const [section, type] = declaration;
+    const range = manifest[section][edge.name];
+    return [{ from: edge.from, to: edge.to, rawSpec: range, spec: range, type }];
+  });
+}
+
+function isOriginNode(node) {
+  return Boolean(node.isProjectRoot || node.isWorkspace || node.isRoot || node.source?.isProjectRoot || node.source?.isWorkspace);
+}
+
+function instanceLocation(node) {
+  return node.location ?? node.source?.location ?? '';
+}
+
+function instanceName(node) {
+  return node.packageName || node.name || node.source?.packageName || node.source?.name || null;
+}
+
+function instanceVersion(node) {
+  return node.version ?? node.source?.version ?? null;
+}
+
+function originForNode(node, edge, chain) {
+  const workspace = Boolean(node.isWorkspace || node.source?.isWorkspace);
+  const location = instanceLocation(node);
+  const packageJsonPath = workspace ? `${location.replace(/\/$/, '')}/package.json` : 'package.json';
+  const type = edge.type;
+  const section = type === 'dev' ? 'devDependencies' : type === 'optional' ? 'optionalDependencies'
+    : type === 'peer' ? 'peerDependencies' : 'dependencies';
+  return {
+    packageJsonPath,
+    section,
+    workspace: workspace ? instanceName(node) : null,
+    chain,
+  };
+}
+
+function instanceChainLink(node, requiredRange) {
+  return {
+    name: instanceName(node),
+    version: instanceVersion(node),
+    location: instanceLocation(node),
+    requiredRange: requiredRange || null,
+  };
+}
+
+function collectInstanceOrigins(target) {
+  const origins = [];
+  const walk = (node, chain, visited) => {
+    const nodeId = instanceLocation(node) || node;
+    if (visited.has(nodeId)) return;
+    const nextVisited = new Set(visited).add(nodeId);
+    for (const edge of instanceEdges(node)) {
+      const parent = edge.from;
+      if (!parent) continue;
+      const requested = edge.rawSpec || edge.spec || null;
+      const adjusted = chain.map((link, index) => index === 0 ? { ...link, requiredRange: requested } : link);
+      if (isOriginNode(parent)) {
+        origins.push(originForNode(parent, edge, adjusted));
+        if (!parent.isWorkspace && !parent.source?.isWorkspace) continue;
+      }
+      const parentLink = instanceChainLink(parent, null);
+      walk(parent, [parentLink, ...adjusted], nextVisited);
+    }
+  };
+  walk(target, [instanceChainLink(target, null)], new Set());
+  return [...new Map(origins.map((origin) => [JSON.stringify(origin), origin])).values()]
+    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+}
+
+export function getPackageInstances(packageName, branch = {}) {
+  if (!packageName) return [];
+  const tree = branch.arboristTree;
+  const candidates = [];
+  if (tree?.inventory?.query) {
+    candidates.push(...tree.inventory.query('name', packageName));
+  } else {
+    const inventory = branch.dependencyInventory || buildDependencyInventory(branch);
+    candidates.push(...[...inventory.nodes.values()].filter((node) => node.name === packageName));
+  }
+
+  const instances = new Map();
+  for (const node of candidates) {
+    const location = instanceLocation(node);
+    const installedVersion = instanceVersion(node);
+    if (!location || typeof installedVersion !== 'string') continue;
+    const incoming = instanceEdges(node).map((edge) => ({
+      parentName: instanceName(edge.from),
+      parentVersion: instanceVersion(edge.from),
+      parentLocation: instanceLocation(edge.from),
+      requestedRange: edge.rawSpec || edge.spec || null,
+      effectiveRange: edge.spec || null,
+      type: edge.type || null,
+    })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    instances.set(location, {
+      installedVersion,
+      location,
+      incoming: [...new Map(incoming.map((edge) => [JSON.stringify(edge), edge])).values()],
+      origins: collectInstanceOrigins(node),
+    });
+  }
+  return [...instances.values()].sort((a, b) => {
+    const order = compareInstalledVersions(a.installedVersion, b.installedVersion);
+    return order || a.location.localeCompare(b.location);
+  });
+}
+
+function reportChainsFromInstances(instances, branch = {}) {
+  const chains = [];
+  for (const instance of instances) {
+    for (const origin of instance.origins) {
+      const location = path.posix.dirname(origin.packageJsonPath);
+      const isWorkspace = location !== '.';
+      const anchorLocation = isWorkspace ? location : '';
+      const version = branch.arboristTree?.inventory?.get(anchorLocation)?.version
+        || branch.pkgLock?.packages?.[anchorLocation]?.version
+        || (isWorkspace
+          ? branch.workspaces?.find((workspace) => workspace.relativePath === origin.packageJsonPath)?.pkgJson?.version
+          : branch.pkgJson?.version)
+        || (isWorkspace ? 'workspace' : null);
+      const anchor = {
+        name: isWorkspace ? origin.workspace : '[root]',
+        version,
+        location: isWorkspace ? location : '',
+        isWorkspace,
+        isRoot: !isWorkspace,
+        packageJsonPath: origin.packageJsonPath,
+        specifier: isWorkspace ? `${origin.workspace} (${origin.packageJsonPath})` : '[root]',
+      };
+      const type = dependencySections.find(([section]) => section === origin.section)?.[1] || 'prod';
+      chains.push([anchor, ...origin.chain.map((link, index) => ({
+        ...link,
+        specifier: `${link.name}@${link.version}`,
+        ...(index === 0 ? { type, packageJsonPath: origin.packageJsonPath, workspace: origin.workspace } : {}),
+      }))]);
+    }
+  }
+  return [...new Map(chains.map((chain) => [JSON.stringify(chain), chain])).values()]
+    .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
 }
 
 export function parseNodePath(nodePathStr) {
@@ -333,97 +661,23 @@ export function extractChainsFromNpmLs(npmLsData, targetPkgName, workspaceLookup
 }
 
 export function tracePathsFromPackageLock(pkgLock, targetPkgName, directDeps, worktreeOrWorkspaces = null) {
-  if (!pkgLock?.packages) return [];
-  const packages = pkgLock.packages;
-  const wsLookup = buildWorkspaceLookup(pkgLock, worktreeOrWorkspaces);
-
-  const dependentsMap = new Map();
-  const packageVersions = new Map();
-
-  for (const [pkgPath, pkgInfo] of Object.entries(packages)) {
-    let parentName = pkgPath;
-    if (pkgPath === '') {
-      parentName = '__ROOT__';
-    } else if (wsLookup.isWorkspaceFolder(pkgPath)) {
-      parentName = wsLookup.getWorkspaceName(pkgPath);
-    } else {
-      parentName = pkgPath.replace(/^.*node_modules\//, '');
-    }
-
-    const ver = pkgInfo.version || 'unknown';
-    packageVersions.set(pkgPath, ver);
-
-    const allDeps = {
-      ...(pkgInfo.dependencies || {}),
-      ...(pkgInfo.devDependencies || {}),
-      ...(pkgInfo.optionalDependencies || {}),
-    };
-
-    for (const [depName, range] of Object.entries(allDeps)) {
-      if (!dependentsMap.has(depName)) {
-        dependentsMap.set(depName, []);
-      }
-      dependentsMap.get(depName).push({
-        parentPath: pkgPath,
-        parentName,
-        requiredRange: range,
-        isWorkspaceRoot: wsLookup.isWorkspaceFolder(pkgPath),
-      });
+  if (!pkgLock) return [];
+  const pkgJson = { ...(pkgLock.packages?.[''] || {}) };
+  for (const [name, info] of directDeps || []) {
+    for (const declaration of info.declarations || [info]) {
+      if (declaration.packageJsonPath && declaration.packageJsonPath !== 'package.json') continue;
+      const section = declaration.section || 'dependencies';
+      pkgJson[section] = { ...pkgJson[section], [name]: declaration.range };
     }
   }
-
-  const targetPaths = Object.keys(packages).filter(
-    (p) => p === `node_modules/${targetPkgName}` || p.endsWith(`/node_modules/${targetPkgName}`)
-  );
-
-  const targetVersion = targetPaths.length > 0 ? packages[targetPaths[0]].version : 'unknown';
-
-  const chains = [];
-
-  function backtrack(currentPkgName, currentPath = []) {
-    const parents = dependentsMap.get(currentPkgName) || [];
-
-    for (const parent of parents) {
-      if (parent.parentPath === '') {
-        chains.push(currentPath);
-      } else if (parent.isWorkspaceRoot) {
-        // Reached workspace root folder (e.g. 'client', 'cypress')
-        const wsName = wsLookup.getWorkspaceName(parent.parentPath);
-        const wsFolder = parent.parentPath;
-        const wsSpecifier = `${wsName} (${wsFolder}/package.json)`;
-        const wsLink = {
-          name: wsName,
-          version: 'workspace',
-          specifier: wsSpecifier,
-          isWorkspaceRoot: true,
-          folderPath: wsFolder,
-        };
-        chains.push([wsLink, ...currentPath]);
-      } else {
-        const parentVer = packageVersions.get(parent.parentPath) || 'unknown';
-        const link = {
-          name: parent.parentName,
-          version: parentVer,
-          specifier: `${parent.parentName}@${parentVer}`,
-          requiredRange: parent.requiredRange,
-        };
-
-        if (!currentPath.some((p) => p.name === parent.parentName)) {
-          backtrack(parent.parentName, [link, ...currentPath]);
-        }
-      }
-    }
-  }
-
-  const initialLink = {
-    name: targetPkgName,
-    version: targetVersion,
-    specifier: `${targetPkgName}@${targetVersion}`,
+  const branch = {
+    pkgJson,
+    pkgLock,
+    workspaces: Array.isArray(worktreeOrWorkspaces) ? worktreeOrWorkspaces
+      : typeof worktreeOrWorkspaces === 'string' ? findWorkspacePackageJsons(worktreeOrWorkspaces, pkgJson) : [],
   };
-
-  backtrack(targetPkgName, [initialLink]);
-
-  return chains;
+  return reportChainsFromInstances(getPackageInstances(targetPkgName, branch), branch)
+    .map((chain) => chain[0].isRoot ? chain.slice(1) : chain);
 }
 
 export function extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData = null, worktreeOrWorkspaces = null) {
@@ -436,7 +690,7 @@ export function extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData
     }
   }
 
-  if (pkgLock?.packages) {
+  if (pkgLock?.packages || pkgLock?.dependencies) {
     const lockChains = tracePathsFromPackageLock(pkgLock, vulnData.name, directDeps, worktreeOrWorkspaces);
     if (lockChains.length > 0) {
       return lockChains;
@@ -489,21 +743,28 @@ export function extractDependencyChains(vulnData, pkgLock, directDeps, npmLsData
 }
 
 export function findDirectRoots(chains, directDeps) {
-  const rootsMap = new Map();
+  const rootsMap = new Map(findDirectRootsFromArborist(
+    chains.filter((chain) => chain[0]?.isRoot || chain[0]?.isWorkspace)
+  ).map((root) => [JSON.stringify([root.packageJsonPath, root.section, root.name, root.location]), root]));
 
   for (const chain of chains) {
-    if (chain.length === 0) continue;
+    if (chain.length === 0 || chain[0].isRoot || chain[0].isWorkspace) continue;
     const top = chain[0];
-    if (directDeps.has(top.name)) {
-      const directInfo = directDeps.get(top.name);
-      rootsMap.set(top.name, {
+    const directInfo = directDeps.get(top.name);
+    if (!directInfo) continue;
+    const declarations = (directInfo.declarations || [directInfo])
+      .filter((decl) => !top.packageJsonPath || decl.packageJsonPath === top.packageJsonPath);
+    for (const decl of declarations) {
+      const key = JSON.stringify([decl.packageJsonPath, decl.section, top.name, top.location]);
+      rootsMap.set(key, {
         name: top.name,
-        currentRange: directInfo.range,
-        section: directInfo.section,
+        currentRange: decl.range,
+        section: decl.section,
         installedVersion: top.version,
-        workspace: directInfo.workspace,
-        packageJsonPath: directInfo.packageJsonPath,
-        declarations: directInfo.declarations || [],
+        workspace: decl.isRoot ? null : decl.workspace,
+        packageJsonPath: decl.packageJsonPath,
+        location: top.location,
+        declarations: [decl],
       });
     }
   }
@@ -539,113 +800,8 @@ function getNodeLabel(node) {
 
 export function getArboristLogicalChains(tree, targetName) {
   if (!tree) return [];
-  const chains = [];
-  const seenNodes = new Set();
-  const queue = [];
-
-  // 1. Direct dependencies of root project
-  for (const edge of tree.edgesOut.values()) {
-    if (edge.type === 'peer' || !edge.to) continue;
-    if (edge.to.isWorkspace) continue;
-    const directRootName = edge.to.packageName || edge.to.name;
-    const step = {
-      name: directRootName,
-      version: edge.to.version,
-      requiredRange: edge.spec,
-      type: edge.type,
-      location: edge.to.location,
-      packageJsonPath: 'package.json',
-      workspace: null,
-      isRoot: false,
-      specifier: `${directRootName}@${edge.to.version}`,
-    };
-    const rootAnchor = {
-      name: '[root]',
-      version: tree.version,
-      location: '',
-      isWorkspace: false,
-      isRoot: true,
-      packageJsonPath: 'package.json',
-      specifier: '[root]',
-    };
-    queue.push([edge.to, [rootAnchor, step]]);
-  }
-
-  // 2. Direct dependencies of each workspace
-  if (tree.workspaces) {
-    for (const [wsName, wsPath] of tree.workspaces) {
-      const wsLoc = wsPath.replace(tree.path + '/', '');
-      const wsNode = tree.inventory.get(wsLoc);
-      if (!wsNode) continue;
-      const wsPkgPath = path.join(wsLoc, 'package.json');
-      const wsAnchor = {
-        name: wsName,
-        version: wsNode.version,
-        location: wsLoc,
-        isWorkspace: true,
-        isRoot: false,
-        packageJsonPath: wsPkgPath,
-        specifier: `${wsName} (${wsPkgPath})`,
-      };
-
-      for (const edge of wsNode.edgesOut.values()) {
-        if (edge.type === 'peer' || !edge.to) continue;
-        const targetNode = edge.to.isLink ? edge.to.target : edge.to;
-        const isWs = Boolean(targetNode.isWorkspace);
-        const step = {
-          name: targetNode.packageName || targetNode.name,
-          version: targetNode.version,
-          requiredRange: edge.spec,
-          type: edge.type,
-          location: targetNode.location,
-          isWorkspace: isWs,
-          isRoot: false,
-          packageJsonPath: isWs ? path.join(targetNode.location, 'package.json') : wsPkgPath,
-          workspace: isWs ? (targetNode.packageName || targetNode.name) : wsName,
-          specifier: isWs
-            ? `${targetNode.packageName || targetNode.name} (${path.join(targetNode.location, 'package.json')})`
-            : `${targetNode.packageName || targetNode.name}@${targetNode.version}`,
-        };
-        queue.push([targetNode, [wsAnchor, step]]);
-      }
-    }
-  }
-
-  while (queue.length > 0) {
-    const [node, currentChain] = queue.shift();
-
-    if (node.name === targetName) {
-      chains.push(currentChain);
-      continue;
-    }
-
-    if (seenNodes.has(node.path)) {
-      continue;
-    }
-    seenNodes.add(node.path);
-
-    const targetNode = node.isLink ? node.target : node;
-    for (const edge of targetNode.edgesOut.values()) {
-      if (edge.type === 'peer' || !edge.to) continue;
-      const childNode = edge.to.isLink ? edge.to.target : edge.to;
-      const isWs = Boolean(childNode.isWorkspace);
-      const step = {
-        name: childNode.packageName || childNode.name,
-        version: childNode.version,
-        requiredRange: edge.spec,
-        type: edge.type,
-        location: childNode.location,
-        isWorkspace: isWs,
-        isRoot: false,
-        specifier: isWs
-          ? `${childNode.packageName || childNode.name} (${path.join(childNode.location, 'package.json')})`
-          : `${childNode.packageName || childNode.name}@${childNode.version}`,
-      };
-      queue.push([childNode, [...currentChain, step]]);
-    }
-  }
-
-  return chains;
+  const branch = { arboristTree: tree };
+  return reportChainsFromInstances(getPackageInstances(targetName, branch), branch);
 }
 
 export function traceArboristChains(nodeOrTree, targetNameOrVisited = null) {
@@ -708,7 +864,7 @@ export function findDirectRootsFromArborist(chains, targetPkgName = null) {
     if (!directChild) continue;
 
     const pkgJsonPath = parent.packageJsonPath || (parent.isWorkspace && parent.location ? path.join(parent.location, 'package.json') : 'package.json');
-    const key = `${pkgJsonPath}:${directChild.name}`;
+    const key = JSON.stringify([pkgJsonPath, directChild.type, directChild.name, directChild.location]);
     if (!rootsMap.has(key)) {
       const section = directChild.type === 'dev' ? 'devDependencies' :
                       directChild.type === 'optional' ? 'optionalDependencies' :
@@ -759,7 +915,19 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
     tree = worktreeOrWorkspaces;
   }
 
-  const directDeps = getDirectDependencies(pkgJson, worktreeOrWorkspaces);
+  const snapshotWorkspaces = Object.entries(pkgLock?.packages || {})
+    .filter(([location, entry]) => location && !location.includes('node_modules/') && !entry.link)
+    .map(([location, entry]) => ({
+      name: entry.name || location,
+      relativePath: `${location}/package.json`,
+      pkgJson: entry,
+      isRoot: false,
+    }));
+  const declaredWorkspaces = Array.isArray(worktreeOrWorkspaces) ? worktreeOrWorkspaces
+    : typeof worktreeOrWorkspaces === 'string' ? findWorkspacePackageJsons(worktreeOrWorkspaces, pkgJson) : [];
+  const workspaces = [...new Map([...snapshotWorkspaces, ...declaredWorkspaces]
+    .map((workspace) => [workspace.relativePath, workspace])).values()];
+  const directDeps = getDirectDependencies(pkgJson || pkgLock?.packages?.[''], workspaces);
   const isDirectInPkg = directDeps.has(pkgName);
   const directInfoFallback = isDirectInPkg ? directDeps.get(pkgName) : null;
 
@@ -833,8 +1001,7 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
       dependencyType = 'Indirect (Transitive)';
     }
 
-    const installedVersionSet = new Set(nodes.map((n) => n.version).filter(Boolean));
-    const versionsList = Array.from(installedVersionSet);
+    const versionsList = sortInstalledVersions(nodes.map((node) => node.version));
     let currentVersion = 'unknown';
     if (versionsList.length === 1) {
       currentVersion = versionsList[0];
@@ -863,32 +1030,25 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
     };
   }
 
-  // Fallback: Legacy parsing for unit tests and environments without preloaded Arborist tree
+  // Snapshot lookup shares the physical inventory and exhaustive origins used by planning.
   const isDirect = isDirectInPkg;
   const directInfo = directInfoFallback;
   const workspaceDeclarations = directInfo?.declarations || [];
 
-  const installedVersionSet = new Set();
-  const installedPaths = [];
-
-  if (pkgLock?.packages) {
-    for (const [pPath, pInfo] of Object.entries(pkgLock.packages)) {
-      if (pPath === `node_modules/${pkgName}` || pPath.endsWith(`/node_modules/${pkgName}`)) {
-        if (pInfo.version) installedVersionSet.add(pInfo.version);
-        installedPaths.push(pPath);
-      }
-    }
-  } else if (pkgLock?.dependencies) {
-    if (pkgLock.dependencies[pkgName]?.version) {
-      installedVersionSet.add(pkgLock.dependencies[pkgName].version);
-    }
-  }
-
-  const chains = extractDependencyChains({ name: pkgName, nodes: installedPaths }, pkgLock, directDeps, npmLsData, worktreeOrWorkspaces);
+  const instances = getPackageInstances(pkgName, {
+    pkgJson,
+    pkgLock,
+    workspaces,
+  });
+  const installedVersionSet = new Set(instances.map((instance) => instance.installedVersion));
+  const installedPaths = instances.map((instance) => instance.location);
+  const originChains = reportChainsFromInstances(instances, { pkgJson, pkgLock, workspaces });
+  const chains = originChains.length > 0 ? originChains
+    : extractDependencyChains({ name: pkgName, nodes: installedPaths }, pkgLock, directDeps, npmLsData, worktreeOrWorkspaces);
   const directRoots = findDirectRoots(chains, directDeps);
 
-  if (isDirect && workspaceDeclarations.length > 0) {
-    const directVer = installedVersionSet.size > 0 ? Array.from(installedVersionSet)[0] : directInfo?.range || 'installed';
+  if (originChains.length === 0 && isDirect && workspaceDeclarations.length > 0) {
+    const directVer = sortInstalledVersions([...installedVersionSet])[0] || directInfo?.range || 'installed';
     for (const decl of workspaceDeclarations) {
       const sectionTag = decl.section === 'devDependencies' ? ' (devDependencies)' : ' (dependencies)';
       const wsName = decl.isRoot ? '[root]' : (decl.workspace || decl.packageJsonPath);
@@ -900,7 +1060,8 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
     }
   }
 
-  const isIndirect = chains.some((c) => c.length > 1 || (c.length === 1 && !c[0].isDirectDecl && c[0].name !== pkgName));
+  const isIndirect = chains.some((chain) => chain[0]?.isRoot || chain[0]?.isWorkspace
+    ? chain.length > 2 : chain.length > 1 || (chain.length === 1 && !chain[0].isDirectDecl && chain[0].name !== pkgName));
 
   let dependencyType = 'Unknown';
   if (isDirect && isIndirect) {
@@ -911,7 +1072,7 @@ export function lookupPackageInstalledInfo(pkgName, pkgJson, pkgLock, npmLsData 
     dependencyType = 'Indirect (Transitive)';
   }
 
-  const versionsList = Array.from(installedVersionSet);
+  const versionsList = sortInstalledVersions([...installedVersionSet]);
   let currentVersion = 'unknown';
 
   if (versionsList.length === 1) {

@@ -12,9 +12,9 @@ export function readRemediationPlan(filename) {
   let plan;
   try { plan = JSON.parse(fs.readFileSync(filename, 'utf8')); }
   catch (error) { throw new Error(`Cannot read remediation plan ${filename}: ${error.message}`); }
-  if (plan?.schemaVersion !== '1.0.0' || plan.kind !== 'security-remediation-plan'
+  if (plan?.schemaVersion !== '2.0.0' || plan.kind !== 'security-remediation-plan'
     || !plan.repository || typeof plan.repository !== 'object' || Array.isArray(plan.repository) || !Array.isArray(plan.branches)) {
-    throw new Error('Expected a version 1.0.0 security-remediation-plan; generate it with scan first.');
+    throw new Error('Expected a version 2.0.0 security-remediation-plan; generate it with scan first.');
   }
   const names = new Set();
   for (const branch of plan.branches) {
@@ -104,7 +104,7 @@ async function refreshBeforePublish(repo, branch, remoteUrl, githubToken) {
 export async function executeRemediationPlan(plan, config = {}) {
   const reportsDir = path.resolve(config.reportsDir || 'reports');
   const resultsPath = path.join(reportsDir, 'security-remediation-results.json');
-  const results = { schemaVersion: '1.0.0', kind: 'security-remediation-results',
+  const results = { schemaVersion: '2.0.0', kind: 'security-remediation-results',
     generatedAt: new Date().toISOString(), planGeneratedAt: plan.generatedAt, repository: plan.repository, branches: [] };
   const save = () => { fs.mkdirSync(reportsDir, { recursive: true }); fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2) + '\n'); };
   try {

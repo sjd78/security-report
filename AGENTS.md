@@ -107,8 +107,9 @@ security-report/
   1. **`bump-direct`**: Directly updates `package.json` if the package is declared in `dependencies`/`devDependencies`.
   2. **`bump-direct-and-lockfile`**: Same as above when the package is *also* pulled in transitively (`Direct & Indirect`); the package.json bump is paired with a lockfile re-resolution for the remaining instances. See section H.
   3. **`bump-direct-parent`**: If a direct root parent (e.g. `msw`) has an updated version available that pulls in the safe dependency, updates the direct parent in `package.json`.
-  4. **`lockfile-update`**: If the parent package's declared semver range already permits the safe patched version (e.g. parent requires `>=0.7.0 <0.9.0` and `0.8.8` is safe), re-resolves the package inside the lockfile via `npm update <pkg> --package-lock-only` without adding unnecessary `package.json` overrides. `npm install <pkg>@<version>` is deliberately not used: it would also add the transitive package to the root `package.json`.
-  5. **`package-override`**: Fallback applied if and only if parent ranges strictly forbid the safe version and no direct parent bump is available.
+     Parent-update candidates must be strictly newer than installed parent versions across every affected declaration/origin. Do not trust npm audit's `fixAvailable` as proof of a forward upgrade; reject lower/equal candidates and preserve a safe fallback without partial workspace edits.
+  4. **`lockfile-update`**: Requests re-resolution within the final manifest's parent ranges, without persistent overrides. The selected execution direction is transient, version/ancestor-scoped pins to realize approved targets, followed by removal of those generated pins and graph verification against the final manifest. This policy is not yet implemented by the current npm named-update path; see section D. `npm install <pkg>@<version>` is deliberately not used because it can add a transitive package to root `package.json`.
+  5. **`package-override`**: A persistent pin must be explicitly justified and present in the reviewed plan. A no-op lockfile update is not permission to introduce an override silently; incompatible parent ranges may instead require a parent upgrade or manual review.
 
 Every strategy carries `packageJsonChanges` (file-scoped semver edits) and `lockfileUpdates` (package names to re-resolve). `remediateBranch` de-duplicates both across findings — for a package targeted by several advisories, the highest requested version wins.
 
@@ -124,10 +125,22 @@ Every strategy carries `packageJsonChanges` (file-scoped semver edits) and `lock
 1. **Step 1 (Intermediate Report)**: Aggregates findings and generates a single structured JSON schema + Markdown file before touching any code.
 2. **Step 2 (Remediation)**:
    - Modifies `package.json` while maintaining exact original file indentation.
-   - Runs `npm install --package-lock-only` to rebuild `package-lock.json` from the updated ranges, followed by one `npm update <pkg> --package-lock-only` per package listed in `remediation.lockfileUpdates`.
-   - Re-runs `npm audit` in the worktree to verify remaining issues.
+   - Currently attempts `npm install --package-lock-only` followed by one `npm update <pkg> --package-lock-only` per requested package, with lifecycle scripts disabled. These operations are not proof that transitive copies changed.
+   - Proves the resulting dependency graph against every approved resolution, then re-runs `npm audit`. A command exit code of zero or a changed lockfile alone is not success. If a vulnerable instance remains unchanged or an approved target is not realized, fail verification, retain the worktree, and prevent commit/push/PR.
 3. **Step 3 (Commit Message Generation)**:
    - Formats a conventional commit message with CVE identifiers, Jira ticket URLs, Dependabot alert links, dependency chains, and verification status.
+
+
+#### Transitive resolution: evidence and selected policy
+
+- **Observed limitation:** `npm update joi --package-lock-only` left the user's lockfile unchanged. Do not recommend named updates as a reliable solution for this repository or rerun them to dispute that observation. Direct `reify({ update: { names: [...] } })` uses the same named-update mechanism, which excludes bundled/shrinkwrapped nodes.
+- **Audit-fix API:** `arb.audit({ fix: true })` loads audit evidence, queues vulnerable nodes' parents, and gives the resolver vulnerable ranges to avoid. A scratch-registry experiment updated a purely transitive dependency with `packageLockOnly: true`, `ignoreScripts: true`, and `force: false`, without changing the manifest, adding overrides, or writing `node_modules`. This is not proof against the user's actual graph.
+- **Audit selection experiment:** There is no public package whitelist for `audit({ fix: true })`. Auditing first, filtering the resulting report's package entries and `topVulns`, building the ideal tree, then calling `reify()` updated only the selected direct or transitive package in separate scratch experiments. This manipulates implementation-dependent state; it is not a supported hard scope boundary. Calling `audit({ fix: true })` afterward reloads the full report. Peer resolution, hoisting, and dependency changes still require a strict graph-diff guard. Jira-only findings absent from npm audit need another path.
+- **Latest user decision:** Prefer transient pins for in-range updates rather than adopting audit-report mutation as the execution mechanism. This supersedes the earlier prohibition on temporary pins. It records the chosen direction, not a completed implementation.
+- **Execution sequence:** Apply reviewed manifest edits; add only the generated version/ancestor-scoped temporary overrides needed for approved targets; resolve the lockfile with lifecycle scripts disabled; remove only those generated overrides, preserving pre-existing overrides and reviewed persistent edits; verify the resulting graph against the final manifest without temporary pins; then audit.
+- **Scope and cleanup:** Keep installed major/minor target groups independently scoped; never impose one global version across incompatible groups. Track generated edits so cleanup on success or failure restores the intended final manifest without deleting unrelated overrides or user changes. Temporary pins must not be committed.
+- **Final validity:** Every target must satisfy the final manifest's original or reviewed parent constraints after temporary pins are removed. Otherwise require a reviewed parent upgrade, persistent override, or manual review. A transient pin must not conceal an invalid final graph or add a root transitive declaration.
+- **No second unconstrained install:** Do not run an unconstrained install after removing temporary pins; it can undo the selected lockfile resolutions. Verification must prove approved per-origin targets and reject changes outside the reviewed scope. A command exit code of zero is not success; failure retains the worktree and prevents publication.
 
 ---
 ### E. Upstream Branch to Downstream Version Translation Table
@@ -137,18 +150,19 @@ Every strategy carries `packageJsonChanges` (file-scoped semver edits) and `lock
 
 ### F. Unified Upstream Branch Grouping across Collectors
 - **Problem**: `npm-audit` naturally evaluates branch worktrees individually, but external API collectors (`jira`, `dependabot`) return repository-wide or project-wide lists.
-- **Solution**: Both `jira` and `dependabot` collectors now structure their findings into upstream branch sections before reaching the blender:
-  - `security-jira-collection.json`: Groups issues into `branches: [{ branch: "release-0.11", mappedVersions: ["8.2"], tickets: [...] }]` plus an `unassigned: [...]` section.
-  - `security-dependabot-collection.json`: Groups alerts into `branches: [{ branch: "main", isDefaultBranch: true, alerts: [...] }, { branch: "release-0.11", alerts: [], note: "..." }]`.
-  - `security-npm-audit-collection.json`: Contains the raw branch audit results.
-- **Benefit**: All debug JSONs and intermediate data structures have a consistent, branch-scoped representation, enabling inspection and deterministic blender correlation.
+- **Solution**: All collection files record `repository` and `branches[].packages[].findings`, with source-specific issue/advisory/CVE records stored once:
+  - `debug-collection-jira.json`: Groups tickets by mapped upstream branch and package. Tickets without branch/version evidence remain package-grouped in `unassigned`; no `allTickets` copy is emitted.
+  - `debug-collection-dependabot.json`: Groups alerts by package only on GitHub's actual repository default branch. The first requested branch is never assumed to be the default; unselected default-branch findings remain in the collection without leaking into release reports.
+  - `debug-collection-npm-audit.json`: Groups each branch's audit advisories by package, retaining physical instances and root/workspace origins rather than serializing worktree internals or repeating package-level CVEs.
+- **Blender handoff**: The blender collates every collector's evidence per branch/package into canonical `findings` and deduplicated `affectedVersions` range/first-patched-version pairs. The registry safety assessment, report, and planner consume these fields directly rather than reconstructing evidence. With `--debug`, `debug-blended.json` projects only repository identity and branches with `branch`, optional `baseCommit`/`error`, and `packages: [{ packageName, findings, affectedVersions }]`; failed branches have empty packages. It excludes snapshots, Arborist trees, and legacy evidence copies.
+- **Benefit**: Debug collections consistently represent repository → branch → package → issue/advisory/CVE, and the blender consumes the explicit branch groups without flat-list fallback. All four debug artifacts are written only when debug is enabled.
 
 ### G. Advisory Resolution (Jira & npm audit) & Optimal Safe Version Calculation
 - **Problem**: Jira CVE tickets and npm audit findings point to GitHub Security Advisories or CVE identifiers, but do not natively provide all upstream npm package fix versions or direct links.
 - **Solution**:
   1. `src/collectors/jira.js` queries `/rest/api/3/issue/{key}/remotelink` to extract attached GHSA and CVE URLs; `src/collectors/npm-audit.js` extracts GHSA/CVE identifiers from `via` advisory objects.
   2. `src/collectors/advisories.js` (`fetchAdvisoryDetails`) queries GitHub Advisory API (and OSV API fallback), resolving CVE IDs, `vulnerableVersionRange`, and `first_patched_version` across all affected releases.
-  3. `src/core/blender.js` calculates the **optimal target safe version** that satisfies all combined advisories for that package on the target branch.
+  3. `src/core/blender.js` preserves all advisory intervals and their paired first-patched versions in canonical package evidence. The remediation planner selects safe per-installed-line patch targets from the branch's published release catalog, using that evidence.
   4. `src/report/markdown-reporter.js` links npm audit sources directly to the resolved GitHub Security Advisories.
 
 ### H. Upstream Lockfile Assessment for Jira Findings & Dual Direct/Indirect Resolution
@@ -188,6 +202,7 @@ Every strategy carries `packageJsonChanges` (file-scoped semver edits) and `lock
   1. `src/report/markdown-reporter.js` splits paths into `formatDirectDependencyPaths` and `formatTransitiveDependencyPaths`.
   2. Direct dependencies strictly pull from workspace/root declarations and are excluded from transitive output.
   3. Both sections render in compact code blocks (`<pkgFile>/<section>/...`) for consistency and readability.
+  4. Installed/current-version lists are deduplicated and sorted by semver, not lexical order. Report ancestry uses exhaustive physical-instance origins with per-path cycle detection; a shared hoisted node must not suppress another root/workspace's path. Scoped names and manifest/location-specific ranges remain intact.
 
 
 ### M. Arborist-Powered Virtual Dependency Resolution & Multi-Scenario Remediation
@@ -199,7 +214,7 @@ Every strategy carries `packageJsonChanges` (file-scoped semver edits) and `lock
   4. `canBeResolvedInLockfile` inspects whether all incoming parent edges satisfy the target safe version constraint.
   5. 4 Primary Remediation Scenarios:
      - **Direct Dependency (`bump-direct` / `bump-direct-and-lockfile`)**: Edits declaring `package.json` files across root and workspaces; issues lockfile update for transitive instances when dual.
-     - **Transitive In-Range Lockfile Update (`lockfile-update`)**: Safe version satisfies parent ranges; updates lockfile without adding redundant overrides.
+     - **Transitive In-Range Lockfile Update (`lockfile-update`)**: Safe version satisfies final parent ranges; selected policy uses transient scoped pins during resolution, removes them, and verifies the final graph without persistent overrides. See section D for implementation status and evidence.
      - **Transitive with Upgradable Direct Parent (`bump-direct-parent`)**: Parent range forbids safe version, but direct parent upgrade is available.
      - **Transitive Requiring Overrides (`package-override`)**: Parent range forbids safe version; writes overrides to root `package.json`, scoped by `workspaceScope` (e.g. `overrides: { "@mono/app": { "pkg": "ver" } }`) or `parentPackage` where applicable.
 ---
@@ -223,7 +238,7 @@ Sources are merged as **CLI option > environment variable > config file** (`.sec
 | `JIRA_PROJECT` | `--jira-project` | Jira Project Key for CVE tickets | `MTA` |
 | `JIRA_JQL` | `--jira-jql` | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
 | `SEC_COLLECTORS` | `--collectors` | Comma-separated active collectors (`npm-audit`, `jira`, `dependabot`) | `npm-audit,jira,dependabot` |
-| `SEC_DEBUG` | `--debug` | Save raw collector outputs to `security-<name>-collection.json` | `false` |
+| `SEC_DEBUG` | `--debug` | Save `debug-collection-{kind}.json` and `debug-blended.json` | `false` |
 | — | `allowOverrides` (field) / `--no-overrides` | Allow writing npm `overrides` into the root `package.json` | `true` |
 
 ---

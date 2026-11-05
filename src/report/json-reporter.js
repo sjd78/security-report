@@ -1,11 +1,24 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { sortVulnerabilities } from '../core/blender.js';
+import { sortInstalledVersions } from '../core/dependency-graph.js';
+
+export function normalizeInstalledVersionDisplay(vulnerability) {
+  const installedVersions = Array.isArray(vulnerability.installedVersions)
+    ? sortInstalledVersions(vulnerability.installedVersions) : null;
+  const versions = installedVersions?.length ? installedVersions
+    : sortInstalledVersions(String(vulnerability.currentVersion || '').split(','));
+  return {
+    ...vulnerability,
+    ...(installedVersions ? { installedVersions } : {}),
+    ...(versions.length ? { currentVersion: versions.join(', ') } : {}),
+  };
+}
 
 export function generateJsonReport(repository, branchReports, options = {}) {
   const sortedBranches = (branchReports || []).map((b) => ({
     ...b,
-    vulnerabilities: [...(b.vulnerabilities || [])].sort(sortVulnerabilities),
+    vulnerabilities: (b.vulnerabilities || []).map(normalizeInstalledVersionDisplay).sort(sortVulnerabilities),
   }));
 
   const totalVulns = sortedBranches.reduce((acc, b) => acc + (b.vulnerabilities?.length || 0), 0);

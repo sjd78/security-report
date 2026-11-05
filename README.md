@@ -20,8 +20,9 @@ Managing security vulnerabilities across large Node.js repositories is often fra
    - Consolidates multiple CVEs and advisories per package to calculate the optimal safe version that resolves all flaws (prioritizing safe in-major updates when installed version is known).
    - Outputs machine-readable JSON (`reports/security-report.json`) and human-readable Markdown (`reports/security-report.md`) featuring:
      - **Package Overview Table**: `Package`, `Status` (`✅ Resolved` / `⚠️ Open`), `Severity`, `Type`, `Current Version`, `Target Fix` (all major line fixes separated by `<br>`), `CVEs` (separated by `<br>`), and `Sources` (linked advisories, Jira tickets, Dependabot alerts separated by `<br>`).
-     - **Detailed Package Findings**: Unnumbered findings with status badges, explicit current and target fix versions, individual advisory links, and strictly partitioned **Direct Dependencies** and **Transitive Dependency Paths** in compact code blocks (`<pkgFile>/<section>/...`).
-   - Writes `reports/security-remediation-plan.json`: a standalone, versioned action plan grouped by branch and package, with scanned commit SHAs, manifest preconditions, advisory motivations, reconciled actions, and explicit unresolved dispositions.
+     - **Detailed Package Findings**: Unnumbered findings with status badges, semver-sorted installed versions, individual advisory links, and partitioned **Direct Dependencies** and **Transitive Dependency Paths**. Transitive paths retain every physical copy and root/workspace origin, including scoped parents and distinct versions of the same parent.
+   - Writes `reports/security-remediation-plan.json`: a standalone schema-2 plan grouped by branch and package, with a separate approved resolution for every vulnerable installed version line, physical installation locations and complete origins, advisory evidence, coverage-linked actions, and explicit unresolved dispositions.
+   - Parent-fix suggestions from npm audit are candidates, not instructions to downgrade: a parent update must move forward from the installed version in every affected declaring workspace. Stale, equal, lower, or unprovable candidates are rejected rather than displayed as upgrades.
 2. **Step 2: Execute a Reviewed Plan**
    - `fix --plan <path>` consumes the saved actions without rescanning or silently choosing a different remediation.
    - Checks every selected branch's scanned SHA and manifest preconditions before applying changes. Stale plans, conflicting actions, escaping paths, and disabled override requirements fail explicitly.
@@ -30,7 +31,7 @@ Managing security vulnerabilities across large Node.js repositories is often fra
    - Apply-only and failed runs retain the worktree for inspection. `--commit` commits verified changes on the remediation branch; `--commit --push` pushes that branch.
 3. **Step 3: Publish Pull Requests**
    - `pr --plan <path>` commits, pushes, and opens one PR per target branch. Rerunning the same plan re-verifies its existing remediation branch and updates the matching open PR instead of duplicating it.
-   - PR descriptions include saved actions, actual installed versions, CVE/GHSA/npm audit/Jira/Dependabot references, verification results, and findings that remain manual or have no fix.
+   - PR descriptions include per-installed-version targets and origin chains, saved actions, actual post-remediation versions, CVE/GHSA/npm audit/Jira/Dependabot references, verification results, and findings that remain manual or have no fix.
    - Titles are configurable through `prTitleTemplate`, `SEC_PR_TITLE_TEMPLATE`, or `--pr-title-template`.
 
 ---
@@ -95,7 +96,7 @@ Precedence is **CLI option > environment variable > config file**, except for `g
 | `JIRA_PROJECT` | `--jira-project <key>` | Jira Project Key for CVE tickets | `MTA` |
 | `JIRA_JQL` | `--jira-jql <query>` | Custom JQL query for Jira ticket retrieval | _Auto-generated_ |
 | `SEC_COLLECTORS` | `--collectors <list>` | Active collectors to run (`npm-audit`, `jira`, `dependabot`) | `npm-audit,jira,dependabot` |
-| `SEC_DEBUG` | `--debug` | Save raw collector outputs to `security-<name>-collection.json` | `false` |
+| `SEC_DEBUG` | `--debug` | Save `debug-collection-{kind}.json` and `debug-blended.json` | `false` |
 | `SEC_PR_TITLE_TEMPLATE` | `--pr-title-template <text>` | PR/commit title; config field `prTitleTemplate`; supports `{targetBranch}`, `{targetPackages}`, `{summary}` | `fix(deps): {summary} ({targetBranch})` |
 
 > **Note on Credentials:** `.security-report.json` holds API tokens and is listed in `.gitignore` — keep it untracked. The GitHub token is never written into a clone URL or `.git/config`: it is passed per git invocation via `GIT_CONFIG_*` and stripped from any git error message. Library callers can bypass config-file discovery entirely with `loadConfig({ noConfigFile: true })`; the test suite relies on this to stay hermetic.
@@ -166,19 +167,34 @@ sec-remediate scan [repo] [options]
 - `--no-jira`: Disable Jira collector.
 - `--no-dependabot`: Disable GitHub Dependabot collector.
 - `--no-overrides`: Leave override-only package plans for manual review.
-- `--debug`: Save intermediate collector outputs to `security-<name>-collection.json`.
+- `--debug`: Write `debug-collection-jira.json`, `debug-collection-dependabot.json`, `debug-collection-npm-audit.json`, and `debug-blended.json` under the reports directory.
+
+#### Collector output
+
+Each collection records `repository` and `branches`, with findings nested at `branches[].packages[].findings`. Package names are stored on their group, not repeated on every finding.
+
+- **Jira:** tickets are grouped by the affected package and mapped upstream branch. Package identity prefers structured GitHub advisory data, with OSV fallback for GHSA/CVE identifiers (including CVE.org links). A unique npm package overrides text extraction; a multi-package advisory uses the text hint only when that package is present in structured data. If lookup is unavailable, text extraction remains the fallback. Tracker titles support `CVE-… product: package description` without a second colon. Tickets without matching branch/version evidence stay in package-grouped `unassigned` entries instead of appearing on every branch.
+- **Dependabot:** alerts belong only to the repository's actual default branch, discovered through GitHub repository metadata (falling back to `main` with a note if unavailable). Requesting a release branch first never makes it the default. The collection retains the default-branch group even when only releases were requested; the report uses only branches actually scanned.
+- **npm audit / Arborist:** each branch's audit supplies package advisories; package instances retain installed versions, physical locations, and declaring root/workspace origins. Collection files omit worktree trees, lockfile snapshots, and remediation actions.
+
+CVEs are stored on the issue/advisory findings, without parallel `allTickets`/`allAlerts` copies or a second package-level CVE list. Jira and Dependabot retain their native `cve` field; npm advisories use a deduplicated `cves` array. A package that cannot be identified remains under `packageName: null`.
+
+The blender collates all enabled collector sources per branch and package, owns canonical `findings`, and calculates `affectedVersions` as deduplicated `{ vulnerableRange, firstPatchedVersion }` pairs without collapsing different release lines to one patch target. The report, registry safety assessment, and remediation planner consume that evidence directly. With `--debug`, `debug-blended.json` exposes the same handoff as `{ repository, branches: [{ branch, baseCommit?, error?, packages: [{ packageName, findings, affectedVersions }] }] }`. It excludes snapshots, Arborist trees, and legacy evidence copies; failed branches retain their error with an empty package list. Without debug, none of the four debug files are written.
+
+Range/patch pairs remain associated with their findings. A known patch supersedes a redundant null-patch entry only for the same finding and normalized range; other missing patch values stay `null`, and invalid or contradictory evidence is retained for planner review. GitHub's global advisory API supplies `vulnerabilities[].first_patched_version` as a string, unlike Dependabot's `security_vulnerability.first_patched_version.identifier` object. OSV supplies paired `introduced`/`fixed` events. Package matching keeps `joi` and `@hapi/joi`, for example, distinct. Markdown advisory details display the blended ranges and patch floors, while the target-fix list uses those same paired values.
 
 #### Remediation-plan artifact
 
 Every scan writes `security-remediation-plan.json` alongside the existing JSON and Markdown reports. Generating the plan does not edit target manifests or lockfiles.
 
-- Top level: `schemaVersion`, `kind: "security-remediation-plan"`, `generatedAt`, repository identity/path, summary counts, and `branches`.
-- Each branch records its `baseCommit`, a summary sentence, `packages`, reconciled `actions`, and any `blockers`. Its status is `ready`, `blocked`, or `no-op`; `no-op` means no executable actions, not necessarily no findings.
-- Every package keeps installed versions, dependency paths, all advisory/CVE/Jira/Dependabot motivations, and a disposition: `ready`, `resolved`, `manual-review`, `no-fix`, or `not-installed`.
-- Each package also records `risk: { fixType, breaking, reasons }` from its canonical actions. `fixType` is `safe-fix`, `override-required`, `parent-upgrade`, `breaking-upgrade`, or `unknown`; `breaking` is independently `true`, `false`, or `null` when compatibility cannot be established.
-- Actions are structured data: `update-dependency` identifies a manifest, dependency section, package, `expectedRange`, and `targetRange`; `set-override` identifies the nested override scope, expected value, and target version; `update-lockfile` requests re-resolution within the declared constraints.
-- Branch actions deduplicate shared edits and retain their motivating package/finding references. Conflicting edits, missing snapshots, and scan failures block execution rather than silently selecting a target.
-- Targets must satisfy every known advisory. Workspace declarations can retain different safe major lines. Missing evidence and unsupported ranges remain explicit manual-review items rather than speculative edits.
+* Top level: `schemaVersion: "2.0.0"`, `kind: "security-remediation-plan"`, `generatedAt`, repository identity/path, summary counts, and `branches`.
+* Each branch records its `baseCommit`, a summary sentence, `packages`, reconciled `actions`, and any `blockers`. Its status is `ready`, `blocked`, or `no-op`; `no-op` means no executable actions, not necessarily no findings.
+* Each package keeps installed versions, normalized advisory evidence (`constraints` and source `references`), and a disposition: `ready`, `resolved`, `manual-review`, `no-fix`, or `not-installed`.
+* Every vulnerable installed version has a resolution with its approved target or explicit unresolved status, applicable finding IDs, physical package instances, and complete root/workspace origin chains.
+* Package `risk: { fixType, breaking, reasons }` is derived from canonical actions and remains separate from per-resolution target safety. `fixType` is `safe-fix`, `override-required`, `parent-upgrade`, `breaking-upgrade`, or `unknown`; `breaking` is independently `true`, `false`, or `null` when compatibility cannot be established.
+* Actions are structured data: `update-dependency` identifies a manifest, dependency section, package, `expectedRange`, and `targetRange`; `set-override` identifies the nested override scope, expected value, and target version; `update-lockfile` requests re-resolution within the declared constraints. Actions link back to the resolution IDs and motivating package/finding references they cover.
+* Branch actions deduplicate shared edits while retaining complete resolution coverage. Conflicting edits, missing snapshots, and scan failures block execution rather than silently selecting a target.
+* Targets must satisfy every known advisory on each affected version line. Missing evidence and unsupported ranges remain explicit manual-review items rather than speculative edits.
 
 Review package dispositions and branch blockers before using an action plan. Planned fixes are not verified resolutions; verification happens only after applying changes.
 
@@ -202,6 +218,25 @@ Executes a saved remediation plan; it does **not** scan or regenerate the plan. 
 - `--pr-title-template <text>`, `--github-token <token>`, `--repos-dir <path>`, `--reports-dir <path>`.
 
 Without `--commit`, the verified worktree is retained and its path printed. Failed execution also retains its worktree. A rerun refuses to overwrite it: review the files, then remove that worktree explicitly when it is no longer needed.
+
+#### Transitive resolution: limitations and selected direction
+
+`update-lockfile` records an intended re-resolution, not a guarantee that npm will change every transitive copy. The user observed `npm update joi --package-lock-only` leaving the lockfile unchanged. Direct Arborist named updates use that same mechanism and are not a demonstrated workaround on this repository.
+
+Arborist's `audit({ fix: true })` takes a different, vulnerability-aware path. A scratch-registry experiment updated a purely transitive dependency without changing `package.json`, adding overrides, or writing `node_modules`. Separate experiments audited first, filtered the report to one package, then built/reified the ideal tree; only the selected direct or transitive package changed. Report filtering is implementation-dependent, not a public package whitelist or a guarantee against collateral graph changes. Audit fix also does not automatically consume Jira-only findings. These experiments are not proof against the user's actual dependency graph.
+
+**Chosen direction: transient pins for in-range updates.** This is the agreed execution policy, not an implementation claim; the current executor still attempts npm named updates:
+
+1. Apply reviewed manifest edits.
+2. Add generated, version/ancestor-scoped temporary overrides for approved targets, keeping distinct installed version lines independently scoped.
+3. Resolve the lockfile with lifecycle scripts disabled.
+4. Remove only the generated temporary overrides. Preserve pre-existing overrides and reviewed persistent edits; restore the intended final manifest on failure too. Temporary pins must not be committed.
+5. Verify every approved resolution and the change scope against the final manifest **without temporary pins**, then run the post-change audit.
+
+If a target violates the final parent constraints, removing its pin leaves an invalid graph: require a reviewed parent upgrade, persistent override, or manual review instead. Do not add root transitive declarations or silently broaden the selected fix. Do not run another unconstrained install after pin removal, because it can undo the chosen resolutions.
+
+A successful command exit is not success if an approved target is missing, a vulnerable copy remains, or unrelated packages changed outside the reviewed scope. Verification failure retains the worktree and prevents publication. Reusing an already-fixed branch must reprove its approved outcomes rather than manufacture another diff.
+
 
 ### `sec-remediate pr [repo] --plan <path>`
 
@@ -310,15 +345,15 @@ sec-remediate pr --plan reports/security-remediation-plan.json
 > _Note: Compact path summary shown. To inspect full transitive tree, run `npm ls js-yaml` or `npm why js-yaml`._
 
 **Consolidated Remediation Plan (bump-direct-and-lockfile):**
-> _Note: Package is both a direct dependency and required transitively. Resolution updates package.json semver and synchronizes lockfile for all instances._
+> _Note: Package is both direct and transitive. Manifest edits address the direct declarations; transitive instances require separate resolution and verification._
 
 1. Update `package.json` file(s):
    - Bump `js-yaml` from `^4.3.0` to `^4.3.2` in `dependencies` (`client/package.json`)
    - Bump `js-yaml` from `^4.3.0` to `^4.3.2` in `devDependencies` (`cypress/package.json`)
-2. Synchronize lockfile:
-   ```bash
-   npm update js-yaml --package-lock-only
-   ```
+2. Required lockfile resolution (not a standalone command):
+   - Re-resolve `js-yaml` to the approved per-instance targets after the manifest edits.
+   - In-range transitive copies use the chosen scoped temporary-pin policy, with generated pins removed before final verification. This execution policy is not yet implemented; a standalone `npm update` command is not presented as a sufficient fix.
+3. Verify every approved direct/transitive resolution against the resulting graph; stop if any target is not realized. Do not infer success from the command's exit code.
 ```
 
 ---

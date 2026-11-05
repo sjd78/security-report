@@ -232,7 +232,7 @@ test('generateJsonReport and generateMarkdownReport', () => {
   assert.ok(mdReport.includes('Remote Code Execution'));
   assert.ok(mdReport.includes('CVE-2023-9999'));
   assert.ok(mdReport.includes('package-override'));
-  assert.ok(mdReport.includes('npm update vuln-lib --package-lock-only'));
+  assert.doesNotMatch(mdReport, /npm update .*--package-lock-only/);
   assert.ok(mdReport.includes('| Package | Status | Remediation | Severity | Type | Current Version | Target Fix | CVEs | Sources |'));
   assert.ok(mdReport.includes('| **`vuln-lib`** | ⚠️ Open | 🛡️ Override required | **CRITICAL** | Indirect (Transitive) | `1.0.0` | `1.1.0` | `CVE-2023-9999` | [npm audit](https://github.com/advisories/GHSA-xxxx) |'));
 });
@@ -624,7 +624,7 @@ test('resolveAuditAdvisories: enriches npm audit vulnerability with CVE, target 
   ];
 
   const advisoryCache = new Map();
-  advisoryCache.set('GHSA-TEST-1234', Promise.resolve({
+  advisoryCache.set(JSON.stringify(['GHSA-TEST-1234', 'demo-pkg']), Promise.resolve({
     id: 'GHSA-test-1234',
     ghsaId: 'GHSA-TEST-1234',
     cve: 'CVE-2024-99999',
@@ -671,7 +671,7 @@ test('parseAuditVulnerabilities: automatically resolves and enriches CVE and tar
   };
 
   const advisoryCache = new Map();
-  advisoryCache.set('GHSA-PXG6-PF52-XH8X', Promise.resolve({
+  advisoryCache.set(JSON.stringify(['GHSA-PXG6-PF52-XH8X', 'cookie']), Promise.resolve({
     id: 'GHSA-pxg6-pf52-xh8x',
     ghsaId: 'GHSA-PXG6-PF52-XH8X',
     cve: 'CVE-2024-47764',
@@ -814,7 +814,7 @@ test('consolidation retains npm-derived fixes when advisory enrichment has no pa
   } };
   for (const details of [null, { id: advisoryId, cve: 'CVE-2024-47764' }]) {
     const report = await parseAuditVulnerabilities(auditJson, pkgJson, pkgLock, null, null, 'main', {
-      advisoryCache: new Map([[advisoryId, Promise.resolve(details)]]),
+      advisoryCache: new Map([[JSON.stringify([advisoryId, 'cookie']), Promise.resolve(details)]]),
     });
     const [cookie] = consolidateVulnerabilitiesByPackage(report.vulnerabilities);
     assert.equal(cookie.targetSafeVersion, '0.7.0');
@@ -873,4 +873,119 @@ test('formatRemediationStatus: returns appropriate emoji badge for all 6 states'
   assert.equal(formatRemediationStatus({ remediation: { strategy: 'package-override' }, targetSafeVersion: '1.2.0' }), '🛡️ Override required');
   assert.equal(formatRemediationStatus({ remediation: { strategy: 'none' } }), '❌ No fix');
   assert.equal(formatRemediationStatus({}), '❌ No fix');
+});
+
+test('reporters: sort numeric installed versions in old snapshot displays without mutating input', () => {
+  const vulnerabilities = [
+    {
+      packageName: 'with-inventory',
+      severity: 'high',
+      installedVersions: ['3.4.15', '3.4.17', '3.4.8', '3.4.15'],
+      currentVersion: '3.4.15, 3.4.17, 3.4.8',
+    },
+    {
+      packageName: 'legacy-snapshot',
+      severity: 'high',
+      currentVersion: '1.10.0, 1.2.0, 1.9.0',
+    },
+  ];
+  const original = JSON.stringify(vulnerabilities);
+  const branches = [{ branch: 'main', vulnerabilities }];
+  const json = generateJsonReport({ name: 'numeric-versions', org: 'test' }, branches);
+  const byName = new Map(json.branches[0].vulnerabilities.map((row) => [row.packageName, row]));
+  assert.deepEqual(byName.get('with-inventory').installedVersions, ['3.4.8', '3.4.15', '3.4.17']);
+  assert.equal(byName.get('with-inventory').currentVersion, '3.4.8, 3.4.15, 3.4.17');
+  assert.equal(byName.get('legacy-snapshot').currentVersion, '1.2.0, 1.9.0, 1.10.0');
+  for (const report of [json, { branches }]) {
+    const markdown = generateMarkdownReport(report);
+    assert.ok(markdown.includes('`3.4.8, 3.4.15, 3.4.17`'));
+    assert.ok(markdown.includes('`1.2.0, 1.9.0, 1.10.0`'));
+    assert.ok(!markdown.includes('`3.4.15, 3.4.17, 3.4.8`'));
+    assert.ok(!markdown.includes('`1.10.0, 1.2.0, 1.9.0`'));
+  }
+  assert.equal(JSON.stringify(vulnerabilities), original);
+});
+
+test('formatTransitiveDependencyPaths: preserves scoped names and manifest-specific roots and ranges', () => {
+  const roots = [
+    { name: '@scope/parent', installedVersion: '1.0.0', section: 'dependencies', packageJsonPath: 'package.json' },
+    { name: '@scope/parent', installedVersion: '2.0.0', section: 'devDependencies', packageJsonPath: 'packages/app/package.json' },
+  ];
+  const dependencyPaths = [
+    '[root] -> @scope/parent@1.0.0 -> @scope/leaf@3.4.15',
+    '@scope/app (packages/app/package.json) -> @scope/parent@2.0.0 -> @scope/leaf@3.4.15',
+  ];
+  const dependencyChains = [
+    [
+      { name: '[root]', isRoot: true, packageJsonPath: 'package.json' },
+      { name: '@scope/parent', version: '1.0.0' },
+      { name: '@scope/leaf', version: '3.4.15', requiredRange: '^3.4.0' },
+    ],
+    [
+      { name: '@scope/app', isWorkspace: true, packageJsonPath: 'packages/app/package.json' },
+      { name: '@scope/parent', version: '2.0.0' },
+      { name: '@scope/leaf', version: '3.4.15', requiredRange: '~3.4.8' },
+    ],
+  ];
+  for (const directRoots of [roots, [...roots].reverse()]) {
+    const paths = formatTransitiveDependencyPaths({
+      packageName: '@scope/leaf', directRoots, dependencyPaths, dependencyChains,
+    });
+    assert.deepEqual(new Set(paths), new Set([
+      'package.json/dependencies/@scope/parent/.../@scope/leaf@3.4.15 (^3.4.0)',
+      'packages/app/package.json/devDependencies/@scope/parent/.../@scope/leaf@3.4.15 (~3.4.8)',
+    ]));
+    const legacy = formatTransitiveDependencyPaths({ packageName: '@scope/leaf', directRoots, dependencyPaths });
+    assert.deepEqual(new Set(legacy), new Set([
+      'package.json/dependencies/@scope/parent/.../@scope/leaf@3.4.15',
+      'packages/app/package.json/devDependencies/@scope/parent/.../@scope/leaf@3.4.15',
+    ]));
+  }
+});
+
+test('findDirectRoots: keeps same-named physical parents in their declaring manifests', () => {
+  const pkgJson = { dependencies: { parent: '^1.0.0' } };
+  const workspaceManifest = { name: '@scope/app', devDependencies: { parent: '^2.0.0' } };
+  const workspaces = [
+    { name: 'root', isRoot: true, relativePath: 'package.json', pkgJson },
+    { name: '@scope/app', isRoot: false, relativePath: 'packages/app/package.json', pkgJson: workspaceManifest },
+  ];
+  const pkgLock = {
+    lockfileVersion: 3,
+    packages: {
+      '': pkgJson,
+      'packages/app': workspaceManifest,
+      'node_modules/parent': { version: '1.0.0', dependencies: { leaf: '^3.0.0' } },
+      'packages/app/node_modules/parent': { version: '2.0.0', dependencies: { leaf: '~3.0.1' } },
+      'node_modules/leaf': { version: '3.0.1' },
+    },
+  };
+  const directDeps = getDirectDependencies(pkgJson, workspaces);
+  const chains = tracePathsFromPackageLock(pkgLock, 'leaf', directDeps, workspaces);
+  const roots = findDirectRoots(chains, directDeps);
+  assert.deepEqual(new Set(roots.map((root) => JSON.stringify([
+    root.packageJsonPath, root.name, root.installedVersion, root.currentRange, root.section, root.location,
+  ]))), new Set([
+    '["package.json","parent","1.0.0","^1.0.0","dependencies","node_modules/parent"]',
+    '["packages/app/package.json","parent","2.0.0","^2.0.0","devDependencies","packages/app/node_modules/parent"]',
+  ]));
+});
+
+test('getDirectDependencies: retains root declarations with a workspace-only manifest list', () => {
+  const pkgJson = { name: 'root', dependencies: { parent: '^1.0.0' } };
+  const workspaces = [{
+    name: '@scope/app',
+    relativePath: 'packages/app/package.json',
+    pkgJson: { devDependencies: { parent: '^2.0.0' } },
+    isRoot: false,
+  }];
+  const before = JSON.stringify(workspaces);
+  const directDeps = getDirectDependencies(pkgJson, workspaces);
+  assert.deepEqual(new Set(directDeps.get('parent').declarations.map((declaration) => JSON.stringify([
+    declaration.packageJsonPath, declaration.section, declaration.range,
+  ]))), new Set([
+    '["package.json","dependencies","^1.0.0"]',
+    '["packages/app/package.json","devDependencies","^2.0.0"]',
+  ]));
+  assert.equal(JSON.stringify(workspaces), before);
 });

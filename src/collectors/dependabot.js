@@ -1,31 +1,25 @@
-export function groupDependabotAlertsByBranch(alerts = [], branches = ['main'], defaultBranch = 'main') {
-  const branchGroups = [];
+import { groupPackageFindings } from './collection.js';
 
-  for (const branch of branches) {
-    const isDefault = branch === defaultBranch || (branch === 'master' && !branches.includes('main'));
-    if (isDefault) {
-      branchGroups.push({
-        branch,
-        isDefaultBranch: true,
-        alertCount: alerts.length,
-        alerts,
-      });
-    } else {
-      branchGroups.push({
-        branch,
-        isDefaultBranch: false,
-        alertCount: 0,
-        alerts: [],
-        note: `GitHub Dependabot alerts natively track the repository default branch (${defaultBranch}).`,
-      });
-    }
-  }
+export function groupDependabotAlertsByBranch(alerts = [], branches = ['main'], defaultBranch = 'main', repository = null) {
+  const selectedBranches = [...new Set(branches)];
+  if (!selectedBranches.includes(defaultBranch)) selectedBranches.push(defaultBranch);
 
   return {
+    repository,
     defaultBranch,
-    branches: branchGroups,
+    branches: selectedBranches.map((branch) => {
+      const isDefaultBranch = branch === defaultBranch;
+      return {
+        branch,
+        isDefaultBranch,
+        alertCount: isDefaultBranch ? alerts.length : 0,
+        packages: groupPackageFindings(isDefaultBranch ? alerts : []),
+        ...(!isDefaultBranch && {
+          note: `GitHub Dependabot alerts natively track the repository default branch (${defaultBranch}).`,
+        }),
+      };
+    }),
     totalAlerts: alerts.length,
-    allAlerts: alerts,
   };
 }
 
@@ -36,47 +30,56 @@ export async function fetchDependabotAlerts(options = {}) {
     githubToken,
     githubApiUrl = 'https://api.github.com',
     branches = ['main'],
-    defaultBranch = 'main',
   } = options;
+  let defaultBranch = typeof options.defaultBranch === 'string' && options.defaultBranch.trim()
+    ? options.defaultBranch.trim()
+    : null;
+  const repository = options.repository || (org && name ? { org, name, fullName: `${org}/${name}` } : null);
 
-  if (!org || !name) {
-    return groupDependabotAlertsByBranch([], branches, defaultBranch);
+  if (!org || !name || !githubToken) {
+    return groupDependabotAlertsByBranch([], branches, defaultBranch || 'main', repository);
   }
 
-  if (!githubToken) {
-    return groupDependabotAlertsByBranch([], branches, defaultBranch);
-  }
+  const repositoryEndpoint = `${githubApiUrl.replace(/\/+$/, '')}/repos/${org}/${name}`;
+  const headers = {
+    Accept: 'application/vnd.github+json',
+    Authorization: `Bearer ${githubToken}`,
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  let defaultBranchNote = null;
 
-  const endpoint = `${githubApiUrl.replace(/\/+$/, '')}/repos/${org}/${name}/dependabot/alerts?state=open&per_page=100`;
+  if (!defaultBranch) {
+    try {
+      const res = await fetch(repositoryEndpoint, { headers });
+      if (!res.ok) throw new Error(`GitHub repository API returned HTTP ${res.status}`);
+      const metadata = await res.json();
+      if (typeof metadata.default_branch !== 'string' || !metadata.default_branch.trim()) {
+        throw new Error('GitHub repository metadata did not include a default branch');
+      }
+      defaultBranch = metadata.default_branch.trim();
+    } catch (err) {
+      defaultBranch = 'main';
+      defaultBranchNote = `Unable to determine the repository default branch: ${err.message}. Falling back to main; requested branches are not assumed to be the default.`;
+    }
+  }
 
   let rawAlerts = [];
 
   try {
-    const res = await fetch(endpoint, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${githubToken}`,
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-    });
+    const res = await fetch(`${repositoryEndpoint}/dependabot/alerts?state=open&per_page=100`, { headers });
 
-    if (res.status === 404) {
-      // Dependabot alerts not enabled or repo not found
-      return groupDependabotAlertsByBranch([], branches, defaultBranch);
-    }
-
-    if (!res.ok) {
+    if (!res.ok && res.status !== 404) {
       console.warn(`[Dependabot] GitHub API returned HTTP ${res.status}: ${res.statusText}`);
-      return groupDependabotAlertsByBranch([], branches, defaultBranch);
+    } else if (res.ok) {
+      rawAlerts = parseDependabotAlerts(await res.json());
     }
-
-    const data = await res.json();
-    rawAlerts = parseDependabotAlerts(data);
   } catch (err) {
     console.warn(`[Dependabot] Error fetching Dependabot alerts: ${err.message}`);
   }
 
-  return groupDependabotAlertsByBranch(rawAlerts, branches, defaultBranch);
+  const collection = groupDependabotAlertsByBranch(rawAlerts, branches, defaultBranch, repository);
+  if (defaultBranchNote) collection.note = defaultBranchNote;
+  return collection;
 }
 
 export function parseDependabotAlerts(data) {
@@ -106,6 +109,10 @@ export function parseDependabotAlerts(data) {
       summary: advisory.summary || `${packageName} vulnerability`,
       severity: (vuln.severity || advisory.severity || 'moderate').toLowerCase(),
       vulnerableVersionRange: vuln.vulnerable_version_range || null,
+      affectedVersions: [{
+        vulnerableRange: vuln.vulnerable_version_range || null,
+        firstPatchedVersion: vuln.first_patched_version?.identifier || null,
+      }],
       targetSafeVersion: vuln.first_patched_version?.identifier || null,
       manifestPath: dep.manifest_path || 'package.json',
     });

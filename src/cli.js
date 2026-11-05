@@ -29,7 +29,7 @@ export function createCli() {
     .option('--no-jira', 'Disable Jira collector')
     .option('--no-dependabot', 'Disable GitHub Dependabot collector')
     .option('--no-overrides', 'Leave override-only findings for manual remediation planning')
-    .option('--debug', 'Save raw collector outputs to security-<name>-collection.json')
+    .option('--debug', 'Save debug-collection-{kind}.json and canonical evidence in debug-blended.json')
     .action(async (repo, options) => {
       try {
         await scanRepository(repo, options);

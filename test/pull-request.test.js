@@ -53,47 +53,93 @@ function pullRequestMetadata(options = {}) {
 }
 
 function branchPlan() {
+  const packageName = 'vulnerable-package';
+  const firstFindingId = 'GHSA-abcd-efgh-2345';
+  const firstResolutionId = `${packageName}@1.0.0`;
+  const secondResolutionId = `${packageName}@1.1.0`;
+  const instance = (version, location) => ({
+    location,
+    incoming: [],
+    origins: [{
+      packageJsonPath: 'packages/app/package.json',
+      section: 'dependencies',
+      workspace: '@scope/app',
+      chain: [
+        { name: 'parent', version: '2.0.0', location: 'packages/app/node_modules/parent', requiredRange: '^2.0.0' },
+        { name: packageName, version, location, requiredRange: '<1.2.0' },
+      ],
+    }],
+  });
   return {
     branch: 'release/1.0', baseCommit: 'a'.repeat(40), status: 'ready',
     summary: 'Update vulnerable package and parent dependency.',
     packages: [{
-      packageName: 'vulnerable-package', status: 'ready', currentVersion: '1.0.0',
-      installedVersions: ['1.0.0', '1.1.0'], targetSafeVersion: '1.2.0',
-      dependencyPaths: ['packages/app/package.json/dependencies/parent/vulnerable-package'],
+      packageName, status: 'ready', installedVersions: ['1.0.0', '1.1.0'],
+      summary: 'Update each vulnerable installed line.',
+      reasons: [],
+      resolutions: [{
+        id: firstResolutionId, installedVersion: '1.0.0', line: '1.0', status: 'ready',
+        targetVersion: '1.0.1', strategy: 'bump-direct-parent', findingIds: [firstFindingId],
+        reasons: [], instances: [instance('1.0.0', 'packages/app/node_modules/vulnerable-package')],
+      }, {
+        id: secondResolutionId, installedVersion: '1.1.0', line: '1.1', status: 'ready',
+        targetVersion: '1.1.1', strategy: 'package-override', findingIds: [firstFindingId, 'second-advisory'],
+        reasons: [], instances: [instance('1.1.0', 'node_modules/parent/node_modules/vulnerable-package')],
+      }],
       findings: [{
-        id: 'GHSA-abcd-efgh-2345', title: 'Prototype pollution', severity: 'high',
-        cve: 'CVE-2026-12345', cves: ['CVE-2026-12345', 'CVE-2026-23456'],
-        vulnerableVersionRange: '<1.2.0', patchedVersions: ['1.2.0'],
+        id: firstFindingId, title: 'Prototype pollution', severity: 'high',
+        cves: ['CVE-2026-12345', 'CVE-2026-23456'],
+        constraints: [
+          { vulnerableRange: '<1.0.1', firstPatchedVersion: '1.0.1' },
+          { vulnerableRange: '>=1.1.0 <1.1.1', firstPatchedVersion: '1.1.1' },
+        ],
         url: 'https://github.com/advisories/GHSA-abcd-efgh-2345',
-        sources: {
-          npmAudit: [{ url: 'https://www.npmjs.com/advisories/1001' }, { urls: ['https://www.npmjs.com/advisories/1002'], advisories: [{ url: 'https://advisories.example.test/npm' }] }],
-          jira: { ticketKey: ['SEC-1', 'SEC-2'], url: ['https://jira.example.test/browse/SEC-1', 'https://jira.example.test/browse/SEC-2'] },
-          jiraTickets: [{ ticketKey: 'SEC-3', url: 'https://jira.example.test/browse/SEC-3' }],
-          dependabot: { alertNumber: 7, url: 'https://github.example.test/org/repo/security/dependabot/7' },
-          dependabotAlerts: [{ alertNumber: 8, url: 'https://github.example.test/org/repo/security/dependabot/8' }],
-          advisoryUrls: ['https://advisories.example.test/merged'],
-        },
+        references: [
+          { source: 'npm-audit', id: '1001', url: 'https://www.npmjs.com/advisories/1001' },
+          { source: 'npm-audit', id: '1001', url: 'https://www.npmjs.com/advisories/1002' },
+          { source: 'advisory', id: 'GHSA-abcd-efgh-2345', url: 'https://advisories.example.test/npm' },
+          { source: 'jira', id: 'SEC-1', url: 'https://jira.example.test/browse/SEC-1' },
+          { source: 'jira', id: 'SEC-2', url: 'https://jira.example.test/browse/SEC-2' },
+          { source: 'jira', id: 'SEC-3', url: 'https://jira.example.test/browse/SEC-3' },
+          { source: 'dependabot', id: '7', url: 'https://github.example.test/org/repo/security/dependabot/7' },
+          { source: 'dependabot', id: '8', url: 'https://github.example.test/org/repo/security/dependabot/8' },
+        ],
       }, {
         id: 'second-advisory', title: 'Resource exhaustion', severity: 'moderate',
         url: 'https://advisories.example.test/second',
-        sources: [{ source: 'jira', ticketKey: 'SEC-4', url: 'https://jira.example.test/browse/SEC-4' }],
+        constraints: [{ vulnerableRange: '>=1.1.0 <1.1.1', firstPatchedVersion: '1.1.1' }],
+        cves: [],
+        references: [{ source: 'jira', id: 'SEC-4', url: 'https://jira.example.test/browse/SEC-4' }],
       }],
+      risk: { fixType: 'override-required', breaking: false, reasons: [] },
     }, {
-      packageName: 'unfixable', status: 'no-fix', reasons: ['No patched release exists.'],
-      findings: [{ id: 'no-fix', title: 'Unpatched issue', url: 'https://advisories.example.test/no-fix' }],
+      packageName: 'unfixable', status: 'no-fix', installedVersions: ['1.0.0'],
+      summary: 'No safe release is known.', reasons: ['No patched release exists.'],
+      resolutions: [{
+        id: 'unfixable@1.0.0', installedVersion: '1.0.0', line: '1.0', status: 'no-fix',
+        targetVersion: null, strategy: 'none', findingIds: ['no-fix'], reasons: ['No safe patch on 1.0.x.'], instances: [],
+      }],
+      findings: [{ id: 'no-fix', title: 'Unpatched issue', severity: 'high', cves: [], constraints: [], references: [{ source: 'advisory', id: 'no-fix', url: 'https://advisories.example.test/no-fix' }], url: 'https://advisories.example.test/no-fix' }],
     }, {
-      packageName: 'manual-package', status: 'manual-review', reasons: ['Parent dependency needs manual review.'],
-      findings: [{ id: 'manual', sources: { jira: { ticketKey: 'SEC-5', url: 'https://jira.example.test/browse/SEC-5' } } }],
+      packageName: 'manual-package', status: 'manual-review', installedVersions: [],
+      reasons: ['Parent dependency needs manual review.'], resolutions: [],
+      findings: [{ id: 'manual', title: 'Manual review', severity: 'moderate', cves: [], constraints: [], references: [{ source: 'jira', id: 'SEC-5', url: 'https://jira.example.test/browse/SEC-5' }], url: null }],
     }, {
-      packageName: 'absent-package', status: 'not-installed', reasons: ['Absent from scanned dependency graph.'], findings: [],
+      packageName: 'absent-package', status: 'not-installed', installedVersions: [],
+      reasons: ['Absent from scanned dependency graph.'], resolutions: [], findings: [],
     }],
     actions: [{
       type: 'update-dependency', file: 'packages/app/package.json', section: 'dependencies', package: 'parent',
-      expectedRange: '^2.0.0', targetRange: '^2.1.0', packageNames: ['vulnerable-package'], findingIds: ['GHSA-abcd-efgh-2345'],
+      expectedRange: '^2.0.0', targetRange: '^2.1.0', packageNames: [packageName],
+      findingIds: [firstFindingId], resolutionIds: [firstResolutionId],
     }, {
-      type: 'set-override', file: 'package.json', package: 'vulnerable-package', scope: ['parent'],
-      expectedValue: null, targetVersion: '1.2.0', packageNames: ['vulnerable-package'], findingIds: ['second-advisory'],
-    }, { type: 'update-lockfile', package: 'vulnerable-package', packageNames: ['vulnerable-package'], findingIds: [] }],
+      type: 'set-override', file: 'package.json', package: `${packageName}@1.1.x`, scope: ['parent@2.0.0'],
+      expectedValue: null, targetVersion: '1.1.1', packageNames: [packageName],
+      findingIds: [firstFindingId, 'second-advisory'], resolutionIds: [secondResolutionId],
+    }, {
+      type: 'update-lockfile', package: packageName, packageNames: [packageName],
+      findingIds: [firstFindingId, 'second-advisory'], resolutionIds: [firstResolutionId, secondResolutionId],
+    }],
   };
 }
 
@@ -128,21 +174,25 @@ test('renderPrTitle rejects unknown or malformed tokens and empty or multiline o
   assert.throws(() => renderPrTitle('line one\n{summary}', { summary: 'line two' }), /single-line/);
 });
 
-test('generatePullRequestBody preserves all motivations across singular, array, and merged sources', () => {
+test('generatePullRequestBody preserves all motivations and per-resolution plans across normalized references', () => {
   const body = generatePullRequestBody(branchPlan(), executionResult());
   for (const expected of [
     'a'.repeat(40), 'release/1.0', 'vulnerable-package', 'Prototype pollution', 'Resource exhaustion',
     'https://github.com/advisories/GHSA-abcd-efgh-2345',
     'https://nvd.nist.gov/vuln/detail/CVE-2026-12345', 'https://nvd.nist.gov/vuln/detail/CVE-2026-23456',
     'https://www.npmjs.com/advisories/1001', 'https://www.npmjs.com/advisories/1002',
-    'https://advisories.example.test/npm', 'https://advisories.example.test/merged', 'https://advisories.example.test/second',
+    'https://advisories.example.test/npm', 'https://advisories.example.test/second',
     ...[1, 2, 3, 4, 5].map((number) => `https://jira.example.test/browse/SEC-${number}`),
     ...[7, 8].map((number) => `https://github.example.test/org/repo/security/dependabot/${number}`),
-    'packages/app/package.json', '^2.0.0', '^2.1.0', 'overrides / parent / vulnerable-package',
+    'packages/app/package.json', '^2.0.0', '^2.1.0', 'overrides / parent@2.0.0 / vulnerable-package@1.1.x',
+    '`1.0.0` (`1.0.x`): → `1.0.1` via `bump-direct-parent`',
+    '`1.1.0` (`1.1.x`): → `1.1.1` via `package-override`',
+    'parent@2.0.0 → vulnerable-package@1.0.0', 'parent@2.0.0 → vulnerable-package@1.1.0',
     'No patched release exists.', 'manual-review', 'not-installed', 'https://advisories.example.test/no-fix',
   ]) assert.ok(body.includes(expected), `Missing body motivation/detail: ${expected}`);
   assert.match(body, /npm audit/);
-  assert.match(body, /Jira SEC-1, SEC-2/);
+  assert.match(body, /Jira SEC-1/);
+  assert.match(body, /Jira SEC-2/);
   assert.match(body, /Dependabot #7/);
   assert.match(body, /observed installed versions: `1\.3\.0`, `1\.4\.0`/);
   assert.doesNotMatch(body, /observed installed versions: `1\.2\.0`/);
@@ -169,7 +219,8 @@ test('generatePullRequestBody treats dry runs and absent verification as unverif
     const body = generatePullRequestBody(branchPlan(), { ...executionResult(), ...overrides });
     assert.match(body, /unverified/i);
     assert.doesNotMatch(body, /observed installed versions|reported \*\*0\*\*|Observed manifest changes/);
-    assert.match(body, /Planned safe target: `1\.2\.0`/);
+    assert.match(body, /`1\.0\.0` \(`1\.0\.x`\): → `1\.0\.1` via `bump-direct-parent`/);
+    assert.match(body, /`1\.1\.0` \(`1\.1\.x`\): → `1\.1\.1` via `package-override`/);
     assert.match(body, /No patched release exists/);
   }
 });
@@ -182,18 +233,24 @@ test('generatePullRequestBody does not infer a zero audit from isClean or missin
   }
 });
 
-test('generatePullRequestBody preserves normalized source arrays at the Finding.sources root', () => {
+test('generatePullRequestBody preserves normalized Finding.references with source labels and CVE links', () => {
   const plan = branchPlan();
   plan.packages[0].findings = [{
-    id: 'CVE-2026-11111', title: 'Array sources',
-    sources: [
-      { jira: [{ ticketKey: 'SEC-10', url: 'https://jira.example.test/browse/SEC-10' }, { ticketKey: 'SEC-11', url: 'https://jira.example.test/browse/SEC-11' }] },
-      { dependabot: [{ alertNumber: 10, url: 'https://github.example.test/org/repo/security/dependabot/10' }] },
-      { npmAudit: { url: ['https://advisories.example.test/a', 'https://advisories.example.test/b'] } },
+    id: 'CVE-2026-11111', title: 'Normalized references', cves: ['CVE-2026-11111'],
+    constraints: [],
+    references: [
+      { source: 'jira', id: 'SEC-10', url: 'https://jira.example.test/browse/SEC-10' },
+      { source: 'jira', id: 'SEC-11', url: 'https://jira.example.test/browse/SEC-11' },
+      { source: 'dependabot', id: '10', url: 'https://github.example.test/org/repo/security/dependabot/10' },
+      { source: 'npm-audit', id: 'audit-10', url: 'https://advisories.example.test/a' },
+      { source: 'npm-audit', id: 'audit-11', url: 'https://advisories.example.test/b' },
     ],
   }];
   const body = generatePullRequestBody(plan);
   for (const url of ['https://jira.example.test/browse/SEC-10', 'https://jira.example.test/browse/SEC-11', 'https://github.example.test/org/repo/security/dependabot/10', 'https://advisories.example.test/a', 'https://advisories.example.test/b', 'https://nvd.nist.gov/vuln/detail/CVE-2026-11111']) assert.ok(body.includes(url));
+  assert.match(body, /Jira SEC-10/);
+  assert.match(body, /Jira SEC-11/);
+  assert.match(body, /Dependabot #10/);
 });
 
 test('generatePullRequestBody retains additional executor disclosures when the saved plan already contains the package', () => {
