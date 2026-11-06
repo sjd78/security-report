@@ -4,6 +4,7 @@ import semver from 'semver';
 import { sortVulnerabilities, isVulnerabilityResolved } from '../core/blender.js';
 import { extractGhsaId } from '../collectors/advisories.js';
 import { normalizeInstalledVersionDisplay } from './json-reporter.js';
+import { isVersionSafe } from '../core/advisory-evidence.js';
 
 export function formatCves(v) {
   const cves = [];
@@ -126,6 +127,30 @@ export function formatFixStrategy(rem, v) {
 }
 
 export function formatTargetFix(v, joiner = '<br>') {
+  if (Array.isArray(v.affectedVersions)) {
+    const installed = (v.installedVersions?.length ? v.installedVersions : String(v.currentVersion || '').split(','))
+      .map((version) => semver.clean(String(version).trim())).filter(Boolean);
+    const majors = new Set(installed.map((version) => semver.major(version)));
+    const findings = v.findings ?? [{ constraints: v.affectedVersions }];
+    const candidates = [...new Set(v.affectedVersions.map((interval) => interval.firstPatchedVersion))]
+      .filter((version) => semver.valid(version) && !semver.prerelease(version))
+      .filter((version) => isVersionSafe(version, findings) === true)
+      .sort(semver.compare);
+    const minimumByMajor = new Map();
+    for (const version of candidates) {
+      const major = semver.major(version);
+      if (!minimumByMajor.has(major)) minimumByMajor.set(major, version);
+    }
+    const targets = new Set();
+    for (const major of majors) {
+      const sameMajor = minimumByMajor.get(major);
+      const needsFix = installed.some((version) => semver.major(version) === major && isVersionSafe(version, findings) === false);
+      const target = sameMajor || (needsFix ? candidates.find((version) => semver.major(version) > major) : null);
+      if (target) targets.add(target);
+    }
+    const selected = majors.size ? [...targets].sort(semver.compare) : [...minimumByMajor.values()];
+    return selected.length ? selected.map((version) => `\`${version}\``).join(joiner) : '_No fix_';
+  }
   const versions = [];
   const seen = new Set();
 
@@ -138,28 +163,24 @@ export function formatTargetFix(v, joiner = '<br>') {
     }
   };
 
-  if (Array.isArray(v.affectedVersions)) {
-    for (const interval of v.affectedVersions) addVer(interval.firstPatchedVersion);
-  } else {
-    if (Array.isArray(v.targetSafeVersions)) {
-      for (const ver of v.targetSafeVersions) addVer(ver);
-    }
-    if (Array.isArray(v.patchedVersions)) {
-      for (const ver of v.patchedVersions) addVer(ver);
-    }
-    if (Array.isArray(v.advisories)) {
-      for (const adv of v.advisories) {
-        if (Array.isArray(adv.patchedVersions)) {
-          for (const ver of adv.patchedVersions) addVer(ver);
-        }
-        if (Array.isArray(adv.targetSafeVersions)) {
-          for (const ver of adv.targetSafeVersions) addVer(ver);
-        }
-        if (adv.targetSafeVersion) addVer(adv.targetSafeVersion);
-      }
-    }
-    if (v.targetSafeVersion) addVer(v.targetSafeVersion);
+  if (Array.isArray(v.targetSafeVersions)) {
+    for (const ver of v.targetSafeVersions) addVer(ver);
   }
+  if (Array.isArray(v.patchedVersions)) {
+    for (const ver of v.patchedVersions) addVer(ver);
+  }
+  if (Array.isArray(v.advisories)) {
+    for (const adv of v.advisories) {
+      if (Array.isArray(adv.patchedVersions)) {
+        for (const ver of adv.patchedVersions) addVer(ver);
+      }
+      if (Array.isArray(adv.targetSafeVersions)) {
+        for (const ver of adv.targetSafeVersions) addVer(ver);
+      }
+      if (adv.targetSafeVersion) addVer(adv.targetSafeVersion);
+    }
+  }
+  if (v.targetSafeVersion) addVer(v.targetSafeVersion);
 
   if (versions.length === 0) {
     return '_No fix_';

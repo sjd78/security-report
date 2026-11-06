@@ -989,3 +989,53 @@ test('getDirectDependencies: retains root declarations with a workspace-only man
   ]));
   assert.equal(JSON.stringify(workspaces), before);
 });
+
+test('blended Target Fix shows one minimum version satisfying every finding per installed major', () => {
+  const affectedVersions = [
+    { vulnerableRange: '<=3.4.8', firstPatchedVersion: '3.4.9' },
+    { vulnerableRange: '<=3.4.10', firstPatchedVersion: '3.4.11' },
+    { vulnerableRange: '<=3.4.16', firstPatchedVersion: '3.4.17' },
+  ];
+  const vulnerability = {
+    packageName: 'dompurify', currentVersion: '3.4.8, 3.4.15, 3.4.17',
+    affectedVersions,
+    findings: affectedVersions.map((constraint, index) => ({ id: `finding-${index}`, constraints: [constraint] })),
+  };
+  assert.equal(formatTargetFix(vulnerability), '`3.4.17`');
+  const markdown = generateMarkdownReport({ branches: [{ branch: 'main', vulnerabilities: [vulnerability] }] });
+  const tableRow = markdown.split('\n').find((line) => line.startsWith('| **`dompurify`**'));
+  assert.ok(tableRow.includes('| `3.4.17` |'));
+  assert.ok(!tableRow.includes('`3.4.9`'));
+  assert.ok(!tableRow.includes('`3.4.11`'));
+});
+
+test('blended Target Fix includes only majors currently installed, not every published fix line', () => {
+  const affectedVersions = [
+    { vulnerableRange: '>=17.1.1 <17.13.9', firstPatchedVersion: '17.13.9' },
+    { vulnerableRange: '>=18.0.0 <18.3.1', firstPatchedVersion: '18.3.1' },
+    { vulnerableRange: '>=19.0.0 <19.0.3', firstPatchedVersion: '19.0.3' },
+  ];
+  assert.equal(formatTargetFix({ currentVersion: '18.2.9', affectedVersions }), '`18.3.1`');
+  assert.equal(formatTargetFix({ installedVersions: ['18.2.9', '17.13.8'], affectedVersions }), '`17.13.9`<br>`18.3.1`');
+});
+
+test('blended Target Fix skips a patch still vulnerable to another finding and does not select the latest patch', () => {
+  const affectedVersions = [
+    { vulnerableRange: '<1.2.0', firstPatchedVersion: '1.2.0' },
+    { vulnerableRange: '>=1.2.0 <1.2.3', firstPatchedVersion: '1.2.3' },
+    { vulnerableRange: '>=1.2.6 <1.2.7', firstPatchedVersion: '1.2.7' },
+  ];
+  assert.equal(formatTargetFix({ currentVersion: '1.1.0', affectedVersions }), '`1.2.3`');
+  assert.equal(formatTargetFix({ currentVersion: '1.1.0', affectedVersions: [
+    ...affectedVersions, { vulnerableRange: 'invalid', firstPatchedVersion: null },
+  ] }), '_No fix_');
+});
+
+test('minimum Target Fix reports a necessary major jump rather than falsely claiming no fix', () => {
+  const affectedVersions = [
+    { vulnerableRange: '<11.1.1', firstPatchedVersion: '11.1.1' },
+    { vulnerableRange: '>=12.0.0 <12.0.1', firstPatchedVersion: '12.0.1' },
+    { vulnerableRange: '>=13.0.0 <13.0.1', firstPatchedVersion: '13.0.1' },
+  ];
+  assert.equal(formatTargetFix({ currentVersion: '8.3.2', affectedVersions }), '`11.1.1`');
+});

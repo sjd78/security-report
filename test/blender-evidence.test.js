@@ -75,5 +75,5 @@ test('blender preserves range-only, contradictory and invalid evidence instead o
   const plan = generateRemediationPlan({ repository: {}, branches: [blended] });
   assert.equal(plan.branches[0].packages[0].status, 'manual-review');
   assert.deepEqual(plan.branches[0].actions, []);
-  assert.equal(formatTargetFix({ ...pkg, patchedVersions: ['99.0.0'], targetSafeVersion: '99.0.0' }), '`1.0.2`');
+  assert.equal(formatTargetFix({ ...pkg, patchedVersions: ['99.0.0'], targetSafeVersion: '99.0.0' }), '_No fix_');
 });

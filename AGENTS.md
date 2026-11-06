@@ -187,7 +187,7 @@ Every strategy carries `packageJsonChanges` (file-scoped semver edits) and `lock
   1. `src/collectors/advisories.js` (`fetchAdvisoryDetails`) collects all `first_patched_version` entries from GitHub Advisories and `fixed` events from OSV across the npm ecosystem.
   2. `src/collectors/npm-audit.js` (`determinePatchedVersions`) parses multiple patch boundaries from compound semver ranges (e.g. `<2.4.5 || >=3.0.0 <3.1.6 || >=4.0.0 <4.1.3`).
   3. `src/core/blender.js` (`selectBestRemediationVersion`) prioritizes safe, non-breaking in-major patch updates when the current installed version is known (e.g. installed `2.4.2` selects `2.4.5`; installed `3.1.3` selects `3.1.6`), or selects the minimal breaking jump.
-  4. `src/report/markdown-reporter.js` (`formatTargetFix`) displays all available major version line fixes in the `Target Fix` column separated by `<br>`.
+  4. `src/report/markdown-reporter.js` (`formatTargetFix`) uses blended `affectedVersions` and canonical findings to display the minimum stable version safe against every finding per installed major, not every advisory patch boundary. Omit unused majors; if an affected installed major has no safe candidate, display the minimum necessary higher-major fix. This report minimum does not change the planner's newest-published-safe-patch policy on each installed major/minor line; keep full advisory evidence in details.
 
 ### K. Upstream Resolution Tracking & Open vs. Resolved Status
 - **Problem**: Downstream Jira compliance tickets or Dependabot alerts often remain open/active even after an upstream repository has already applied the fix in its lockfile. Continuing to flag them as active defects or attempting code modifications causes confusion and redundant diffs.

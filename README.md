@@ -19,7 +19,7 @@ Managing security vulnerabilities across large Node.js repositories is often fra
    - Compares installed versions against target fixes to track **`Status` (`✅ Resolved` vs `⚠️ Open`)**, identifying flaws that remain logged in Jira or Dependabot but are already solved in code.
    - Consolidates multiple CVEs and advisories per package to calculate the optimal safe version that resolves all flaws (prioritizing safe in-major updates when installed version is known).
    - Outputs machine-readable JSON (`reports/security-report.json`) and human-readable Markdown (`reports/security-report.md`) featuring:
-     - **Package Overview Table**: `Package`, `Status` (`✅ Resolved` / `⚠️ Open`), `Severity`, `Type`, `Current Version`, `Target Fix` (all major line fixes separated by `<br>`), `CVEs` (separated by `<br>`), and `Sources` (linked advisories, Jira tickets, Dependabot alerts separated by `<br>`).
+     - **Package Overview Table**: `Package`, `Status` (`✅ Resolved` / `⚠️ Open`), `Severity`, `Type`, `Current Version`, `Target Fix` (minimum all-findings-safe version per relevant installed major), `CVEs`, and linked `Sources`.
      - **Detailed Package Findings**: Unnumbered findings with status badges, semver-sorted installed versions, individual advisory links, and partitioned **Direct Dependencies** and **Transitive Dependency Paths**. Transitive paths retain every physical copy and root/workspace origin, including scoped parents and distinct versions of the same parent.
    - Writes `reports/security-remediation-plan.json`: a standalone schema-2 plan grouped by branch and package, with a separate approved resolution for every vulnerable installed version line, physical installation locations and complete origins, advisory evidence, coverage-linked actions, and explicit unresolved dispositions.
    - Parent-fix suggestions from npm audit are candidates, not instructions to downgrade: a parent update must move forward from the installed version in every affected declaring workspace. Stale, equal, lower, or unprovable candidates are rejected rather than displayed as upgrades.
@@ -183,6 +183,8 @@ The blender collates all enabled collector sources per branch and package, owns 
 
 Range/patch pairs remain associated with their findings. A known patch supersedes a redundant null-patch entry only for the same finding and normalized range; other missing patch values stay `null`, and invalid or contradictory evidence is retained for planner review. GitHub's global advisory API supplies `vulnerabilities[].first_patched_version` as a string, unlike Dependabot's `security_vulnerability.first_patched_version.identifier` object. OSV supplies paired `introduced`/`fixed` events. Package matching keeps `joi` and `@hapi/joi`, for example, distinct. Markdown advisory details display the blended ranges and patch floors, while the target-fix list uses those same paired values.
 
+For blended data, Markdown **Target Fix** selects the lowest known stable patch boundary that satisfies every finding, with one entry per currently used major rather than every historical patch. If a vulnerable installed major has no safe candidate, show the smallest necessary higher-major fix instead. Unused release lines are omitted; individual advisory details retain their full evidence. This is a display minimum, not a resolution instruction: the planner still selects the newest published safe patch within each installed major/minor line and may require manual review for cross-line upgrades.
+
 #### Remediation-plan artifact
 
 Every scan writes `security-remediation-plan.json` alongside the existing JSON and Markdown reports. Generating the plan does not edit target manifests or lockfiles.
@@ -316,7 +318,7 @@ sec-remediate pr --plan reports/security-remediation-plan.json
 
 | Package | Status | Severity | Type | Current Version | Target Fix | CVEs | Sources |
 | :--- | :---: | :---: | :---: | :--- | :--- | :--- | :--- |
-| **`fast-uri`** | ⚠️ Open | **HIGH** | Direct | `2.4.2` | `2.4.5`<br>`3.1.6`<br>`4.1.3` | `CVE-2026-75931` | [npm audit](https://github.com/advisories/GHSA-5jgf-p345-68v8) |
+| **`fast-uri`** | ⚠️ Open | **HIGH** | Direct | `2.4.2` | `2.4.5` | `CVE-2026-75931` | [npm audit](https://github.com/advisories/GHSA-5jgf-p345-68v8) |
 | **`qs`** | ✅ Resolved | **HIGH** | Direct | `6.16.0` | `6.16.0` | `CVE-2026-82417` | [MTA-7680](https://issues.example.com/browse/MTA-7680)<br>[#42](https://github.com/org/repo/security/dependabot/42) |
 
 ### Detailed Package Finding
